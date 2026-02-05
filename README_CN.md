@@ -63,7 +63,7 @@ DKI (Dynamic KV Injection，动态键值注入) 是一种针对大型语言模�
 
 ```bash
 # 克隆仓库
-git clone https://github.com/your-org/DKI.git
+git clone https://github.com/LucasMa2025/DKI.git
 cd DKI
 
 # 安装（创建虚拟环境、安装依赖、初始化数据库）
@@ -588,4 +588,5 @@ A:
 ---
 
 **DKI** - 在注意力层级重新思考记忆增强
+
 
