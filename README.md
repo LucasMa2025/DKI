@@ -159,20 +159,20 @@ dki = DKISystem()
 # Set user preferences (short, stable, cached K/V)
 dki.set_user_preference(
     user_id="user_001",
-    preference_text="素食主义者，住北京朝阳区，不喜欢辣，喜欢安静的环境"
+    preference_text="vegetarian, living in Chaoyang District of Beijing, dislikes spicy food and prefers a quiet environment."
 )
 
 # Add session memories (for retrieval-based injection)
 dki.add_memory(
     session_id="session_001",
-    content="User mentioned they went to 静心素食 last week"
+    content="User mentioned they went to Tranquil Vegan last week"
 )
 
 # Chat with hybrid injection
 # - Preferences: K/V injection (implicit influence)
 # - History: Suffix prompt (explicit reference)
 response = dki.chat(
-    query="今晚想找一家餐厅，有什么新推荐吗？",
+    query="I’m looking for a restaurant to go to tonight – any new recommendations?",
     session_id="session_001",
     user_id="user_001",  # Enable preference injection
     use_hybrid=True,     # Use hybrid injection strategy
@@ -786,7 +786,7 @@ This project is inspired by the following research:
 
 ## 📄 Related Papers
 
-This project is based on the paper "Dynamic KV Injection: Attention-Level Memory Augmentation for Large Language Models".
+This project is based on the paper "Dynamic KV Injection: An Attention-Level User Memory System for Large Language Models".
 
 ## 📄 License
 
@@ -799,4 +799,5 @@ Contributions are welcome! Please read our contributing guidelines first.
 ---
 
 **DKI** - Rethinking Memory Augmentation at the Attention Level
+
 
