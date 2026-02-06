@@ -53,7 +53,7 @@ DKI uses a **layered injection approach** that mirrors human cognition:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                    DKI Hybrid Injection Architecture                     │
+│                    DKI Hybrid Injection Architecture                    │
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                         │
 │  ┌─────────────────────────────────────────────────────────────────┐    │
@@ -596,7 +596,7 @@ alpha = min(alpha_base, alpha_max)
 | Dimension          | RAG                                 | DKI                                       |
 | ------------------ | ----------------------------------- | ----------------------------------------- |
 | Injection Level    | Token domain (prompt concatenation) | Attention domain (K/V injection)          |
-| Injection Control  | None (hard concatenation)           | Continuous (α ∈ [0, 1])                   |
+| Injection Control  | None (hard concatenation)           | Continuous (α ∈ [0, 1])                  |
 | Prompt Consumption | Yes                                 | No                                        |
 | Context Window     | Consumed by retrieved content       | Fully available to user                   |
 | Prompt Engineering | Required                            | Simplified                                |
@@ -799,3 +799,4 @@ Contributions are welcome! Please read our contributing guidelines first.
 ---
 
 **DKI** - Rethinking Memory Augmentation at the Attention Level
+
