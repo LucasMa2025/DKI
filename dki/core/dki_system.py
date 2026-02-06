@@ -71,6 +71,9 @@ from dki.core.components.position_remapper import PositionRemapper
 from dki.core.components.attention_budget import (
     AttentionBudgetAnalyzer, BudgetAnalysis, LatencyTimer, LatencyBreakdown
 )
+from dki.core.components.hybrid_injector import (
+    HybridDKIInjector, HybridInjectionConfig, UserPreference, SessionHistory
+)
 from dki.models.factory import ModelFactory
 from dki.models.base import BaseModelAdapter, ModelOutput, KVCacheEntry
 from dki.database.connection import DatabaseManager
@@ -130,22 +133,49 @@ class DKIResponse:
 
 class DKISystem:
     """
-    Dynamic KV Injection System.
+    Dynamic KV Injection System - User-Level Cross-Session Memory System.
     
-    Implements attention-level memory augmentation:
-    1. Retrieve relevant memories
-    2. Compute K/V representations
-    3. Apply query-conditioned projection
-    4. Inject into attention with α scaling
-    5. Generate response
+    ============================================================================
+    SCOPE DEFINITION (Paper Section 1.1)
+    ============================================================================
+    DKI is designed specifically for USER-LEVEL MEMORY:
+    - User Preferences: Dietary restrictions, communication style, interests
+    - Session History: Previous conversation context, established facts
+    - Personal Context: Location, timezone, language preferences
     
-    Key Features:
+    DKI is NOT for external knowledge bases or public data retrieval (use RAG).
+    
+    This focused scope enables:
+    1. Short memory (50-200 tokens) → reduced position encoding risks
+    2. User-owned data → simplified privacy considerations
+    3. Session-coherent → effective K/V caching
+    
+    ============================================================================
+    HYBRID INJECTION STRATEGY (Paper Section 3.9)
+    ============================================================================
+    
+    ┌─────────────────────────────────────────────────────────────────────────┐
+    │  Layer   │  Content     │  Injection        │  Influence      │ Analogy │
+    ├──────────┼──────────────┼───────────────────┼─────────────────┼─────────┤
+    │  L1      │  Preferences │  K/V (negative)   │  Implicit       │ Person. │
+    │  L2      │  History     │  Suffix (positive)│  Explicit       │ Memory  │
+    │  L3      │  Query       │  Input (positive) │  Primary focus  │ Current │
+    └─────────────────────────────────────────────────────────────────────────┘
+    
+    - Preferences: Short, stable → Negative-position K/V injection (α=0.3-0.5)
+    - History: Longer, dynamic → Suffix-prompt with trust-establishing guidance
+    
+    ============================================================================
+    KEY FEATURES
+    ============================================================================
     - Memory Influence Scaling (MIS): Continuous α ∈ [0, 1] control
     - Query-Conditioned Projection: FiLM-style adaptive projection
-    - Dual-Factor Gating: Uncertainty × Relevance
+    - Dual-Factor Gating: Relevance-driven decision, entropy-modulated strength
+    - Hybrid Injection: Preferences via K/V, History via suffix prompt
     - Tiered KV Cache: L1(GPU) → L2(CPU) → L3(SSD) → L4(Recompute)
     - Position Remapping: RoPE/ALiBi compatibility
     - Attention Budget Analysis: Token vs Attention budget tracking
+    - Plugin Architecture: Configuration-driven, framework-agnostic
     
     Design Invariants (Paper Section 5):
     1. Storage model-agnostic (text + routing vectors only)
@@ -154,7 +184,7 @@ class DKISystem:
     4. Graceful degradation (α → 0 recovers vanilla)
     5. Audit logging for compliance
     
-    Memory Hierarchy (Paper Section 7.4):
+    Memory Hierarchy (Paper Section 7.4, OPTIONAL enhancement):
     ┌─────────────────────────────────────────────────┐
     │  L1: GPU HBM (Hot)     - Uncompressed FP16     │
     │  L2: CPU RAM (Warm)    - Compressed (2-4×)     │
@@ -200,13 +230,28 @@ class DKISystem:
             ), 'max_model_len') else 4096
         )
         
+        # Hybrid Injector (Paper Section 3.9)
+        self._hybrid_injector: Optional[HybridDKIInjector] = None
+        self._use_hybrid_injection = getattr(
+            getattr(self.config.dki, 'hybrid_injection', None), 
+            'enabled', 
+            True
+        )
+        
+        # User preferences cache (user_id -> UserPreference)
+        self._user_preferences: Dict[str, UserPreference] = {}
+        
         # Database
         self.db_manager = DatabaseManager(
             db_path=self.config.database.path,
             echo=self.config.database.echo,
         )
         
-        logger.info(f"DKI System initialized (tiered_cache={self._use_tiered_cache})")
+        logger.info(
+            f"DKI System initialized "
+            f"(tiered_cache={self._use_tiered_cache}, "
+            f"hybrid_injection={self._use_hybrid_injection})"
+        )
     
     @property
     def model(self) -> BaseModelAdapter:
@@ -248,6 +293,42 @@ class DKISystem:
             pos_encoding = PositionRemapper().detect_position_encoding(self.model.model_name)
             self._position_remapper = PositionRemapper(position_encoding=pos_encoding)
         return self._position_remapper
+    
+    @property
+    def hybrid_injector(self) -> HybridDKIInjector:
+        """Get or create hybrid injector."""
+        if self._hybrid_injector is None:
+            # Get config from dki.hybrid_injection if available
+            hybrid_config_data = getattr(
+                getattr(self.config.dki, 'hybrid_injection', None),
+                '__dict__',
+                {}
+            )
+            
+            # Build HybridInjectionConfig
+            pref_config = hybrid_config_data.get('preference', {})
+            hist_config = hybrid_config_data.get('history', {})
+            
+            config = HybridInjectionConfig(
+                preference_enabled=pref_config.get('enabled', True),
+                preference_alpha=pref_config.get('alpha', 0.4),
+                preference_max_tokens=pref_config.get('max_tokens', 100),
+                preference_position_strategy=pref_config.get('position_strategy', 'negative'),
+                history_enabled=hist_config.get('enabled', True),
+                history_max_tokens=hist_config.get('max_tokens', 500),
+                history_max_messages=hist_config.get('max_messages', 10),
+                history_method=hist_config.get('method', 'suffix_prompt'),
+            )
+            
+            language = hybrid_config_data.get('language', 'en')
+            
+            self._hybrid_injector = HybridDKIInjector(
+                config=config,
+                model=self._model_adapter,
+                tokenizer=None,  # Will be set when model is loaded
+                language=language,
+            )
+        return self._hybrid_injector
     
     def _get_session_cache(self, session_id: str) -> Union[SessionKVCache, TieredKVCache]:
         """
@@ -341,11 +422,75 @@ class DKISystem:
         logger.info(f"Loaded {count} memories for session {session_id}")
         return count
     
+    def set_user_preference(
+        self,
+        user_id: str,
+        preference_text: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """
+        Set user preference for hybrid injection.
+        
+        Preferences are:
+        - Short (typically < 100 tokens)
+        - Stable (rarely change)
+        - Injected via K/V at negative positions
+        - Cached for reuse across sessions
+        
+        Args:
+            user_id: User identifier
+            preference_text: Preference content (e.g., "素食主义者，住北京，不喜欢辣")
+            metadata: Optional metadata
+        """
+        self._user_preferences[user_id] = UserPreference(
+            content=preference_text,
+            user_id=user_id,
+            metadata=metadata or {},
+        )
+        logger.info(f"Set preference for user {user_id}: {len(preference_text)} chars")
+    
+    def get_user_preference(self, user_id: str) -> Optional[UserPreference]:
+        """Get user preference."""
+        return self._user_preferences.get(user_id)
+    
+    def get_session_history(self, session_id: str, max_messages: int = 10) -> SessionHistory:
+        """
+        Get session history for hybrid injection.
+        
+        History is:
+        - Longer (can be 100-500 tokens)
+        - Dynamic (changes each turn)
+        - Injected as suffix prompt with trust-establishing guidance
+        
+        Args:
+            session_id: Session identifier
+            max_messages: Maximum messages to retrieve
+            
+        Returns:
+            SessionHistory object
+        """
+        history = SessionHistory(session_id=session_id)
+        
+        with self.db_manager.session_scope() as db:
+            conv_repo = ConversationRepository(db)
+            messages = conv_repo.get_recent(session_id, limit=max_messages)
+            
+            for msg in messages:
+                history.add_message(
+                    role=msg.role,
+                    content=msg.content,
+                    timestamp=msg.created_at.timestamp() if msg.created_at else None,
+                )
+        
+        return history
+    
     def chat(
         self,
         query: str,
         session_id: str,
+        user_id: Optional[str] = None,
         allow_injection: bool = True,
+        use_hybrid: Optional[bool] = None,
         force_alpha: Optional[float] = None,
         max_new_tokens: int = 512,
         temperature: float = 0.7,
@@ -355,10 +500,16 @@ class DKISystem:
         """
         Generate response using DKI.
         
+        Supports two injection modes:
+        1. Standard DKI: Memory retrieval + K/V injection
+        2. Hybrid DKI: Preferences (K/V) + History (suffix prompt)
+        
         Args:
             query: User query
             session_id: Session identifier
+            user_id: User identifier (for hybrid injection preferences)
             allow_injection: Whether to allow memory injection
+            use_hybrid: Use hybrid injection (None = auto from config)
             force_alpha: Force specific alpha value (bypasses gating)
             max_new_tokens: Maximum tokens to generate
             temperature: Sampling temperature
@@ -367,6 +518,9 @@ class DKISystem:
         Returns:
             DKIResponse with generated text, metadata, and budget analysis
         """
+        # Determine injection mode
+        use_hybrid_mode = use_hybrid if use_hybrid is not None else self._use_hybrid_injection
+        
         # Start latency timer
         with LatencyTimer() as timer:
             cache_hit = False
@@ -374,6 +528,32 @@ class DKISystem:
             
             # Get session cache
             session_cache = self._get_session_cache(session_id)
+            
+            # Step 0: Hybrid injection preparation (if enabled)
+            hybrid_result = None
+            if use_hybrid_mode and allow_injection:
+                timer.start_stage("hybrid_prep")
+                
+                # Get user preference (if user_id provided)
+                preference = None
+                if user_id:
+                    preference = self.get_user_preference(user_id)
+                
+                # Get session history
+                history = self.get_session_history(session_id)
+                
+                # Prepare hybrid input
+                hybrid_result = self.hybrid_injector.prepare_input(
+                    user_query=query,
+                    preference=preference,
+                    history=history if history.messages else None,
+                )
+                
+                # Use modified query with history suffix
+                if hybrid_result.history_tokens > 0:
+                    query = hybrid_result.input_text
+                
+                timer.end_stage()
             
             # Step 1: Gating decision
             timer.start_stage("gating")
@@ -417,9 +597,10 @@ class DKISystem:
             # Step 2: Generate with or without injection
             if not gating_decision.should_inject or gating_decision.alpha < 0.1:
                 # Fallback to vanilla generation (graceful degradation)
+                # But still use hybrid history suffix if available
                 timer.start_stage("prefill")
                 output = self.model.generate(
-                    prompt=query,
+                    prompt=query,  # May include history suffix from hybrid
                     max_new_tokens=max_new_tokens,
                     temperature=temperature,
                     **kwargs
@@ -428,6 +609,13 @@ class DKISystem:
                 memories_used = []
             else:
                 # DKI injection flow
+                # Include preference K/V from hybrid if available
+                preference_kv = None
+                preference_alpha = 0.0
+                if hybrid_result and hybrid_result.preference_kv is not None:
+                    preference_kv = hybrid_result.preference_kv
+                    preference_alpha = hybrid_result.preference_alpha
+                
                 output, cache_hit, cache_tier = self._generate_with_injection(
                     query=query,
                     gating_decision=gating_decision,
@@ -435,6 +623,8 @@ class DKISystem:
                     max_new_tokens=max_new_tokens,
                     temperature=temperature,
                     timer=timer,
+                    preference_kv=preference_kv,
+                    preference_alpha=preference_alpha,
                     **kwargs
                 )
                 memories_used = gating_decision.memories
@@ -443,6 +633,27 @@ class DKISystem:
         
         # Record latency for analysis
         self._budget_analyzer.record_latency(timer.breakdown)
+        
+        # Add hybrid injection metadata
+        if hybrid_result:
+            metadata = {
+                'model': self.model.model_name,
+                'session_cache_stats': session_cache.get_stats(),
+                'task_type': task_type,
+                'hybrid_injection': {
+                    'enabled': True,
+                    'preference_tokens': hybrid_result.preference_tokens,
+                    'history_tokens': hybrid_result.history_tokens,
+                    'preference_alpha': hybrid_result.preference_alpha,
+                },
+            }
+        else:
+            metadata = {
+                'model': self.model.model_name,
+                'session_cache_stats': session_cache.get_stats(),
+                'task_type': task_type,
+                'hybrid_injection': {'enabled': False},
+            }
         
         # Log to database
         self._log_conversation(
@@ -464,11 +675,7 @@ class DKISystem:
             cache_tier=cache_tier,
             budget_analysis=budget_analysis,
             latency_breakdown=timer.breakdown,
-            metadata={
-                'model': self.model.model_name,
-                'session_cache_stats': session_cache.get_stats(),
-                'task_type': task_type,
-            },
+            metadata=metadata,
         )
     
     def _generate_with_injection(
@@ -479,12 +686,26 @@ class DKISystem:
         max_new_tokens: int,
         temperature: float,
         timer: Optional[LatencyTimer] = None,
+        preference_kv: Optional[Any] = None,
+        preference_alpha: float = 0.0,
         **kwargs
     ) -> tuple:
         """
         Generate response with K/V injection.
         
-        Supports both simple SessionKVCache and TieredKVCache.
+        Supports:
+        - Simple SessionKVCache and TieredKVCache
+        - Hybrid injection with preference K/V
+        
+        Args:
+            query: User query (may include history suffix)
+            gating_decision: Gating decision with memories
+            session_cache: K/V cache
+            max_new_tokens: Max tokens to generate
+            temperature: Sampling temperature
+            timer: Latency timer
+            preference_kv: Pre-computed preference K/V (from hybrid injection)
+            preference_alpha: Alpha for preference injection
         
         Returns:
             (ModelOutput, cache_hit, cache_tier)
@@ -558,6 +779,32 @@ class DKISystem:
             merged_kv = all_kv_entries[0]
         else:
             merged_kv = []
+        
+        # Add preference K/V if available (hybrid injection)
+        # Preference K/V is prepended (negative positions conceptually)
+        if preference_kv is not None and preference_alpha > 0:
+            if timer:
+                timer.start_stage("preference_merge")
+            
+            # Scale preference K/V with its own alpha
+            if isinstance(preference_kv, list) and len(preference_kv) > 0:
+                scaled_pref_kv = []
+                for entry in preference_kv:
+                    key, value = self.mis.scale_kv_values(
+                        entry.key, entry.value, preference_alpha
+                    )
+                    scaled_pref_kv.append(KVCacheEntry(
+                        key=key, value=value, layer_idx=entry.layer_idx
+                    ))
+                
+                # Prepend preference K/V to merged K/V
+                if merged_kv:
+                    merged_kv = self._merge_kv_entries([scaled_pref_kv, merged_kv])
+                else:
+                    merged_kv = scaled_pref_kv
+            
+            if timer:
+                timer.end_stage()
         
         # Apply alpha scaling to K/V (MIS)
         if timer:

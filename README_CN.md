@@ -1,6 +1,6 @@
 # DKI - Dynamic KV Injection 动态键值注入系统
 
-> 大型语言模型的注意力层级记忆增强
+> 大型语言模型的用户级跨会话记忆系统
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -9,36 +9,98 @@
 
 ## 📖 概述
 
-DKI (Dynamic KV Injection，动态键值注入) 是一种针对大型语言模型的新型记忆增强方法，它在注意力层级而非 token 层级注入记忆内容。
+DKI (Dynamic KV Injection，动态键值注入) 是一种针对大型语言模型的**用户级跨会话记忆系统**，它在注意力层级而非 token 层级注入记忆内容。
 
-与传统的 RAG（检索增强生成）会消耗上下文窗口 token 不同，DKI 计算记忆内容的键值（Key-Value）表示，并将其直接注入注意力机制，**保留完整的上下文窗口供用户输入使用**。
+### DKI 是什么
+
+DKI 专为**用户级记忆**设计：
+
+-   **用户偏好**：饮食限制、沟通风格、兴趣爱好
+-   **会话历史**：之前的对话上下文、已建立的事实
+-   **个人上下文**：位置、时区、语言偏好
+
+### DKI 不是什么
+
+DKI **不适用于**外部知识库或公共数据检索。这些场景请使用 RAG（检索增强生成）。
+
+### 为什么这个定位很重要
+
+这种聚焦的范围带来以下优势：
+
+1. **短记忆**（50-200 tokens）→ 降低位置编码风险
+2. **用户自有数据** → 简化隐私考量
+3. **会话连贯** → 有效的 K/V 缓存
+4. **稳定偏好** → 高缓存复用率
 
 ### 核心特性
 
 -   **🧠 注意力层级注入**：通过 K/V 注入记忆，而非提示词 token
+-   **🔀 混合注入策略**：偏好（K/V）+ 历史（后缀提示词）
 -   **🎚️ 记忆影响缩放（MIS）**：连续的 α ∈ [0, 1] 强度控制
 -   **🔄 查询条件投影**：FiLM 风格的记忆中心变换
--   **🚦 双因子门控**：不确定性 × 相关性的智能注入决策
+-   **🚦 双因子门控**：相关性驱动决策，熵调制强度
 -   **💾 分层 KV 缓存**：L1(GPU) → L2(CPU) → L3(SSD) → L4(重计算)
 -   **📊 注意力预算分析**：Token 预算 vs 注意力预算追踪
+-   **🔌 插件化架构**：配置驱动，框架无关
 -   **🔌 多引擎支持**：vLLM、LLaMA、DeepSeek、GLM
 -   **✅ 优雅降级**：α → 0 平滑回退到普通 LLM 行为
 
 ## 🏗️ 架构
 
+### 混合注入策略
+
+DKI 使用**分层注入方法**，模拟人类认知：
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      DKI 混合注入架构                                    │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │  第1层：用户偏好（K/V 注入）                                      │    │
+│  │  ├── 内容：饮食、风格、兴趣                                       │    │
+│  │  ├── 位置：负位置（概念上在用户输入"之前"）                        │    │
+│  │  ├── 影响：隐式、背景（如同人格）                                 │    │
+│  │  └── α：0.3-0.5（较低，用于微妙影响）                             │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                         │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │  第2层：会话历史（后缀提示词）                                     │    │
+│  │  ├── 内容：近期对话轮次                                           │    │
+│  │  ├── 位置：用户查询之后（正位置）                                 │    │
+│  │  ├── 影响：显式、可引用（如同记忆）                               │    │
+│  │  └── 提示词：建立信任的引导                                       │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                         │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │  第3层：当前查询（标准输入）                                       │    │
+│  │  └── 注意力的主要焦点                                             │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 系统流程
+
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                         动态键值注入系统                                 │
 ├─────────────────────────────────────────────────────────────────────────┤
-│  用户查询                                                                │
+│  用户查询 + 用户ID                                                       │
 │       │                                                                 │
 │       ▼                                                                 │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │  0. 混合注入准备                                                  │    │
+│  │     ├── 加载用户偏好（缓存的 K/V）                                │    │
+│  │     └── 格式化会话历史（后缀提示词）                              │    │
+│  └─────────────────────────────┬───────────────────────────────────┘    │
+│                                ▼                                        │
 │  ┌─────────────────────────────────────────────────────────────────┐    │
 │  │  1. 记忆路由器（FAISS + 句子嵌入）                                │    │
 │  └─────────────────────────────┬───────────────────────────────────┘    │
 │                                ▼                                        │
 │  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  2. 双因子门控（熵 × 相关性）                                     │    │
+│  │  2. 双因子门控（相关性驱动，熵调制）                               │    │
 │  └─────────────────────────────┬───────────────────────────────────┘    │
 │                    ┌───────────┴───────────┐                            │
 │                    ▼                       ▼                            │
@@ -63,7 +125,7 @@ DKI (Dynamic KV Injection，动态键值注入) 是一种针对大型语言模�
 
 ```bash
 # 克隆仓库
-git clone https://github.com/LucasMa2025/DKI.git
+git clone https://github.com/your-org/DKI.git
 cd DKI
 
 # 安装（创建虚拟环境、安装依赖、初始化数据库）
@@ -95,28 +157,63 @@ from dki import DKISystem
 # 初始化系统
 dki = DKISystem()
 
-# 添加记忆
-dki.add_memory(
-    session_id="user_001",
-    content="用户偏好素食，对海鲜过敏"
-)
-dki.add_memory(
-    session_id="user_001",
-    content="用户住在北京，喜欢徒步旅行"
+# 设置用户偏好（短小、稳定、缓存 K/V）
+dki.set_user_preference(
+    user_id="user_001",
+    preference_text="素食主义者，住北京朝阳区，不喜欢辣，喜欢安静的环境"
 )
 
-# 带记忆注入的对话
+# 添加会话记忆（用于检索式注入）
+dki.add_memory(
+    session_id="session_001",
+    content="用户上周提到去过静心素食餐厅"
+)
+
+# 混合注入对话
+# - 偏好：K/V 注入（隐式影响）
+# - 历史：后缀提示词（显式参考）
 response = dki.chat(
-    query="推荐一家午餐餐厅",
-    session_id="user_001"
+    query="今晚想找一家餐厅，有什么新推荐吗？",
+    session_id="session_001",
+    user_id="user_001",  # 启用偏好注入
+    use_hybrid=True,     # 使用混合注入策略
 )
 
 print(response.text)
-# 输出会考虑素食偏好，无需在提示词中显式提及
+# 输出会考虑：
+# - 素食偏好（隐式，来自 K/V）
+# - 之前的餐厅访问（显式，来自历史）
+# - 北京位置（隐式，来自 K/V）
 
 print(f"Alpha值: {response.gating_decision.alpha}")
 print(f"使用的记忆数量: {len(response.memories_used)}")
 print(f"延迟: {response.latency_ms}ms")
+print(f"混合注入: {response.metadata.get('hybrid_injection', {})}")
+```
+
+### 插件化集成
+
+```python
+from dki.core.plugin_interface import DKIPlugin
+
+# 从配置文件加载
+plugin = DKIPlugin.from_config("./config/dki_plugin.yaml")
+
+# 附加到任意模型
+plugin.attach(model, tokenizer)
+
+# 检查是否应使用 DKI（支持 A/B 测试）
+if plugin.should_use_dki(user_id="user_001"):
+    # 从配置的数据源获取用户记忆
+    preferences, history = plugin.get_user_memory("user_001")
+    
+    # 计算偏好的 K/V
+    K_pref, V_pref = plugin.compute_memory_kv(preferences, model)
+    
+    # 注入到注意力
+    K_combined, V_combined = plugin.inject_memory(
+        K_user, V_user, K_pref, V_pref, alpha=0.4
+    )
 ```
 
 ## 📁 项目结构
@@ -180,19 +277,88 @@ model:
             model_name: "Qwen/Qwen2-7B-Instruct"
             tensor_parallel_size: 1
 
-# DKI设置
+# DKI设置 - 用户级记忆系统
 dki:
+    enabled: true
+    version: "2.5"
+    
+    # 混合注入策略
+    hybrid_injection:
+        enabled: true
+        language: "cn"  # en | cn
+        
+        # 偏好：K/V 注入（隐式）
+        preference:
+            enabled: true
+            position_strategy: "negative"
+            alpha: 0.4  # 较低用于背景影响
+            max_tokens: 100
+        
+        # 历史：后缀提示词（显式）
+        history:
+            enabled: true
+            method: "suffix_prompt"
+            max_tokens: 500
+            max_messages: 10
+    
+    # 记忆源（外部数据库）
+    memory_source:
+        type: "sqlite"
+        connection: "./data/dki.db"
+    
+    # 门控：相关性驱动，熵调制
     gating:
-        entropy_threshold: 0.5 # 熵阈值
-        relevance_threshold: 0.7 # 相关性阈值
-    cache:
-        max_size: 100
-        strategy: "weighted" # lru, lfu, weighted
+        relevance_threshold: 0.7
+        entropy_ceiling: 1.0
+        entropy_floor: 0.5
+    
+    # 安全设置
+    safety:
+        max_alpha: 0.8
+        fallback_on_error: true
+        audit_logging: true
+    
+    # A/B 测试
+    ab_test:
+        enabled: false
+        dki_percentage: 50
+```
 
-# RAG设置
-rag:
-    top_k: 5
-    similarity_threshold: 0.5
+### 插件配置（独立部署）
+
+创建 `dki_plugin.yaml` 用于框架无关部署：
+
+```yaml
+dki:
+    enabled: true
+    version: "1.0"
+    
+    memory_source:
+        type: "postgresql"
+        connection: "postgresql://user:pass@host:5432/db"
+        table: "user_memories"
+    
+    injection:
+        preference_injection:
+            enabled: true
+            position_strategy: "negative"
+            alpha: 0.4
+            max_tokens: 100
+        
+        history_injection:
+            enabled: true
+            method: "suffix_prompt"
+            max_tokens: 500
+    
+    safety:
+        max_alpha: 0.8
+        fallback_on_error: true
+        audit_logging: true
+        log_path: "./dki_audit.log"
+    
+    ab_test:
+        enabled: true
+        dki_percentage: 10  # 从 10% 流量开始
 ```
 
 ## 📊 实验
@@ -269,7 +435,23 @@ results = runner.run_alpha_sensitivity(
 
 ## 🔬 研究背景
 
-DKI 解决了 RAG 的一个根本性限制：检索到的内容会消耗上下文窗口容量，在记忆内容和用户输入空间之间产生冲突。
+### DKI 的定位：用户级记忆系统
+
+与 RAG 针对**外部知识**（文档、数据库、网页内容）不同，DKI 专为**用户级记忆**设计：
+
+| 维度 | RAG | DKI |
+| ---- | --- | --- |
+| **目标数据** | 外部知识库 | 用户偏好、会话历史 |
+| **数据规模** | 大（数千文档） | 小（每用户 50-200 tokens） |
+| **更新频率** | 批量更新 | 每会话实时更新 |
+| **隐私** | 共享知识 | 用户自有数据 |
+| **缓存** | 文档级 | 用户级（高复用） |
+
+这种聚焦的范围是**有意为之**的，它使 DKI 的核心优势得以实现。
+
+### Token 预算分析
+
+DKI 解决了 RAG 的一个根本性限制：检索到的内容会消耗上下文窗口容量。
 
 **RAG 范式：**
 
@@ -299,6 +481,20 @@ DKI **不等同于**交叉注意力：
 | 架构   | 无需修改         | 专用层                                 |
 | 兼容性 | 任何仅解码器 LLM | 仅编码器-解码器                        |
 | 控制   | 连续 α           | 学习权重                               |
+
+### 混合注入策略的原理
+
+为什么对偏好和历史使用不同的策略？
+
+| 记忆类型 | 特点 | 策略 | 原因 |
+| -------- | ---- | ---- | ---- |
+| **偏好** | 短（20-100 tokens），稳定，抽象 | K/V 注入（负位置） | OOD 风险低，可缓存，隐式影响 |
+| **历史** | 较长（100-500 tokens），动态，具体 | 后缀提示词（正位置） | 零 OOD 风险，可引用，显式参考 |
+
+这种分层方法：
+- 最小化 OOD 风险（偏好很短）
+- 支持历史引用（在提示词中可见）
+- 减少幻觉（建立信任的提示词）
 
 ### 设计不变量
 
@@ -423,36 +619,36 @@ alpha = min(alpha_base, alpha_max)
 
 #### ✅ 推荐使用 DKI 的场景
 
-1. **长上下文 + 受限窗口**
+1. **个性化助手**
 
-    - 用户输入 > 2500 tokens
-    - 上下文窗口 < 8K tokens
-    - 需要注入 > 200 tokens 的记忆
+    - 用户偏好需要跨会话持久化
+    - 隐式个性化（无需在提示词中显式提及）
+    - 多轮对话需要上下文连续性
 
-2. **多轮对话**
+2. **客服系统**
 
-    - > 3 轮交互
-    - 需要持久化个性化
-    - 会话缓存可显著降低延迟
+    - 用户画像 + 对话历史
+    - 跨会话一致体验
+    - 隐私敏感的用户数据
 
-3. **细粒度控制需求**
+3. **教育应用**
 
-    - 需要动态调整记忆强度
-    - 不同记忆需要不同权重
-    - 需要可审计的注入决策
+    - 学习偏好 + 进度历史
+    - 基于用户水平的自适应响应
+    - 长期用户建模
 
-4. **实时交互系统**
-    - 延迟敏感（多轮后）
-    - 需要快速响应时间
-    - Token 计费昂贵
+4. **健康/养生助手**
+    - 健康档案 + 咨询历史
+    - 敏感个人数据
+    - 一致的医疗上下文
 
-#### ⚠️ 慎用 DKI 的场景
+#### ⚠️ 建议使用 RAG 的场景
 
-1. **简单事实性 QA**
+1. **外部知识检索**
 
-    - 单轮查询
-    - 充足的上下文窗口
-    - RAG 更简单直接
+    - 文档搜索和问答
+    - 公共知识库
+    - 频繁更新的内容
 
 2. **首轮延迟极度敏感**
 
@@ -467,7 +663,7 @@ alpha = min(alpha_base, alpha_max)
     - 注意力可视化不足
 
 4. **快速原型开发**
-    - 使用成熟 RAG 生态系统
+    - 使用成熟 RAG 生态系统（LangChain、LlamaIndex）
     - 需要快速迭代
     - 无需深度定制
 
@@ -543,25 +739,40 @@ print(f"注意力FLOPs: {budget.attention_flops}")
 A: 不需要。DKI 是推理时增强，使用冻结的模型参数。仅 α 预测器和 QCP 是可选的小型网络（如果需要训练）。
 
 **Q: DKI 可以与现有 RAG 系统结合使用吗？**  
-A: 可以。您可以使用 RAG 进行初始检索，然后使用 DKI 注入。这是一种混合方法。
+A: 可以！DKI 处理用户级记忆，RAG 处理外部知识。它们是互补的：
+- RAG：文档检索、知识库
+- DKI：用户偏好、会话历史
 
 **Q: 内存占用如何？**  
-A: 每条 200 token 的记忆约 100MB（未压缩）。使用分层缓存和 GEAR 压缩可实现 8× 压缩。
+A: 每条 200 token 的记忆约 100MB（未压缩）。使用分层缓存和 GEAR 压缩可实现 8× 压缩。对于用户级记忆（通常 < 200 tokens），这是非常可控的。
 
 **Q: 支持哪些位置编码方案？**  
-A: 目前支持 RoPE 和 ALiBi。对于其他方案，请参阅`position_remapper.py`中的实现。
+A: 目前支持 RoPE 和 ALiBi。对于短偏好（< 100 tokens），负位置映射是安全的。对于较长内容，使用后缀提示词注入。
 
 **Q: 如何调试注入决策？**  
 A: 启用审计日志（`config.yaml`中的`audit_logging: true`），所有注入决策将被记录，包括 memory_ids、α 值和门控原因。
 
+**Q: 偏好注入和历史注入有什么区别？**  
+A:
+- **偏好**：K/V 注入在负位置，隐式影响，可缓存
+- **历史**：后缀提示词在正位置，显式参考，动态变化
+
+**Q: 如何将 DKI 集成到现有系统？**  
+A: 使用插件接口：
+```python
+from dki.core.plugin_interface import DKIPlugin
+plugin = DKIPlugin.from_config("./dki_config.yaml")
+plugin.attach(model)
+```
+
 **Q: 生产环境部署建议？**  
 A:
 
-1. 从小缓存开始（size=50）并监控命中率
-2. 使用 Weighted 缓存策略
-3. 设置合理的 α 上限（0.7）
-4. 监控幻觉率
-5. 与 RAG 进行 A/B 测试
+1. 启用混合注入
+2. 偏好 α 设置为 0.4（保守）
+3. 启用 A/B 测试，初始 10% 流量
+4. 监控幻觉率和用户满意度
+5. 根据指标逐步增加 DKI 流量
 
 ### 路线图
 
@@ -570,9 +781,12 @@ A:
 -   [x] 实验框架
 -   [x] LLaMA/DeepSeek/GLM 适配器
 -   [x] FlashAttention-3 集成
+-   [x] 混合注入策略（偏好 + 历史）
+-   [x] 插件化架构（配置驱动）
+-   [x] A/B 测试支持
+-   [ ] 注意力可视化工具（Streamlit 调试器）
 -   [ ] 多模态扩展（图像记忆）
 -   [ ] 分布式部署支持
--   [ ] 注意力可视化工具
 -   [ ] LangChain/LlamaIndex 集成
 
 ### 致谢
@@ -588,6 +802,3 @@ A:
 ---
 
 **DKI** - 在注意力层级重新思考记忆增强
-
-
-

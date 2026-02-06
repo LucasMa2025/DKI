@@ -69,13 +69,51 @@ rag:
   index_type: "faiss"  # faiss, annoy
 
 # ============ DKI Settings ============
+# DKI is a User-Level Cross-Session Memory System
+# Scope: User preferences, session history, personal context
+# NOT for: External knowledge bases, public data retrieval (use RAG)
 dki:
   enabled: true
+  version: "2.5"
   
   # Use tiered cache instead of simple cache (recommended for production)
   use_tiered_cache: true
   
-  # Memory Influence Scaling (MIS)
+  # ============ Hybrid Injection Strategy (Paper Section 3.9) ============
+  # Layered approach: Preferences via K/V, History via suffix prompt
+  hybrid_injection:
+    enabled: true
+    language: "en"  # en | cn (affects prompt templates)
+    
+    # Preference Injection (K/V level, negative position)
+    # Short, stable, implicit influence - like "personality"
+    preference:
+      enabled: true
+      position_strategy: "negative"  # negative | actual_prefix
+      alpha: 0.4                     # Lower α for background influence (0.3-0.5 recommended)
+      max_tokens: 100                # Preferences should be short
+    
+    # History Injection (Token level, suffix prompt)
+    # Longer, dynamic, explicit reference - like "memory"
+    history:
+      enabled: true
+      method: "suffix_prompt"        # suffix_prompt | kv_injection
+      max_tokens: 500                # Can be longer than preferences
+      max_messages: 10               # Recent messages to include
+      prompt_template: "default"     # default | custom path
+  
+  # ============ Memory Source Configuration ============
+  # Connect to external memory database
+  memory_source:
+    type: "sqlite"                   # sqlite | postgresql | redis | api | file
+    connection: "./data/dki.db"
+    table: "user_memories"
+    # For API source:
+    # type: "api"
+    # endpoint: "https://memory-service/api/v1/memories"
+    # auth: "Bearer ${MEMORY_API_KEY}"
+  
+  # ============ Memory Influence Scaling (MIS) ============
   # Provides continuous α ∈ [0, 1] control for injection strength
   # α = 0: vanilla LLM, α = 1: full memory influence
   mis:
@@ -83,30 +121,34 @@ dki:
     alpha_max: 1.0
     alpha_default: 0.5
     
-  # Query-Conditioned Projection (QCP)
+  # ============ Query-Conditioned Projection (QCP) ============
   # FiLM-style modulation: Memory-centric, query only modulates
   projection:
     rank: 64
     dropout: 0.1
     
-  # Dual-Factor Gating
+  # ============ Dual-Factor Gating ============
   # Inject = f(Uncertainty, Relevance)
   # Note: Entropy is a heuristic proxy, not rigorous uncertainty estimator
+  # Design: Relevance-driven decision, entropy-modulated strength
   gating:
     entropy_threshold: 0.5
     relevance_threshold: 0.7
+    entropy_ceiling: 1.0             # Max α when entropy is high
+    entropy_floor: 0.5               # Max α when entropy is low
     use_margin: true
     margin_weight: 0.3
     
-  # Simple Session KV Cache (fallback)
+  # ============ Simple Session KV Cache (fallback) ============
   cache:
     enabled: true
     max_size: 100
     strategy: "weighted"  # lru, lfu, weighted
     ttl_seconds: 3600
   
-  # Tiered KV Cache (Paper Section 7.4)
+  # ============ Tiered KV Cache (Paper Section 7.4) ============
   # Memory hierarchy: L1(GPU) → L2(CPU) → L3(SSD) → L4(Recompute)
+  # Note: This is an OPTIONAL enhancement, not required for correctness
   tiered_cache:
     enabled: true
     l1_max_size: 10       # GPU HBM: 5-10 hot memories
@@ -125,9 +167,23 @@ dki:
     selective_layers: false
     cache_layers: [8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]
     
-  # Position Encoding
+  # ============ Position Encoding ============
   position:
     strategy: "virtual_prefix"  # virtual_prefix, actual_prefix
+    # Note: Negative position mapping may introduce O.O.D. behavior
+    # For short preferences (< 100 tokens), risk is minimal
+  
+  # ============ Safety Settings ============
+  safety:
+    max_alpha: 0.8                   # Hard ceiling for α
+    fallback_on_error: true          # Fall back to vanilla LLM on error
+    audit_logging: true              # Log all injection decisions
+    log_path: "./logs/dki_audit.log"
+  
+  # ============ A/B Testing ============
+  ab_test:
+    enabled: false
+    dki_percentage: 50               # Percentage of traffic to route to DKI
     
 # ============ Memory Store Settings ============
 memory:

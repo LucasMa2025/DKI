@@ -1,6 +1,6 @@
 # DKI - Dynamic KV Injection
 
-> Attention-Level Memory Augmentation for Large Language Models
+> User-Level Cross-Session Memory System for Large Language Models
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -9,36 +9,98 @@
 
 ## 📖 Overview
 
-DKI (Dynamic KV Injection) is a novel approach to memory augmentation for Large Language Models that injects memory content at the attention level rather than the token level.
+DKI (Dynamic KV Injection) is a **user-level cross-session memory system** for Large Language Models that injects memory content at the attention level rather than the token level.
 
-Unlike traditional RAG (Retrieval-Augmented Generation) which consumes context window tokens, DKI computes Key-Value representations of memory content and injects them directly into the attention mechanism, **preserving the full context window for user input**.
+### What DKI Is
+
+DKI is designed specifically for **user-level memory**:
+
+-   **User Preferences**: Dietary restrictions, communication style, interests
+-   **Session History**: Previous conversation context, established facts
+-   **Personal Context**: Location, timezone, language preferences
+
+### What DKI Is NOT
+
+DKI is **NOT** for external knowledge bases or public data retrieval. For those use cases, use RAG (Retrieval-Augmented Generation).
+
+### Why This Scope Matters
+
+This focused scope enables:
+
+1. **Short memory** (50-200 tokens) → reduced position encoding risks
+2. **User-owned data** → simplified privacy considerations
+3. **Session-coherent** → effective K/V caching
+4. **Stable preferences** → high cache reuse rate
 
 ### Key Features
 
 -   **🧠 Attention-Level Injection**: Memory injected via K/V, not prompt tokens
+-   **🔀 Hybrid Injection Strategy**: Preferences (K/V) + History (suffix prompt)
 -   **🎚️ Memory Influence Scaling (MIS)**: Continuous α ∈ [0, 1] control
 -   **🔄 Query-Conditioned Projection**: FiLM-style memory-centric transformation
--   **🚦 Dual-Factor Gating**: Uncertainty × Relevance for smart injection decisions
+-   **🚦 Dual-Factor Gating**: Relevance-driven decision, entropy-modulated strength
 -   **💾 Tiered KV Cache**: L1(GPU) → L2(CPU) → L3(SSD) → L4(Recompute)
 -   **📊 Attention Budget Analysis**: Token vs Attention budget tracking
+-   **🔌 Plugin Architecture**: Configuration-driven, framework-agnostic
 -   **🔌 Multi-Engine Support**: vLLM, LLaMA, DeepSeek, GLM
 -   **✅ Graceful Degradation**: α → 0 smoothly recovers vanilla LLM behavior
 
 ## 🏗️ Architecture
 
+### Hybrid Injection Strategy
+
+DKI uses a **layered injection approach** that mirrors human cognition:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    DKI Hybrid Injection Architecture                     │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │  Layer 1: User Preferences (K/V Injection)                      │    │
+│  │  ├── Content: Dietary, style, interests                         │    │
+│  │  ├── Position: Negative (conceptually "before" user input)      │    │
+│  │  ├── Influence: Implicit, background (like personality)         │    │
+│  │  └── α: 0.3-0.5 (lower, for subtle influence)                   │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                         │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │  Layer 2: Session History (Suffix Prompt)                       │    │
+│  │  ├── Content: Recent conversation turns                         │    │
+│  │  ├── Position: After user query (positive positions)            │    │
+│  │  ├── Influence: Explicit, citable (like memory)                 │    │
+│  │  └── Prompt: Trust-establishing guidance                        │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                         │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │  Layer 3: Current Query (Standard Input)                        │    │
+│  │  └── Primary focus of attention                                 │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### System Flow
+
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                     Dynamic KV Injection System                         │
 ├─────────────────────────────────────────────────────────────────────────┤
-│  User Query                                                             │
+│  User Query + User ID                                                   │
 │       │                                                                 │
 │       ▼                                                                 │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │  0. Hybrid Injection Preparation                                │    │
+│  │     ├── Load user preferences (cached K/V)                      │    │
+│  │     └── Format session history (suffix prompt)                  │    │
+│  └─────────────────────────────┬───────────────────────────────────┘    │
+│                                ▼                                        │
 │  ┌─────────────────────────────────────────────────────────────────┐    │
 │  │  1. Memory Router (FAISS + Sentence Embedding)                  │    │
 │  └─────────────────────────────┬───────────────────────────────────┘    │
 │                                ▼                                        │
 │  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  2. Dual-Factor Gating (Entropy × Relevance)                    │    │
+│  │  2. Dual-Factor Gating (Relevance-driven, Entropy-modulated)    │    │
 │  └─────────────────────────────┬───────────────────────────────────┘    │
 │                    ┌───────────┴───────────┐                            │
 │                    ▼                       ▼                            │
@@ -94,28 +156,63 @@ from dki import DKISystem
 # Initialize
 dki = DKISystem()
 
-# Add memories
-dki.add_memory(
-    session_id="user_001",
-    content="User prefers vegetarian food and is allergic to seafood"
-)
-dki.add_memory(
-    session_id="user_001",
-    content="User lives in Beijing and enjoys hiking"
+# Set user preferences (short, stable, cached K/V)
+dki.set_user_preference(
+    user_id="user_001",
+    preference_text="素食主义者，住北京朝阳区，不喜欢辣，喜欢安静的环境"
 )
 
-# Chat with memory injection
+# Add session memories (for retrieval-based injection)
+dki.add_memory(
+    session_id="session_001",
+    content="User mentioned they went to 静心素食 last week"
+)
+
+# Chat with hybrid injection
+# - Preferences: K/V injection (implicit influence)
+# - History: Suffix prompt (explicit reference)
 response = dki.chat(
-    query="Recommend a restaurant for lunch",
-    session_id="user_001"
+    query="今晚想找一家餐厅，有什么新推荐吗？",
+    session_id="session_001",
+    user_id="user_001",  # Enable preference injection
+    use_hybrid=True,     # Use hybrid injection strategy
 )
 
 print(response.text)
-# Output considers vegetarian preference without explicit prompt mention
+# Output considers:
+# - Vegetarian preference (implicit, from K/V)
+# - Previous restaurant visit (explicit, from history)
+# - Beijing location (implicit, from K/V)
 
 print(f"Alpha: {response.gating_decision.alpha}")
 print(f"Memories used: {len(response.memories_used)}")
 print(f"Latency: {response.latency_ms}ms")
+print(f"Hybrid: {response.metadata.get('hybrid_injection', {})}")
+```
+
+### Plugin-Based Integration
+
+```python
+from dki.core.plugin_interface import DKIPlugin
+
+# Load from configuration file
+plugin = DKIPlugin.from_config("./config/dki_plugin.yaml")
+
+# Attach to any model
+plugin.attach(model, tokenizer)
+
+# Check if DKI should be used (A/B testing support)
+if plugin.should_use_dki(user_id="user_001"):
+    # Get user memory from configured source
+    preferences, history = plugin.get_user_memory("user_001")
+    
+    # Compute K/V for preferences
+    K_pref, V_pref = plugin.compute_memory_kv(preferences, model)
+    
+    # Inject into attention
+    K_combined, V_combined = plugin.inject_memory(
+        K_user, V_user, K_pref, V_pref, alpha=0.4
+    )
 ```
 
 ## 📁 Project Structure
@@ -179,19 +276,88 @@ model:
             model_name: "Qwen/Qwen2-7B-Instruct"
             tensor_parallel_size: 1
 
-# DKI Settings
+# DKI Settings - User-Level Memory System
 dki:
+    enabled: true
+    version: "2.5"
+    
+    # Hybrid Injection Strategy
+    hybrid_injection:
+        enabled: true
+        language: "cn"  # en | cn
+        
+        # Preferences: K/V injection (implicit)
+        preference:
+            enabled: true
+            position_strategy: "negative"
+            alpha: 0.4  # Lower for background influence
+            max_tokens: 100
+        
+        # History: Suffix prompt (explicit)
+        history:
+            enabled: true
+            method: "suffix_prompt"
+            max_tokens: 500
+            max_messages: 10
+    
+    # Memory source (external database)
+    memory_source:
+        type: "sqlite"
+        connection: "./data/dki.db"
+    
+    # Gating: Relevance-driven, entropy-modulated
     gating:
-        entropy_threshold: 0.5
         relevance_threshold: 0.7
-    cache:
-        max_size: 100
-        strategy: "weighted" # lru, lfu, weighted
+        entropy_ceiling: 1.0
+        entropy_floor: 0.5
+    
+    # Safety
+    safety:
+        max_alpha: 0.8
+        fallback_on_error: true
+        audit_logging: true
+    
+    # A/B Testing
+    ab_test:
+        enabled: false
+        dki_percentage: 50
+```
 
-# RAG Settings
-rag:
-    top_k: 5
-    similarity_threshold: 0.5
+### Plugin Configuration (Standalone)
+
+Create `dki_plugin.yaml` for framework-agnostic deployment:
+
+```yaml
+dki:
+    enabled: true
+    version: "1.0"
+    
+    memory_source:
+        type: "postgresql"
+        connection: "postgresql://user:pass@host:5432/db"
+        table: "user_memories"
+    
+    injection:
+        preference_injection:
+            enabled: true
+            position_strategy: "negative"
+            alpha: 0.4
+            max_tokens: 100
+        
+        history_injection:
+            enabled: true
+            method: "suffix_prompt"
+            max_tokens: 500
+    
+    safety:
+        max_alpha: 0.8
+        fallback_on_error: true
+        audit_logging: true
+        log_path: "./dki_audit.log"
+    
+    ab_test:
+        enabled: true
+        dki_percentage: 10  # Start with 10% traffic
 ```
 
 ## 📊 Experiments
@@ -268,7 +434,23 @@ results = runner.run_alpha_sensitivity(
 
 ## 🔬 Research Background
 
-DKI addresses a fundamental limitation of RAG: retrieved content consumes context window capacity, creating a trade-off between memory content and user input space.
+### DKI's Positioning: User-Level Memory System
+
+Unlike RAG which targets **external knowledge** (documents, databases, web content), DKI is designed specifically for **user-level memory**:
+
+| Dimension | RAG | DKI |
+| --------- | --- | --- |
+| **Target Data** | External knowledge bases | User preferences, session history |
+| **Data Size** | Large (thousands of documents) | Small (50-200 tokens per user) |
+| **Update Frequency** | Batch updates | Real-time per session |
+| **Privacy** | Shared knowledge | User-owned data |
+| **Caching** | Document-level | User-level (high reuse) |
+
+This focused scope is **intentional** and enables DKI's key advantages.
+
+### Token Budget Analysis
+
+DKI addresses a fundamental limitation of RAG: retrieved content consumes context window capacity.
 
 **RAG Paradigm:**
 
@@ -298,6 +480,20 @@ DKI is NOT equivalent to Cross-Attention:
 | Architecture  | No modification      | Dedicated layers                         |
 | Compatibility | Any decoder-only LLM | Encoder-decoder only                     |
 | Control       | Continuous α         | Learned weights                          |
+
+### Hybrid Injection Rationale
+
+Why use different strategies for preferences vs history?
+
+| Memory Type | Characteristics | Strategy | Reason |
+| ----------- | --------------- | -------- | ------ |
+| **Preferences** | Short (20-100 tokens), stable, abstract | K/V injection (negative position) | Low OOD risk, cacheable, implicit influence |
+| **History** | Longer (100-500 tokens), dynamic, concrete | Suffix prompt (positive position) | Zero OOD risk, citable, explicit reference |
+
+This layered approach:
+- Minimizes OOD risk (preferences are short)
+- Enables history citation (visible in prompt)
+- Reduces hallucination (trust-establishing prompts)
 
 ### Design Invariants
 
@@ -412,36 +608,36 @@ alpha = min(alpha_base, alpha_max)
 
 #### ✅ Recommended for DKI
 
-1. **Long Context + Constrained Window**
+1. **Personalized Assistants**
 
-    - User input > 2500 tokens
-    - Context window < 8K tokens
-    - Need to inject > 200 tokens of memory
+    - User preferences need to persist across sessions
+    - Implicit personalization (no explicit mention in prompt)
+    - Multi-turn dialogue with context continuity
 
-2. **Multi-turn Dialogue**
+2. **Customer Service Systems**
 
-    - > 3 turns of interaction
-    - Persistent personalization needed
-    - Session cache significantly reduces latency
+    - User profile + conversation history
+    - Consistent experience across sessions
+    - Privacy-sensitive user data
 
-3. **Fine-grained Control Requirements**
+3. **Educational Applications**
 
-    - Need dynamic memory strength adjustment
-    - Different memories need different weights
-    - Auditable injection decisions required
+    - Learning preferences + progress history
+    - Adaptive responses based on user level
+    - Long-term user modeling
 
-4. **Real-time Interactive Systems**
-    - Latency sensitive (after multiple turns)
-    - Fast response time needed
-    - Token billing is expensive
+4. **Health/Wellness Assistants**
+    - Health profile + consultation history
+    - Sensitive personal data
+    - Consistent medical context
 
-#### ⚠️ Use DKI with Caution
+#### ⚠️ Use RAG Instead
 
-1. **Simple Factual QA**
+1. **External Knowledge Retrieval**
 
-    - Single-turn queries
-    - Ample context window
-    - RAG is simpler and more direct
+    - Document search and QA
+    - Public knowledge bases
+    - Frequently updated content
 
 2. **First-turn Latency Critical**
 
@@ -456,7 +652,7 @@ alpha = min(alpha_base, alpha_max)
     - Attention visualization insufficient
 
 4. **Rapid Prototyping**
-    - Using mature RAG ecosystem
+    - Using mature RAG ecosystem (LangChain, LlamaIndex)
     - Need fast iteration
     - No deep customization needed
 
@@ -528,25 +724,40 @@ print(f"Attention FLOPs: {budget.attention_flops}")
 A: No. DKI is an inference-time enhancement using frozen model parameters. Only the α predictor and QCP are optional small networks (if training is needed).
 
 **Q: Can DKI be combined with existing RAG systems?**  
-A: Yes. You can use RAG for initial retrieval, then use DKI for injection. This is a hybrid approach.
+A: Yes! DKI handles user-level memory, RAG handles external knowledge. They are complementary:
+- RAG: Document retrieval, knowledge bases
+- DKI: User preferences, session history
 
 **Q: What about memory footprint?**  
-A: Each 200-token memory is ~100MB (uncompressed). Using tiered cache and GEAR compression can achieve 8× compression.
+A: Each 200-token memory is ~100MB (uncompressed). Using tiered cache and GEAR compression can achieve 8× compression. For user-level memory (typically < 200 tokens), this is very manageable.
 
 **Q: Which position encoding schemes are supported?**  
-A: Currently RoPE and ALiBi are supported. For other schemes, see the implementation in `position_remapper.py`.
+A: Currently RoPE and ALiBi are supported. For short preferences (< 100 tokens), negative position mapping is safe. For longer content, use suffix prompt injection.
 
 **Q: How to debug injection decisions?**  
 A: Enable audit logging (`audit_logging: true` in `config.yaml`), all injection decisions will be logged including memory_ids, α values, and gating reasons.
 
+**Q: What's the difference between preference and history injection?**  
+A:
+- **Preferences**: K/V injection at negative positions, implicit influence, cached
+- **History**: Suffix prompt at positive positions, explicit reference, dynamic
+
+**Q: How to integrate DKI into existing systems?**  
+A: Use the plugin interface:
+```python
+from dki.core.plugin_interface import DKIPlugin
+plugin = DKIPlugin.from_config("./dki_config.yaml")
+plugin.attach(model)
+```
+
 **Q: Production deployment recommendations?**  
 A:
 
-1. Start with small cache (size=50) and monitor hit rate
-2. Use Weighted cache strategy
-3. Set reasonable α ceiling (0.7)
-4. Monitor hallucination rate
-5. A/B test against RAG
+1. Start with hybrid injection enabled
+2. Set preference α to 0.4 (conservative)
+3. Enable A/B testing with 10% traffic initially
+4. Monitor hallucination rate and user satisfaction
+5. Gradually increase DKI traffic based on metrics
 
 ### Roadmap
 
@@ -555,9 +766,12 @@ A:
 -   [x] Experiment framework
 -   [x] LLaMA/DeepSeek/GLM adapters
 -   [x] FlashAttention-3 integration
+-   [x] Hybrid injection strategy (preferences + history)
+-   [x] Plugin architecture (configuration-driven)
+-   [x] A/B testing support
+-   [ ] Attention visualization tools (Streamlit debugger)
 -   [ ] Multi-modal extension (image memory)
 -   [ ] Distributed deployment support
--   [ ] Attention visualization tools
 -   [ ] LangChain/LlamaIndex integration
 
 ### Acknowledgments
