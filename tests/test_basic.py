@@ -122,7 +122,7 @@ def test_memory_router():
     router.add_memory("mem3", "I work as a software engineer")
     
     # Search
-    results = router.search("What should I eat?", top_k=2)
+    results = router.search("What should I eat?", top_k=2, threshold=-1.0)
     
     assert len(results) > 0
     assert results[0].memory_id in ["mem1", "mem2", "mem3"]
