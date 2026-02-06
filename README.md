@@ -1,4 +1,4 @@
-# DKI - Dynamic KV Injection
+# DKI - Dynamic KV Injection: An Attention-Level User Memory System for Large Language Models
 
 > User-Level Cross-Session Memory System for Large Language Models
 
@@ -799,5 +799,6 @@ Contributions are welcome! Please read our contributing guidelines first.
 ---
 
 **DKI** - Rethinking Memory Augmentation at the Attention Level
+
 
 
