@@ -1,4 +1,4 @@
-# DKI - Dynamic KV Injection 动态键值注入系统
+# DKI - Dynamic KV Injection 一个注意力层用户级跨会话记忆系统
 
 > 大型语言模型的用户级跨会话记忆系统
 
@@ -731,7 +731,7 @@ print(f"注意力FLOPs: {budget.attention_flops}")
 
 ### 📄 相关论文
 
-本项目基于论文《Dynamic KV Injection: Attention-Level Memory Augmentation for Large Language Models》实现。
+本项目基于论文《Dynamic KV Injection: An Attention-Level User Memory System for Large Language Models》实现。
 
 ### 常见问题
 
@@ -802,3 +802,4 @@ A:
 ---
 
 **DKI** - 在注意力层级重新思考记忆增强
+
