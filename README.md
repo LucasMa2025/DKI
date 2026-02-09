@@ -1,4 +1,4 @@
-# DKI - Dynamic KV Injection: An Attention-Level User Memory System for Large Language Models
+# DKI - Dynamic KV Injection
 
 > User-Level Cross-Session Memory System for Large Language Models
 
@@ -53,7 +53,7 @@ DKI uses a **layered injection approach** that mirrors human cognition:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                    DKI Hybrid Injection Architecture                    │
+│                    DKI Hybrid Injection Architecture                     │
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                         │
 │  ┌─────────────────────────────────────────────────────────────────┐    │
@@ -159,20 +159,20 @@ dki = DKISystem()
 # Set user preferences (short, stable, cached K/V)
 dki.set_user_preference(
     user_id="user_001",
-    preference_text="vegetarian, living in Chaoyang District of Beijing, dislikes spicy food and prefers a quiet environment."
+    preference_text="素食主义者，住北京朝阳区，不喜欢辣，喜欢安静的环境"
 )
 
 # Add session memories (for retrieval-based injection)
 dki.add_memory(
     session_id="session_001",
-    content="User mentioned they went to Tranquil Vegan last week"
+    content="User mentioned they went to 静心素食 last week"
 )
 
 # Chat with hybrid injection
 # - Preferences: K/V injection (implicit influence)
 # - History: Suffix prompt (explicit reference)
 response = dki.chat(
-    query="I’m looking for a restaurant to go to tonight – any new recommendations?",
+    query="今晚想找一家餐厅，有什么新推荐吗？",
     session_id="session_001",
     user_id="user_001",  # Enable preference injection
     use_hybrid=True,     # Use hybrid injection strategy
@@ -596,7 +596,7 @@ alpha = min(alpha_base, alpha_max)
 | Dimension          | RAG                                 | DKI                                       |
 | ------------------ | ----------------------------------- | ----------------------------------------- |
 | Injection Level    | Token domain (prompt concatenation) | Attention domain (K/V injection)          |
-| Injection Control  | None (hard concatenation)           | Continuous (α ∈ [0, 1])                  |
+| Injection Control  | None (hard concatenation)           | Continuous (α ∈ [0, 1])                   |
 | Prompt Consumption | Yes                                 | No                                        |
 | Context Window     | Consumed by retrieved content       | Fully available to user                   |
 | Prompt Engineering | Required                            | Simplified                                |
@@ -769,10 +769,32 @@ A:
 -   [x] Hybrid injection strategy (preferences + history)
 -   [x] Plugin architecture (configuration-driven)
 -   [x] A/B testing support
+-   [x] User data adapter interface (PostgreSQL/MySQL/MongoDB/Redis/REST API)
+-   [x] Tiered preference cache (L1 Memory + L2 Redis)
+-   [x] Non-vectorized data handler (BM25 + Embedding hybrid search)
+-   [x] OpenAI-compatible API (/v1/chat/completions)
+-   [ ] Vue3 Frontend UI (in development)
 -   [ ] Attention visualization tools (Streamlit debugger)
 -   [ ] Multi-modal extension (image memory)
 -   [ ] Distributed deployment support
 -   [ ] LangChain/LlamaIndex integration
+
+### Frontend UI Technology Stack
+
+The DKI system frontend UI will be developed using **Vue3** framework:
+
+-   **Vue 3 + TypeScript**: Type-safe modern frontend development
+-   **Vite**: Fast development server and build tool
+-   **Pinia**: Vue3 official state management
+-   **Element Plus / Naive UI**: Enterprise-grade UI component library
+-   **WebSocket**: Real-time streaming response support
+
+Planned UI Features:
+-   Chat interface (with DKI metadata badges)
+-   User preference management panel
+-   DKI debug panel (α slider, gating decision visualization)
+-   Session history browser
+-   System statistics dashboard
 
 ### Acknowledgments
 
@@ -786,7 +808,7 @@ This project is inspired by the following research:
 
 ## 📄 Related Papers
 
-This project is based on the paper "Dynamic KV Injection: An Attention-Level User Memory System for Large Language Models".
+This project is based on the paper "Dynamic KV Injection: Attention-Level Memory Augmentation for Large Language Models".
 
 ## 📄 License
 
@@ -799,6 +821,3 @@ Contributions are welcome! Please read our contributing guidelines first.
 ---
 
 **DKI** - Rethinking Memory Augmentation at the Attention Level
-
-
-

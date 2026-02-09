@@ -1,4 +1,4 @@
-# DKI - Dynamic KV Injection 一个注意力层用户级跨会话记忆系统
+# DKI - Dynamic KV Injection 动态键值注入系统
 
 > 大型语言模型的用户级跨会话记忆系统
 
@@ -731,7 +731,7 @@ print(f"注意力FLOPs: {budget.attention_flops}")
 
 ### 📄 相关论文
 
-本项目基于论文《Dynamic KV Injection: An Attention-Level User Memory System for Large Language Models》实现。
+本项目基于论文《Dynamic KV Injection: Attention-Level Memory Augmentation for Large Language Models》实现。
 
 ### 常见问题
 
@@ -784,10 +784,32 @@ A:
 -   [x] 混合注入策略（偏好 + 历史）
 -   [x] 插件化架构（配置驱动）
 -   [x] A/B 测试支持
+-   [x] 用户数据适配器接口（PostgreSQL/MySQL/MongoDB/Redis/REST API）
+-   [x] 偏好分层缓存（L1 内存 + L2 Redis）
+-   [x] 非向量化数据处理器（BM25 + Embedding 混合搜索）
+-   [x] OpenAI 兼容 API（/v1/chat/completions）
+-   [ ] Vue3 前端 UI（开发中）
 -   [ ] 注意力可视化工具（Streamlit 调试器）
 -   [ ] 多模态扩展（图像记忆）
 -   [ ] 分布式部署支持
 -   [ ] LangChain/LlamaIndex 集成
+
+### 前端 UI 技术选型
+
+DKI 系统的前端 UI 将采用 **Vue3** 框架开发，主要特性：
+
+-   **Vue 3 + TypeScript**：类型安全的现代前端开发
+-   **Vite**：快速的开发服务器和构建工具
+-   **Pinia**：Vue3 官方状态管理
+-   **Element Plus / Naive UI**：企业级 UI 组件库
+-   **WebSocket**：实时流式响应支持
+
+UI 功能规划：
+-   聊天界面（显示 DKI 元数据徽章）
+-   用户偏好管理面板
+-   DKI 调试面板（α 滑块、门控决策可视化）
+-   会话历史浏览
+-   系统统计仪表板
 
 ### 致谢
 
@@ -802,4 +824,3 @@ A:
 ---
 
 **DKI** - 在注意力层级重新思考记忆增强
-
