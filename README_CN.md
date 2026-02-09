@@ -191,6 +191,49 @@ print(f"延迟: {response.latency_ms}ms")
 print(f"混合注入: {response.metadata.get('hybrid_injection', {})}")
 ```
 
+### Chat UI 界面
+
+DKI 提供了一个基于 Vue3 + Element Plus 的现代化 Chat UI：
+
+```bash
+# 安装前端依赖
+cd ui
+npm install
+
+# 启动开发服务器
+npm run dev
+```
+
+或使用一键启动脚本：
+
+```bash
+# 同时启动前后端
+python start_dev.py
+
+# 仅启动后端
+python start_dev.py backend
+
+# 仅启动前端
+python start_dev.py frontend
+```
+
+**UI 功能特性**：
+
+-   🔐 用户登录/注册
+-   💬 支持 Markdown 渲染的聊天界面
+-   ⚙️ 用户偏好管理（增删改查）
+-   📊 会话历史管理
+-   📈 系统统计监控（需管理员密码）
+-   🎨 浅色/深色主题切换
+
+**统计页面鉴权**：
+统计页面使用简单密码保护（非生产标准），可在配置中设置：
+
+```bash
+# 环境变量
+VITE_STATS_PASSWORD=your_password
+```
+
 ### 插件化集成
 
 ```python
@@ -206,10 +249,10 @@ plugin.attach(model, tokenizer)
 if plugin.should_use_dki(user_id="user_001"):
     # 从配置的数据源获取用户记忆
     preferences, history = plugin.get_user_memory("user_001")
-    
+
     # 计算偏好的 K/V
     K_pref, V_pref = plugin.compute_memory_kv(preferences, model)
-    
+
     # 注入到注意力
     K_combined, V_combined = plugin.inject_memory(
         K_user, V_user, K_pref, V_pref, alpha=0.4
@@ -254,6 +297,15 @@ DKI/
 │   │   └── data_generator.py # 测试数据生成
 │   └── web/
 │       └── app.py            # FastAPI + Web界面
+├── ui/                        # Vue3 前端界面
+│   ├── src/
+│   │   ├── views/            # 页面组件
+│   │   ├── components/       # 通用组件
+│   │   ├── stores/           # Pinia 状态管理
+│   │   ├── services/         # API 服务
+│   │   └── utils/            # 工具函数
+│   ├── package.json
+│   └── vite.config.ts
 ├── scripts/
 │   ├── init_db.sql           # 数据库架构
 │   ├── setup.bat/.sh         # 安装脚本
@@ -281,43 +333,43 @@ model:
 dki:
     enabled: true
     version: "2.5"
-    
+
     # 混合注入策略
     hybrid_injection:
         enabled: true
-        language: "cn"  # en | cn
-        
+        language: "cn" # en | cn
+
         # 偏好：K/V 注入（隐式）
         preference:
             enabled: true
             position_strategy: "negative"
-            alpha: 0.4  # 较低用于背景影响
+            alpha: 0.4 # 较低用于背景影响
             max_tokens: 100
-        
+
         # 历史：后缀提示词（显式）
         history:
             enabled: true
             method: "suffix_prompt"
             max_tokens: 500
             max_messages: 10
-    
+
     # 记忆源（外部数据库）
     memory_source:
         type: "sqlite"
         connection: "./data/dki.db"
-    
+
     # 门控：相关性驱动，熵调制
     gating:
         relevance_threshold: 0.7
         entropy_ceiling: 1.0
         entropy_floor: 0.5
-    
+
     # 安全设置
     safety:
         max_alpha: 0.8
         fallback_on_error: true
         audit_logging: true
-    
+
     # A/B 测试
     ab_test:
         enabled: false
@@ -332,33 +384,33 @@ dki:
 dki:
     enabled: true
     version: "1.0"
-    
+
     memory_source:
         type: "postgresql"
         connection: "postgresql://user:pass@host:5432/db"
         table: "user_memories"
-    
+
     injection:
         preference_injection:
             enabled: true
             position_strategy: "negative"
             alpha: 0.4
             max_tokens: 100
-        
+
         history_injection:
             enabled: true
             method: "suffix_prompt"
             max_tokens: 500
-    
+
     safety:
         max_alpha: 0.8
         fallback_on_error: true
         audit_logging: true
         log_path: "./dki_audit.log"
-    
+
     ab_test:
         enabled: true
-        dki_percentage: 10  # 从 10% 流量开始
+        dki_percentage: 10 # 从 10% 流量开始
 ```
 
 ## 📊 实验
@@ -439,13 +491,15 @@ results = runner.run_alpha_sensitivity(
 
 与 RAG 针对**外部知识**（文档、数据库、网页内容）不同，DKI 专为**用户级记忆**设计：
 
-| 维度 | RAG | DKI |
-| ---- | --- | --- |
-| **目标数据** | 外部知识库 | 用户偏好、会话历史 |
-| **数据规模** | 大（数千文档） | 小（每用户 50-200 tokens） |
-| **更新频率** | 批量更新 | 每会话实时更新 |
-| **隐私** | 共享知识 | 用户自有数据 |
-| **缓存** | 文档级 | 用户级（高复用） |
+| 维度         | RAG            | DKI                                         |
+| ------------ | -------------- | ------------------------------------------- |
+| **目标数据** | 外部知识库     | 用户偏好、会话历史                          |
+| **数据规模** | 大（数千文档） | 小到中（偏好 50-200，历史 100-4000 tokens） |
+| **更新频率** | 批量更新       | 每会话实时更新                              |
+| **隐私**     | 共享知识       | 用户自有数据                                |
+| **缓存**     | 文档级         | 用户级（高复用）                            |
+
+> **注意**：DKI 的 token 数量取决于会话复杂度和相关性。偏好注入建议保持短小（50-200 tokens），而历史注入可根据需要扩展至 4000+ tokens。长历史建议启用相关性过滤以优化性能。
 
 这种聚焦的范围是**有意为之**的，它使 DKI 的核心优势得以实现。
 
@@ -486,15 +540,39 @@ DKI **不等同于**交叉注意力：
 
 为什么对偏好和历史使用不同的策略？
 
-| 记忆类型 | 特点 | 策略 | 原因 |
-| -------- | ---- | ---- | ---- |
-| **偏好** | 短（20-100 tokens），稳定，抽象 | K/V 注入（负位置） | OOD 风险低，可缓存，隐式影响 |
-| **历史** | 较长（100-500 tokens），动态，具体 | 后缀提示词（正位置） | 零 OOD 风险，可引用，显式参考 |
+| 记忆类型 | 特点                                | 策略                 | 原因                          |
+| -------- | ----------------------------------- | -------------------- | ----------------------------- |
+| **偏好** | 短（50-200 tokens），稳定，抽象     | K/V 注入（负位置）   | OOD 风险低，可缓存，隐式影响  |
+| **历史** | 可变（100-4000 tokens），动态，具体 | 后缀提示词（正位置） | 零 OOD 风险，可引用，显式参考 |
 
 这种分层方法：
-- 最小化 OOD 风险（偏好很短）
-- 支持历史引用（在提示词中可见）
-- 减少幻觉（建立信任的提示词）
+
+-   最小化 OOD 风险（偏好很短）
+-   支持历史引用（在提示词中可见）
+-   减少幻觉（建立信任的提示词）
+
+### Token 数量与性能影响
+
+DKI 支持的 token 范围取决于会话复杂度和相关性：
+
+| Token 范围 | 适用场景             | 延迟影响 | 显存占用（7B 模型） |
+| ---------- | -------------------- | -------- | ------------------- |
+| 100-500    | 简单偏好 + 短历史    | < 10%    | ~250MB              |
+| 500-2000   | 中等复杂度会话       | 10-30%   | ~1GB                |
+| 2000-4000  | 复杂多轮会话         | 30-50%   | ~2GB                |
+| 4000+      | 长期会话（建议过滤） | > 50%    | > 2GB               |
+
+**性能优化建议**：
+
+-   对于长历史，启用 `search_relevant_history` 进行相关性过滤
+-   偏好保持短小（50-200 tokens），利用 K/V 缓存
+-   历史使用后缀提示词，可根据需要动态调整长度
+
+**与 RAG 的显存对比**：
+
+-   相同 token 数量下，DKI 和 RAG 显存占用**基本相同**
+-   DKI 可能因缓存多轮历史而占用更多显存
+-   但 DKI 的 K/V 缓存可复用，后续请求无需重计算
 
 ### 设计不变量
 
@@ -731,7 +809,7 @@ print(f"注意力FLOPs: {budget.attention_flops}")
 
 ### 📄 相关论文
 
-本项目基于论文《Dynamic KV Injection: Attention-Level Memory Augmentation for Large Language Models》实现。
+本项目基于论文《Dynamic KV Injection: An Attention-Level User Memory System for Large Language Models》实现。
 
 ### 常见问题
 
@@ -740,8 +818,9 @@ A: 不需要。DKI 是推理时增强，使用冻结的模型参数。仅 α 预
 
 **Q: DKI 可以与现有 RAG 系统结合使用吗？**  
 A: 可以！DKI 处理用户级记忆，RAG 处理外部知识。它们是互补的：
-- RAG：文档检索、知识库
-- DKI：用户偏好、会话历史
+
+-   RAG：文档检索、知识库
+-   DKI：用户偏好、会话历史
 
 **Q: 内存占用如何？**  
 A: 每条 200 token 的记忆约 100MB（未压缩）。使用分层缓存和 GEAR 压缩可实现 8× 压缩。对于用户级记忆（通常 < 200 tokens），这是非常可控的。
@@ -754,11 +833,13 @@ A: 启用审计日志（`config.yaml`中的`audit_logging: true`），所有注�
 
 **Q: 偏好注入和历史注入有什么区别？**  
 A:
-- **偏好**：K/V 注入在负位置，隐式影响，可缓存
-- **历史**：后缀提示词在正位置，显式参考，动态变化
+
+-   **偏好**：K/V 注入在负位置，隐式影响，可缓存
+-   **历史**：后缀提示词在正位置，显式参考，动态变化
 
 **Q: 如何将 DKI 集成到现有系统？**  
 A: 使用插件接口：
+
 ```python
 from dki.core.plugin_interface import DKIPlugin
 plugin = DKIPlugin.from_config("./dki_config.yaml")
@@ -805,6 +886,7 @@ DKI 系统的前端 UI 将采用 **Vue3** 框架开发，主要特性：
 -   **WebSocket**：实时流式响应支持
 
 UI 功能规划：
+
 -   聊天界面（显示 DKI 元数据徽章）
 -   用户偏好管理面板
 -   DKI 调试面板（α 滑块、门控决策可视化）

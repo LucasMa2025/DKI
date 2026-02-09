@@ -205,10 +205,10 @@ plugin.attach(model, tokenizer)
 if plugin.should_use_dki(user_id="user_001"):
     # Get user memory from configured source
     preferences, history = plugin.get_user_memory("user_001")
-    
+
     # Compute K/V for preferences
     K_pref, V_pref = plugin.compute_memory_kv(preferences, model)
-    
+
     # Inject into attention
     K_combined, V_combined = plugin.inject_memory(
         K_user, V_user, K_pref, V_pref, alpha=0.4
@@ -280,43 +280,43 @@ model:
 dki:
     enabled: true
     version: "2.5"
-    
+
     # Hybrid Injection Strategy
     hybrid_injection:
         enabled: true
-        language: "cn"  # en | cn
-        
+        language: "cn" # en | cn
+
         # Preferences: K/V injection (implicit)
         preference:
             enabled: true
             position_strategy: "negative"
-            alpha: 0.4  # Lower for background influence
+            alpha: 0.4 # Lower for background influence
             max_tokens: 100
-        
+
         # History: Suffix prompt (explicit)
         history:
             enabled: true
             method: "suffix_prompt"
             max_tokens: 500
             max_messages: 10
-    
+
     # Memory source (external database)
     memory_source:
         type: "sqlite"
         connection: "./data/dki.db"
-    
+
     # Gating: Relevance-driven, entropy-modulated
     gating:
         relevance_threshold: 0.7
         entropy_ceiling: 1.0
         entropy_floor: 0.5
-    
+
     # Safety
     safety:
         max_alpha: 0.8
         fallback_on_error: true
         audit_logging: true
-    
+
     # A/B Testing
     ab_test:
         enabled: false
@@ -331,33 +331,33 @@ Create `dki_plugin.yaml` for framework-agnostic deployment:
 dki:
     enabled: true
     version: "1.0"
-    
+
     memory_source:
         type: "postgresql"
         connection: "postgresql://user:pass@host:5432/db"
         table: "user_memories"
-    
+
     injection:
         preference_injection:
             enabled: true
             position_strategy: "negative"
             alpha: 0.4
             max_tokens: 100
-        
+
         history_injection:
             enabled: true
             method: "suffix_prompt"
             max_tokens: 500
-    
+
     safety:
         max_alpha: 0.8
         fallback_on_error: true
         audit_logging: true
         log_path: "./dki_audit.log"
-    
+
     ab_test:
         enabled: true
-        dki_percentage: 10  # Start with 10% traffic
+        dki_percentage: 10 # Start with 10% traffic
 ```
 
 ## 📊 Experiments
@@ -438,13 +438,15 @@ results = runner.run_alpha_sensitivity(
 
 Unlike RAG which targets **external knowledge** (documents, databases, web content), DKI is designed specifically for **user-level memory**:
 
-| Dimension | RAG | DKI |
-| --------- | --- | --- |
-| **Target Data** | External knowledge bases | User preferences, session history |
-| **Data Size** | Large (thousands of documents) | Small (50-200 tokens per user) |
-| **Update Frequency** | Batch updates | Real-time per session |
-| **Privacy** | Shared knowledge | User-owned data |
-| **Caching** | Document-level | User-level (high reuse) |
+| Dimension            | RAG                            | DKI                                                     |
+| -------------------- | ------------------------------ | ------------------------------------------------------- |
+| **Target Data**      | External knowledge bases       | User preferences, session history                       |
+| **Data Size**        | Large (thousands of documents) | Small to Medium (prefs 50-200, history 100-4000 tokens) |
+| **Update Frequency** | Batch updates                  | Real-time per session                                   |
+| **Privacy**          | Shared knowledge               | User-owned data                                         |
+| **Caching**          | Document-level                 | User-level (high reuse)                                 |
+
+> **Note**: DKI token count depends on session complexity and relevance. Preference injection should stay short (50-200 tokens), while history injection can extend to 4000+ tokens as needed. For long histories, enable relevance filtering to optimize performance.
 
 This focused scope is **intentional** and enables DKI's key advantages.
 
@@ -485,15 +487,39 @@ DKI is NOT equivalent to Cross-Attention:
 
 Why use different strategies for preferences vs history?
 
-| Memory Type | Characteristics | Strategy | Reason |
-| ----------- | --------------- | -------- | ------ |
-| **Preferences** | Short (20-100 tokens), stable, abstract | K/V injection (negative position) | Low OOD risk, cacheable, implicit influence |
-| **History** | Longer (100-500 tokens), dynamic, concrete | Suffix prompt (positive position) | Zero OOD risk, citable, explicit reference |
+| Memory Type     | Characteristics                               | Strategy                          | Reason                                      |
+| --------------- | --------------------------------------------- | --------------------------------- | ------------------------------------------- |
+| **Preferences** | Short (50-200 tokens), stable, abstract       | K/V injection (negative position) | Low OOD risk, cacheable, implicit influence |
+| **History**     | Variable (100-4000 tokens), dynamic, concrete | Suffix prompt (positive position) | Zero OOD risk, citable, explicit reference  |
 
 This layered approach:
-- Minimizes OOD risk (preferences are short)
-- Enables history citation (visible in prompt)
-- Reduces hallucination (trust-establishing prompts)
+
+-   Minimizes OOD risk (preferences are short)
+-   Enables history citation (visible in prompt)
+-   Reduces hallucination (trust-establishing prompts)
+
+### Token Count and Performance Impact
+
+DKI's supported token range depends on session complexity and relevance:
+
+| Token Range | Use Case                              | Latency Impact | VRAM (7B model) |
+| ----------- | ------------------------------------- | -------------- | --------------- |
+| 100-500     | Simple prefs + short history          | < 10%          | ~250MB          |
+| 500-2000    | Medium complexity sessions            | 10-30%         | ~1GB            |
+| 2000-4000   | Complex multi-turn sessions           | 30-50%         | ~2GB            |
+| 4000+       | Long sessions (filtering recommended) | > 50%          | > 2GB           |
+
+**Performance Optimization Tips**:
+
+-   For long histories, enable `search_relevant_history` for relevance filtering
+-   Keep preferences short (50-200 tokens) to leverage K/V caching
+-   History uses suffix prompts, length can be dynamically adjusted
+
+**VRAM Comparison with RAG**:
+
+-   For the same token count, DKI and RAG have **similar VRAM usage**
+-   DKI may use more VRAM due to caching multi-turn history
+-   However, DKI's K/V cache is reusable, no recomputation for subsequent requests
 
 ### Design Invariants
 
@@ -725,8 +751,9 @@ A: No. DKI is an inference-time enhancement using frozen model parameters. Only 
 
 **Q: Can DKI be combined with existing RAG systems?**  
 A: Yes! DKI handles user-level memory, RAG handles external knowledge. They are complementary:
-- RAG: Document retrieval, knowledge bases
-- DKI: User preferences, session history
+
+-   RAG: Document retrieval, knowledge bases
+-   DKI: User preferences, session history
 
 **Q: What about memory footprint?**  
 A: Each 200-token memory is ~100MB (uncompressed). Using tiered cache and GEAR compression can achieve 8× compression. For user-level memory (typically < 200 tokens), this is very manageable.
@@ -739,11 +766,13 @@ A: Enable audit logging (`audit_logging: true` in `config.yaml`), all injection 
 
 **Q: What's the difference between preference and history injection?**  
 A:
-- **Preferences**: K/V injection at negative positions, implicit influence, cached
-- **History**: Suffix prompt at positive positions, explicit reference, dynamic
+
+-   **Preferences**: K/V injection at negative positions, implicit influence, cached
+-   **History**: Suffix prompt at positive positions, explicit reference, dynamic
 
 **Q: How to integrate DKI into existing systems?**  
 A: Use the plugin interface:
+
 ```python
 from dki.core.plugin_interface import DKIPlugin
 plugin = DKIPlugin.from_config("./dki_config.yaml")
@@ -790,6 +819,7 @@ The DKI system frontend UI will be developed using **Vue3** framework:
 -   **WebSocket**: Real-time streaming response support
 
 Planned UI Features:
+
 -   Chat interface (with DKI metadata badges)
 -   User preference management panel
 -   DKI debug panel (α slider, gating decision visualization)
@@ -808,7 +838,7 @@ This project is inspired by the following research:
 
 ## 📄 Related Papers
 
-This project is based on the paper "Dynamic KV Injection: Attention-Level Memory Augmentation for Large Language Models".
+This project is based on the paper "Dynamic KV Injection: An Attention-Level User Memory System for Large Language Models".
 
 ## 📄 License
 
