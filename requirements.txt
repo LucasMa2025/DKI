@@ -71,3 +71,4 @@ isort>=5.12.0
 matplotlib>=3.7.0
 seaborn>=0.12.0
 plotly>=5.18.0
+
