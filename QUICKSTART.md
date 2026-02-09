@@ -1,6 +1,6 @@
 # DKI Quick Start Guide
 
-快速开始使用 DKI (Dynamic KV Injection) - LLM 注意力层级用户记忆插件。
+快速开始使用 DKI (Dynamic KV Injection) - LLM 注意力层级用户记忆插件
 
 ## 📋 Prerequisites
 
@@ -230,3 +230,4 @@ print(f"History Count: {response.metadata.relevant_history_count}")
 ---
 
 Happy experimenting with DKI! 🚀
+
