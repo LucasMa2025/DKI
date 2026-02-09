@@ -1,5 +1,5 @@
 """
-DKI - Dynamic KV Injection
+DKI -  Dynamic KV Injection
 Attention-Level User Memory Plugin for LLMs
 
 Setup script for package installation
@@ -74,3 +74,4 @@ setup(
         ],
     },
 )
+
