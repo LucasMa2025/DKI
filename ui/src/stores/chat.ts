@@ -84,6 +84,8 @@ export const useChatStore = defineStore('chat', () => {
   }
   
   // Send message
+  // 修正: 只传递 user_id 和原始输入，移除 prompt 拼接逻辑
+  // DKI 会自动通过适配器读取用户偏好和历史消息进行注入
   async function sendMessage(content: string) {
     const authStore = useAuthStore()
     const settingsStore = useSettingsStore()
@@ -97,7 +99,7 @@ export const useChatStore = defineStore('chat', () => {
       currentSessionId.value = session.id
     }
     
-    // Add user message
+    // Add user message to local display
     const userMessage: ChatMessage = {
       id: `temp-${Date.now()}`,
       sessionId: currentSessionId.value,
@@ -107,20 +109,25 @@ export const useChatStore = defineStore('chat', () => {
     }
     messages.value.push(userMessage)
     
-    // Prepare request
+    // 修正: 简化请求，只传递必要信息
+    // - user_id: 用户标识 (DKI 用于读取偏好和历史)
+    // - session_id: 会话标识 (DKI 用于读取会话历史)
+    // - query: 原始用户输入 (不含任何 prompt 构造)
+    // DKI 会自动:
+    // 1. 通过适配器读取用户偏好 → K/V 注入
+    // 2. 通过适配器检索相关历史 → 后缀提示词
     const request: ChatRequest = {
+      // 原始用户输入，不拼接任何历史消息或 prompt
+      query: content.trim(),
+      // 用户标识 - DKI 用于读取偏好和历史
+      dkiUserId: authStore.user?.id,
+      // 会话标识 - DKI 用于读取会话历史
+      dkiSessionId: currentSessionId.value,
+      // 可选参数
       model: settingsStore.defaultModel,
-      messages: messages.value.map(m => ({
-        role: m.role,
-        content: m.content,
-      })),
       temperature: settingsStore.temperature,
       maxTokens: settingsStore.maxTokens,
       stream: false,
-      dkiEnabled: settingsStore.dkiEnabled,
-      dkiUserId: authStore.user?.id,
-      dkiSessionId: currentSessionId.value,
-      dkiUseHybrid: settingsStore.dkiUseHybrid,
     }
     
     // Add placeholder for assistant message

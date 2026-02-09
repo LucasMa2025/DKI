@@ -48,17 +48,20 @@ export interface GatingDecision {
   reasoning: string
 }
 
+// 修正: 简化 ChatRequest，只传递必要信息
+// DKI 会自动通过适配器读取用户偏好和历史消息
 export interface ChatRequest {
+  // 原始用户输入 (不含任何 prompt 构造)
+  query: string
+  // 用户标识 - DKI 用于读取偏好和历史
+  dkiUserId?: string
+  // 会话标识 - DKI 用于读取会话历史
+  dkiSessionId?: string
+  // 可选参数
   model?: string
-  messages: Array<{ role: string; content: string }>
   temperature?: number
   maxTokens?: number
   stream?: boolean
-  dkiEnabled?: boolean
-  dkiUserId?: string
-  dkiSessionId?: string
-  dkiForceAlpha?: number
-  dkiUseHybrid?: boolean
 }
 
 export interface ChatResponse {

@@ -78,31 +78,41 @@ export const api = {
   },
   
   // Chat
+  // 修正: 简化 API 调用，只传递 user_id 和原始输入
+  // DKI 会自动处理偏好读取、历史检索和注入
   chat: {
     async send(request: ChatRequest): Promise<ChatResponse> {
-      return http.post('/v1/chat/completions', {
+      // 修正: 使用 DKI 插件 API
+      // 只传递:
+      // - query: 原始用户输入 (不含任何 prompt 构造)
+      // - user_id: 用户标识 (DKI 用于读取偏好和历史)
+      // - session_id: 会话标识 (DKI 用于读取会话历史)
+      return http.post('/v1/dki/chat', {
+        // 原始用户输入，不拼接任何历史或 prompt
+        query: request.query,
+        // 用户标识 - DKI 用于读取偏好和历史
+        user_id: request.dkiUserId,
+        // 会话标识 - DKI 用于读取会话历史
+        session_id: request.dkiSessionId,
+        // 可选参数
         model: request.model,
-        messages: request.messages,
         temperature: request.temperature,
         max_tokens: request.maxTokens,
-        stream: request.stream,
-        dki_user_id: request.dkiUserId,
-        dki_session_id: request.dkiSessionId,
-        dki_force_alpha: request.dkiForceAlpha,
       })
     },
     
     // Streaming chat (returns EventSource)
     createStream(request: ChatRequest): EventSource {
       const params = new URLSearchParams({
+        query: request.query || '',
+        user_id: request.dkiUserId || '',
+        session_id: request.dkiSessionId || '',
         model: request.model || '',
         temperature: String(request.temperature || 0.7),
         max_tokens: String(request.maxTokens || 2048),
-        dki_user_id: request.dkiUserId || '',
-        dki_session_id: request.dkiSessionId || '',
       })
       
-      return new EventSource(`${config.api.baseUrl}/v1/chat/stream?${params}`)
+      return new EventSource(`${config.api.baseUrl}/v1/dki/chat/stream?${params}`)
     },
   },
   
