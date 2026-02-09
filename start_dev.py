@@ -13,22 +13,22 @@ Usage:
 Architecture:
     ┌─────────────────────────────────────────────────────────┐
     │  Example Chat UI (Vue3)                                 │
-    │  └── Only passes user_id + raw input to DKI            │
+    │  └── Only passes user_id + raw input to DKI             │
     └─────────────────────────────┬───────────────────────────┘
                                   │
                                   ▼
     ┌─────────────────────────────────────────────────────────┐
     │  DKI Plugin API (FastAPI)                               │
-    │  ├── /v1/dki/chat - DKI enhanced chat                  │
-    │  └── /v1/dki/info - DKI plugin status                  │
+    │  ├── /v1/dki/chat - DKI enhanced chat                   │
+    │  └── /v1/dki/info - DKI plugin status                   │
     └─────────────────────────────┬───────────────────────────┘
                                   │
                                   ▼
     ┌─────────────────────────────────────────────────────────┐
     │  DKI Plugin Core                                        │
-    │  ├── Config-driven adapter reads Chat UI's database    │
-    │  ├── Preferences → K/V injection (Attention Hook)      │
-    │  └── History → Suffix prompt                           │
+    │  ├── Config-driven adapter reads Chat UI's database     │
+    │  ├── Preferences → K/V injection (Attention Hook)       │
+    │  └── History → Suffix prompt                            │
     └─────────────────────────────────────────────────────────┘
 """
 
@@ -155,3 +155,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
