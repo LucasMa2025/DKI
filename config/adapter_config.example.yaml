@@ -1,4 +1,4 @@
-# DKI 外部数据适配器配置示例
+# DKI 外部数据适配器配置示例文件
 # 
 # 上层应用只需提供此配置文件，无需实现任何接口
 # DKI 会自动连接上层应用的数据库，读取用户偏好和历史消息
@@ -170,3 +170,4 @@ user_adapter:
 #     embedding vector(1536),  -- 向量字段
 #     created_at TIMESTAMP DEFAULT NOW()
 # );
+
