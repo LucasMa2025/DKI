@@ -30,6 +30,10 @@ from dki.experiment.runner import ExperimentRunner, ExperimentConfig
 from dki.experiment.data_generator import ExperimentDataGenerator
 from dki.config.config_loader import ConfigLoader
 from dki.api.routes import create_api_router
+from dki.api.auth_routes import create_auth_router
+from dki.api.session_routes import create_session_router
+from dki.api.preference_routes import create_preference_router
+from dki.api.stats_routes import create_stats_router
 from dki.api.dependencies import init_dependencies, cleanup_dependencies
 from dki.adapters import AdapterFactory, AdapterConfig, AdapterType
 
@@ -153,6 +157,22 @@ def create_app() -> FastAPI:
     # Include OpenAI-compatible API routes
     api_router = create_api_router()
     app.include_router(api_router)
+    
+    # Include authentication routes
+    auth_router = create_auth_router()
+    app.include_router(auth_router)
+    
+    # Include session management routes
+    session_router = create_session_router()
+    app.include_router(session_router)
+    
+    # Include preference management routes
+    preference_router = create_preference_router()
+    app.include_router(preference_router)
+    
+    # Include stats routes
+    stats_router = create_stats_router()
+    app.include_router(stats_router)
     
     # API Routes
     @app.get("/api/health")

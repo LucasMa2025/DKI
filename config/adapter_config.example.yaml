@@ -1,0 +1,172 @@
+# DKI 外部数据适配器配置示例
+# 
+# 上层应用只需提供此配置文件，无需实现任何接口
+# DKI 会自动连接上层应用的数据库，读取用户偏好和历史消息
+#
+# 使用方式:
+#   1. 复制此文件为 adapter_config.yaml
+#   2. 修改数据库连接信息
+#   3. 修改表名和字段映射以匹配您的数据库结构
+#   4. 启动 DKI
+
+user_adapter:
+  # ============ 数据库连接配置 ============
+  database:
+    type: postgresql  # postgresql | mysql | sqlite
+    host: localhost
+    port: 5432
+    database: my_app_db
+    username: app_user
+    password: your_password
+    
+    # 连接池配置
+    pool_size: 5
+    max_overflow: 10
+    pool_timeout: 30
+    
+    # SSL 配置 (可选)
+    ssl_enabled: false
+    # ssl_ca: /path/to/ca.pem
+  
+  # ============ 用户偏好表映射 ============
+  # 告诉 DKI 如何从您的数据库读取用户偏好
+  preferences:
+    # 您的偏好表名
+    table: user_preferences
+    
+    # 字段映射: DKI内部字段 -> 您的表字段
+    fields:
+      user_id: user_id           # 用户 ID 字段
+      preference_id: id          # 偏好 ID 字段
+      preference_text: content   # 偏好内容字段 (核心字段)
+      preference_type: type      # 偏好类型字段 (如 dietary, communication)
+      priority: priority         # 优先级字段 (可选，用于排序)
+      created_at: created_at     # 创建时间 (可选)
+      updated_at: updated_at     # 更新时间 (可选)
+    
+    # 额外过滤条件 (可选)
+    # 只读取满足这些条件的记录
+    filters:
+      is_active: true
+    
+    # 排序 (可选)
+    order_by: priority
+    order_desc: true
+  
+  # ============ 消息表映射 ============
+  # 告诉 DKI 如何从您的数据库读取聊天消息
+  messages:
+    # 您的消息表名
+    table: chat_messages
+    
+    # 字段映射
+    fields:
+      message_id: id             # 消息 ID
+      session_id: session_id     # 会话 ID
+      user_id: user_id           # 用户 ID
+      role: role                 # 角色 (user/assistant)
+      content: content           # 消息内容 (核心字段)
+      timestamp: created_at      # 时间戳
+      embedding: embedding       # 向量字段 (可选，如果有预计算向量)
+    
+    # 额外过滤条件
+    filters:
+      is_deleted: false
+    
+    # 排序
+    order_by: created_at
+    order_desc: true
+  
+  # ============ 用户表映射 (可选) ============
+  # 如果需要读取用户画像信息
+  users:
+    table: users
+    fields:
+      user_id: id
+      username: username
+      display_name: display_name
+      email: email
+      created_at: created_at
+  
+  # ============ 会话表映射 (可选) ============
+  sessions:
+    table: chat_sessions
+    fields:
+      session_id: id
+      user_id: user_id
+      title: title
+      created_at: created_at
+  
+  # ============ 向量检索配置 ============
+  vector_search:
+    enabled: true
+    
+    # 向量检索类型
+    # - pgvector: 使用 PostgreSQL pgvector 扩展 (需要预计算向量)
+    # - dynamic: 动态向量处理 (无需预计算向量，DKI 自动处理)
+    # - none: 不使用向量检索，仅关键词匹配
+    type: dynamic
+    
+    # 如果使用 pgvector，指定向量字段
+    embedding_field: embedding
+    embedding_dim: 1536
+    
+    # 动态向量处理配置 (type=dynamic 时使用)
+    dynamic:
+      # 检索策略
+      # - lazy: 实时计算 embedding (适合小数据量 < 100 条)
+      # - batch: 批量预计算 (适合首次加载)
+      # - hybrid: BM25 初筛 + embedding 重排序 (推荐，适合大数据量)
+      strategy: hybrid
+      
+      # Embedding 模型
+      embedding_model: text-embedding-ada-002
+      
+      # Embedding API (可选，默认使用 OpenAI)
+      # api_url: https://api.openai.com/v1
+      # api_key: your_api_key
+    
+    # 检索参数
+    top_k: 10
+    similarity_threshold: 0.5
+  
+  # ============ 缓存配置 ============
+  cache_enabled: true
+  cache_ttl: 300  # 缓存过期时间 (秒)
+
+
+# ============ 常见数据库结构示例 ============
+
+# 示例 1: 简单的偏好表
+# CREATE TABLE user_preferences (
+#     id SERIAL PRIMARY KEY,
+#     user_id VARCHAR(50) NOT NULL,
+#     type VARCHAR(50) NOT NULL,
+#     content TEXT NOT NULL,
+#     priority INT DEFAULT 0,
+#     is_active BOOLEAN DEFAULT TRUE,
+#     created_at TIMESTAMP DEFAULT NOW()
+# );
+
+# 示例 2: 简单的消息表
+# CREATE TABLE chat_messages (
+#     id SERIAL PRIMARY KEY,
+#     session_id VARCHAR(50) NOT NULL,
+#     user_id VARCHAR(50) NOT NULL,
+#     role VARCHAR(20) NOT NULL,
+#     content TEXT NOT NULL,
+#     is_deleted BOOLEAN DEFAULT FALSE,
+#     created_at TIMESTAMP DEFAULT NOW()
+# );
+
+# 示例 3: 带向量的消息表 (pgvector)
+# CREATE EXTENSION IF NOT EXISTS vector;
+# CREATE TABLE chat_messages (
+#     id SERIAL PRIMARY KEY,
+#     session_id VARCHAR(50) NOT NULL,
+#     user_id VARCHAR(50) NOT NULL,
+#     role VARCHAR(20) NOT NULL,
+#     content TEXT NOT NULL,
+#     embedding vector(1536),  -- 向量字段
+#     created_at TIMESTAMP DEFAULT NOW()
+# );

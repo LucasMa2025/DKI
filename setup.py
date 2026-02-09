@@ -1,5 +1,7 @@
 """
 DKI - Dynamic KV Injection
+Attention-Level User Memory Plugin for LLMs
+
 Setup script for package installation
 """
 
@@ -13,10 +15,10 @@ with open("requirements.txt", "r", encoding="utf-8") as fh:
 
 setup(
     name="dki",
-    version="1.0.0",
+    version="2.0.0",
     author="AGI Demo Project",
     author_email="",
-    description="Dynamic KV Injection - Attention-Level Memory Augmentation for LLMs",
+    description="DKI - Attention-Level User Memory Plugin for LLMs via K/V Injection",
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/your-repo/dki",
@@ -46,6 +48,15 @@ setup(
             "matplotlib>=3.7.0",
             "seaborn>=0.12.0",
             "plotly>=5.18.0",
+        ],
+        "postgresql": [
+            "asyncpg>=0.29.0",
+        ],
+        "mysql": [
+            "aiomysql>=0.2.0",
+        ],
+        "redis": [
+            "redis>=5.0.0",
         ],
     },
     entry_points={

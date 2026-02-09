@@ -1,6 +1,6 @@
 # DKI - Dynamic KV Injection
 
-> User-Level Cross-Session Memory System for Large Language Models
+> Attention-Level User Memory Plugin for Large Language Models
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -9,43 +9,89 @@
 
 ## 📖 Overview
 
-DKI (Dynamic KV Injection) is a **user-level cross-session memory system** for Large Language Models that injects memory content at the attention level rather than the token level.
+DKI (Dynamic KV Injection) is an **LLM attention-level plugin** that dynamically injects user preferences and session history via Attention Hooks during inference, enabling cross-session personalized memory.
 
 ### What DKI Is
 
-DKI is designed specifically for **user-level memory**:
+DKI is an **LLM plugin** designed specifically for **user-level memory**:
 
--   **User Preferences**: Dietary restrictions, communication style, interests
--   **Session History**: Previous conversation context, established facts
--   **Personal Context**: Location, timezone, language preferences
+-   **Attention Hook Mechanism**: Injects K/V at the attention level via PyTorch Hooks, not prompt concatenation
+-   **Configuration-Driven Adapter**: Automatically reads from upstream application databases, no code changes required
+-   **Hybrid Injection Strategy**: Preference K/V injection (negative position) + History suffix prompt (positive position)
+
+**Core Workflow**:
+
+```
+Upstream App → Pass user_id + raw input → DKI Plugin
+    ↓
+DKI reads upstream app database via config-driven adapter
+    ↓
+Preferences → K/V injection (negative pos) | History → suffix prompt (positive pos)
+    ↓
+Call LLM inference → Return response
+```
 
 ### What DKI Is NOT
 
-DKI is **NOT** for external knowledge bases or public data retrieval. For those use cases, use RAG (Retrieval-Augmented Generation).
+-   **Not RAG**: DKI uses K/V injection, not prompt concatenation, doesn't consume token budget
+-   **Not Knowledge Base Retrieval**: DKI focuses on user-level memory, use RAG for external knowledge
+-   **No Interface Implementation Required**: Configuration-driven, upstream apps only pass user_id and raw input
 
 ### Why This Scope Matters
 
 This focused scope enables:
 
-1. **Short memory** (50-200 tokens) → reduced position encoding risks
+1. **Short preferences** (50-200 tokens) → reduced position encoding risks, cacheable
 2. **User-owned data** → simplified privacy considerations
 3. **Session-coherent** → effective K/V caching
 4. **Stable preferences** → high cache reuse rate
 
 ### Key Features
 
--   **🧠 Attention-Level Injection**: Memory injected via K/V, not prompt tokens
--   **🔀 Hybrid Injection Strategy**: Preferences (K/V) + History (suffix prompt)
+-   **🧠 Attention Hook Injection**: Injects K/V at attention level via PyTorch Hooks, not prompt tokens
+-   **🔀 Hybrid Injection Strategy**: Preferences (K/V negative position) + History (suffix prompt positive position)
+-   **🔧 Configuration-Driven Adapter**: SQLAlchemy dynamic table mapping, no interface implementation required
 -   **🎚️ Memory Influence Scaling (MIS)**: Continuous α ∈ [0, 1] control
 -   **🔄 Query-Conditioned Projection**: FiLM-style memory-centric transformation
 -   **🚦 Dual-Factor Gating**: Relevance-driven decision, entropy-modulated strength
 -   **💾 Tiered KV Cache**: L1(GPU) → L2(CPU) → L3(SSD) → L4(Recompute)
--   **📊 Attention Budget Analysis**: Token vs Attention budget tracking
--   **🔌 Plugin Architecture**: Configuration-driven, framework-agnostic
+-   **📊 Monitoring API**: Statistics, injection logs, health checks
 -   **🔌 Multi-Engine Support**: vLLM, LLaMA, DeepSeek, GLM
 -   **✅ Graceful Degradation**: α → 0 smoothly recovers vanilla LLM behavior
 
 ## 🏗️ Architecture
+
+### Core Architecture: LLM Plugin Mode
+
+DKI operates as an **attention-level plugin** for LLMs, implementing K/V injection via PyTorch Hook mechanism:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         DKI Plugin Architecture                          │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │  Upstream Application (Chat UI / Customer Service / Other Apps) │    │
+│  │  └── Only needs to pass: user_id + raw user input               │    │
+│  │      (No RAG, No Prompt Engineering, No Interface Implementation)│    │
+│  └─────────────────────────────┬───────────────────────────────────┘    │
+│                                ▼                                        │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │  DKI Plugin                                                      │    │
+│  │  ├── Config-Driven Adapter (SQLAlchemy dynamic table mapping)   │    │
+│  │  │   └── Reads upstream app database (preferences + history)    │    │
+│  │  ├── Preference Processing → K/V Injection (negative pos, Hook) │    │
+│  │  ├── History Processing → Suffix Prompt (positive pos)          │    │
+│  │  └── Monitoring API (stats/logs/health)                         │    │
+│  └─────────────────────────────┬───────────────────────────────────┘    │
+│                                ▼                                        │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │  LLM Engine (vLLM / LLaMA / DeepSeek / GLM)                     │    │
+│  │  └── Inference with K/V Injection                               │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
 
 ### Hybrid Injection Strategy
 
@@ -57,9 +103,10 @@ DKI uses a **layered injection approach** that mirrors human cognition:
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                         │
 │  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  Layer 1: User Preferences (K/V Injection)                      │    │
+│  │  Layer 1: User Preferences (K/V Injection - Attention Hook)     │    │
 │  │  ├── Content: Dietary, style, interests                         │    │
 │  │  ├── Position: Negative (conceptually "before" user input)      │    │
+│  │  ├── Mechanism: PyTorch Hook modifies Attention K/V             │    │
 │  │  ├── Influence: Implicit, background (like personality)         │    │
 │  │  └── α: 0.3-0.5 (lower, for subtle influence)                   │    │
 │  └─────────────────────────────────────────────────────────────────┘    │
@@ -68,6 +115,7 @@ DKI uses a **layered injection approach** that mirrors human cognition:
 │  │  Layer 2: Session History (Suffix Prompt)                       │    │
 │  │  ├── Content: Recent conversation turns                         │    │
 │  │  ├── Position: After user query (positive positions)            │    │
+│  │  ├── Mechanism: Standard token concatenation                    │    │
 │  │  ├── Influence: Explicit, citable (like memory)                 │    │
 │  │  └── Prompt: Trust-establishing guidance                        │    │
 │  └─────────────────────────────────────────────────────────────────┘    │
@@ -80,41 +128,41 @@ DKI uses a **layered injection approach** that mirrors human cognition:
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-### System Flow
+### Data Flow
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                     Dynamic KV Injection System                         │
+│                         DKI Data Flow                                    │
 ├─────────────────────────────────────────────────────────────────────────┤
-│  User Query + User ID                                                   │
+│  User Query + user_id + session_id                                      │
 │       │                                                                 │
 │       ▼                                                                 │
 │  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  0. Hybrid Injection Preparation                                │    │
-│  │     ├── Load user preferences (cached K/V)                      │    │
-│  │     └── Format session history (suffix prompt)                  │    │
+│  │  1. Config-Driven Adapter reads upstream app database           │    │
+│  │     ├── Preferences table → Preference list                     │    │
+│  │     └── Messages table → Relevant history (vector/BM25/keyword) │    │
 │  └─────────────────────────────┬───────────────────────────────────┘    │
 │                                ▼                                        │
 │  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  1. Memory Router (FAISS + Sentence Embedding)                  │    │
+│  │  2. Preference Processing                                       │    │
+│  │     ├── Format preference text                                  │    │
+│  │     ├── Compute/cache K/V representation                        │    │
+│  │     └── Prepare Attention Hook                                  │    │
 │  └─────────────────────────────┬───────────────────────────────────┘    │
 │                                ▼                                        │
 │  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  2. Dual-Factor Gating (Relevance-driven, Entropy-modulated)    │    │
-│  └─────────────────────────────┬───────────────────────────────────┘    │
-│                    ┌───────────┴───────────┐                            │
-│                    ▼                       ▼                            │
-│           ┌──────────────┐    ┌────────────────────────────────┐        │
-│           │ Vanilla LLM  │    │ 3. Session KV Cache            │        │
-│           │ (fallback)   │    │ + Query-Conditioned Projection │        │
-│           └──────────────┘    └─────────────┬──────────────────┘        │
-│                                             ▼                           │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  4. Memory Influence Scaling (α control)                        │    │
+│  │  3. History Processing                                          │    │
+│  │     └── Format as suffix prompt (with trust guidance)           │    │
 │  └─────────────────────────────┬───────────────────────────────────┘    │
 │                                ▼                                        │
 │  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  5. LLM with KV Injection → Generate Response                   │    │
+│  │  4. LLM Inference (with K/V Injection)                          │    │
+│  │     ├── Attention Hook injects preference K/V (negative pos)    │    │
+│  │     └── Input = query + history suffix (positive pos)           │    │
+│  └─────────────────────────────┬───────────────────────────────────┘    │
+│                                ▼                                        │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │  5. Return response + Record monitoring data                    │    │
 │  └─────────────────────────────────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
@@ -136,134 +184,214 @@ chmod +x scripts/*.sh
 ./scripts/setup.sh
 ```
 
-### Start Web UI
+### Upstream Application Integration (Recommended)
 
-```bash
-# Windows:
-scripts\start.bat web
+DKI as an LLM plugin, upstream applications only need to:
 
-# Linux/Mac:
-./scripts/start.sh web
-```
-
-Open http://localhost:8080 in your browser.
-
-### Python Usage
+1. **Provide adapter config file** - Specify database connection and field mapping
+2. **Remove RAG/Prompt engineering code** - DKI handles it automatically
+3. **Pass user_id + raw input** - No prompt construction needed
 
 ```python
-from dki import DKISystem
+from dki.core.dki_plugin import DKIPlugin
+from dki.models.vllm_adapter import VLLMAdapter
 
-# Initialize
-dki = DKISystem()
+# 1. Initialize LLM adapter
+model_adapter = VLLMAdapter(model_name="Qwen/Qwen2-7B-Instruct")
 
-# Set user preferences (short, stable, cached K/V)
-dki.set_user_preference(
-    user_id="user_001",
-    preference_text="素食主义者，住北京朝阳区，不喜欢辣，喜欢安静的环境"
+# 2. Create DKI plugin from config (recommended)
+# Upstream apps only need to provide config, no interface implementation
+dki = await DKIPlugin.from_config(
+    model_adapter=model_adapter,
+    adapter_config_path="config/adapter_config.yaml",  # DB connection + field mapping
 )
 
-# Add session memories (for retrieval-based injection)
-dki.add_memory(
-    session_id="session_001",
-    content="User mentioned they went to 静心素食 last week"
-)
-
-# Chat with hybrid injection
-# - Preferences: K/V injection (implicit influence)
-# - History: Suffix prompt (explicit reference)
-response = dki.chat(
-    query="今晚想找一家餐厅，有什么新推荐吗？",
-    session_id="session_001",
-    user_id="user_001",  # Enable preference injection
-    use_hybrid=True,     # Use hybrid injection strategy
+# 3. Call DKI - only pass user_id and raw input
+# DKI will automatically:
+# - Read user preferences from upstream app DB → K/V injection
+# - Retrieve relevant history messages → suffix prompt
+response = await dki.chat(
+    query="Recommend a restaurant for tonight",  # Raw input, no prompt construction
+    user_id="user_001",   # User ID (DKI uses to read preferences and history)
+    session_id="session_001",  # Session ID (DKI uses to read session history)
 )
 
 print(response.text)
 # Output considers:
-# - Vegetarian preference (implicit, from K/V)
-# - Previous restaurant visit (explicit, from history)
-# - Beijing location (implicit, from K/V)
+# - Vegetarian preference (implicit, from K/V injection)
+# - Previous restaurant visit (explicit, from history suffix)
+# - Beijing location (implicit, from K/V injection)
 
-print(f"Alpha: {response.gating_decision.alpha}")
-print(f"Memories used: {len(response.memories_used)}")
-print(f"Latency: {response.latency_ms}ms")
-print(f"Hybrid: {response.metadata.get('hybrid_injection', {})}")
+# Monitoring data
+print(f"Injection enabled: {response.metadata.injection_enabled}")
+print(f"Alpha: {response.metadata.alpha}")
+print(f"Preference tokens: {response.metadata.preference_tokens}")
+print(f"History tokens: {response.metadata.history_tokens}")
+print(f"Cache hit: {response.metadata.preference_cache_hit}")
+print(f"Latency: {response.metadata.latency_ms}ms")
 ```
 
-### Plugin-Based Integration
+### Adapter Configuration Example
+
+Create `config/adapter_config.yaml` to specify how to connect to upstream app database:
+
+```yaml
+user_adapter:
+    # Database connection (connects to upstream app's database)
+    database:
+        type: postgresql # postgresql | mysql | sqlite
+        host: localhost
+        port: 5432
+        database: my_app_db # Upstream app's database
+        username: user
+        password: pass
+
+    # Preferences table mapping (maps to upstream app's table structure)
+    preferences:
+        table: user_preferences # Upstream app's table name
+        fields:
+            user_id: user_id # Upstream app's field name
+            preference_text: content
+            preference_type: type
+            priority: priority
+
+    # Messages table mapping
+    messages:
+        table: chat_messages
+        fields:
+            message_id: id
+            session_id: session_id
+            user_id: user_id
+            role: role
+            content: content
+            timestamp: created_at
+
+    # Vector search config (supports dynamic vector processing)
+    vector_search:
+        type: dynamic # pgvector | faiss | dynamic
+        dynamic:
+            strategy: hybrid # lazy | batch | hybrid (BM25 + embedding)
+```
+
+### Example Chat UI
+
+DKI provides a Vue3 + Element Plus example Chat UI to demonstrate DKI integration:
+
+```bash
+# Start both frontend and backend
+python start_dev.py
+
+# Start backend only
+python start_dev.py backend
+
+# Start frontend only
+python start_dev.py frontend
+```
+
+**UI Features**:
+
+-   🔐 User login/registration
+-   💬 Chat interface with Markdown rendering
+-   ⚙️ User preference management (CRUD)
+-   📊 Session history management
+-   📈 System statistics monitoring (requires admin password)
+-   🎨 Light/dark theme toggle
+
+**Note**: Chat UI is an **example application** to demonstrate DKI integration. DKI's adapter reads the Chat UI's database to get user preferences and history messages.
+
+### Monitoring API
+
+DKI provides monitoring API to view internal working status:
 
 ```python
-from dki.core.plugin_interface import DKIPlugin
+# Get statistics
+stats = dki.get_stats()
+print(f"Total requests: {stats['total_requests']}")
+print(f"Injection rate: {stats['injection_rate']:.2%}")
+print(f"Cache hit rate: {stats['cache_hit_rate']:.2%}")
+print(f"Avg latency: {stats['avg_latency_ms']:.1f}ms")
 
-# Load from configuration file
-plugin = DKIPlugin.from_config("./config/dki_plugin.yaml")
-
-# Attach to any model
-plugin.attach(model, tokenizer)
-
-# Check if DKI should be used (A/B testing support)
-if plugin.should_use_dki(user_id="user_001"):
-    # Get user memory from configured source
-    preferences, history = plugin.get_user_memory("user_001")
-
-    # Compute K/V for preferences
-    K_pref, V_pref = plugin.compute_memory_kv(preferences, model)
-
-    # Inject into attention
-    K_combined, V_combined = plugin.inject_memory(
-        K_user, V_user, K_pref, V_pref, alpha=0.4
-    )
+# Get injection logs
+logs = dki.get_injection_logs(limit=10)
+for log in logs:
+    print(f"[{log['timestamp']}] alpha={log['alpha']:.2f}, enabled={log['injection_enabled']}")
 ```
+
+REST API endpoints:
+
+-   `GET /v1/dki/info` - Get DKI plugin status
+-   `POST /v1/dki/chat` - DKI enhanced chat (upstream apps call this endpoint)
 
 ## 📁 Project Structure
 
 ```
 DKI/
 ├── config/
-│   └── config.yaml           # Main configuration
+│   ├── config.yaml              # Main configuration
+│   └── adapter_config.example.yaml  # Adapter config example
 ├── dki/
 │   ├── core/
-│   │   ├── dki_system.py     # Main DKI system
-│   │   ├── rag_system.py     # RAG baseline
-│   │   ├── memory_router.py  # FAISS-based retrieval
+│   │   ├── dki_plugin.py        # ⭐ DKI Plugin Core
+│   │   ├── dki_system.py        # DKI System wrapper
+│   │   ├── memory_router.py     # FAISS-based retrieval
 │   │   ├── embedding_service.py
-│   │   ├── architecture.py   # Architecture documentation
 │   │   └── components/
-│   │       ├── memory_influence_scaling.py
-│   │       ├── query_conditioned_projection.py
-│   │       ├── dual_factor_gating.py
+│   │       ├── memory_influence_scaling.py   # MIS component
+│   │       ├── query_conditioned_projection.py  # QCP component
+│   │       ├── dual_factor_gating.py         # Dual-factor gating
+│   │       ├── hybrid_injector.py            # Hybrid injector
 │   │       ├── session_kv_cache.py
 │   │       ├── tiered_kv_cache.py    # L1/L2/L3/L4 memory hierarchy
-│   │       ├── attention_budget.py   # Budget analysis
-│   │       └── position_remapper.py
+│   │       └── position_remapper.py  # Position encoding remapping
+│   ├── adapters/
+│   │   ├── base.py              # Adapter base class
+│   │   └── config_driven_adapter.py  # ⭐ Config-driven adapter
+│   ├── api/
+│   │   └── dki_routes.py        # ⭐ DKI API routes
 │   ├── models/
-│   │   ├── factory.py        # Model factory
-│   │   ├── base.py           # Base adapter
+│   │   ├── factory.py           # Model factory
+│   │   ├── base.py              # Base adapter
 │   │   ├── vllm_adapter.py
 │   │   ├── llama_adapter.py
 │   │   ├── deepseek_adapter.py
 │   │   └── glm_adapter.py
+│   ├── cache/
+│   │   └── non_vectorized_handler.py  # Dynamic vector processing
 │   ├── database/
-│   │   ├── models.py         # SQLAlchemy models
-│   │   ├── connection.py     # DB connection manager
-│   │   └── repository.py     # Repository pattern
+│   │   ├── models.py            # SQLAlchemy models
+│   │   └── connection.py        # DB connection manager
 │   ├── experiment/
-│   │   ├── runner.py         # Experiment runner
-│   │   ├── metrics.py        # Evaluation metrics
-│   │   └── data_generator.py # Test data generation
+│   │   ├── runner.py            # Experiment runner
+│   │   ├── metrics.py           # Evaluation metrics
+│   │   └── data_generator.py    # Test data generation
 │   └── web/
-│       └── app.py            # FastAPI + Web UI
+│       └── app.py               # FastAPI application
+├── ui/                          # Vue3 Example Frontend UI
+│   ├── src/
+│   │   ├── views/               # Page components
+│   │   ├── components/          # Common components
+│   │   ├── stores/              # Pinia state management
+│   │   ├── services/            # API services
+│   │   └── types/               # TypeScript types
+│   ├── package.json
+│   └── vite.config.ts
+├── docs/
+│   ├── Integration_Guide.md     # Integration guide
+│   └── Dynamic_Vector_Search.md # Dynamic vector search docs
+├── tests/
+│   ├── unit/                    # Unit tests
+│   └── integration/             # Integration tests
 ├── scripts/
-│   ├── init_db.sql           # Database schema
-│   ├── setup.bat/.sh         # Setup scripts
-│   └── start.bat/.sh         # Start scripts
-├── data/                      # Experiment data
-├── experiment_results/        # Experiment outputs
+│   ├── setup.bat/.sh            # Setup scripts
+│   └── start.bat/.sh            # Start scripts
+├── start_dev.py                 # Development startup script
 ├── requirements.txt
 └── README.md
 ```
 
 ## ⚙️ Configuration
+
+### DKI Main Configuration
 
 Edit `config/config.yaml`:
 
@@ -276,7 +404,7 @@ model:
             model_name: "Qwen/Qwen2-7B-Instruct"
             tensor_parallel_size: 1
 
-# DKI Settings - User-Level Memory System
+# DKI Plugin Settings
 dki:
     enabled: true
     version: "2.5"
@@ -286,24 +414,19 @@ dki:
         enabled: true
         language: "cn" # en | cn
 
-        # Preferences: K/V injection (implicit)
+        # Preferences: K/V injection (Attention Hook, negative position)
         preference:
             enabled: true
             position_strategy: "negative"
             alpha: 0.4 # Lower for background influence
-            max_tokens: 100
+            max_tokens: 200
 
-        # History: Suffix prompt (explicit)
+        # History: Suffix prompt (positive position)
         history:
             enabled: true
             method: "suffix_prompt"
-            max_tokens: 500
+            max_tokens: 2000
             max_messages: 10
-
-    # Memory source (external database)
-    memory_source:
-        type: "sqlite"
-        connection: "./data/dki.db"
 
     # Gating: Relevance-driven, entropy-modulated
     gating:
@@ -316,49 +439,75 @@ dki:
         max_alpha: 0.8
         fallback_on_error: true
         audit_logging: true
-
-    # A/B Testing
-    ab_test:
-        enabled: false
-        dki_percentage: 50
 ```
 
-### Plugin Configuration (Standalone)
+### Adapter Configuration (Core)
 
-Create `dki_plugin.yaml` for framework-agnostic deployment:
+Create `config/adapter_config.yaml` to configure how to connect to upstream app database:
 
 ```yaml
-dki:
-    enabled: true
-    version: "1.0"
+user_adapter:
+    # Database connection - connects to upstream app's database
+    database:
+        type: postgresql # postgresql | mysql | sqlite
+        host: localhost
+        port: 5432
+        database: my_app_db # Upstream app's database name
+        username: user
+        password: pass
+        pool_size: 5
 
-    memory_source:
-        type: "postgresql"
-        connection: "postgresql://user:pass@host:5432/db"
-        table: "user_memories"
+    # Preferences table mapping - maps to upstream app's table structure
+    preferences:
+        table: user_preferences # Upstream app's preference table name
+        fields:
+            user_id: user_id # Field mapping: DKI field -> upstream app field
+            preference_text: content
+            preference_type: type
+            priority: priority
+            created_at: created_at
+        filters:
+            is_active: true # Additional filter conditions
 
-    injection:
-        preference_injection:
-            enabled: true
-            position_strategy: "negative"
-            alpha: 0.4
-            max_tokens: 100
+    # Messages table mapping
+    messages:
+        table: chat_messages # Upstream app's message table name
+        fields:
+            message_id: id
+            session_id: session_id
+            user_id: user_id
+            role: role
+            content: content
+            timestamp: created_at
+            embedding: embedding # Vector field (optional)
 
-        history_injection:
-            enabled: true
-            method: "suffix_prompt"
-            max_tokens: 500
-
-    safety:
-        max_alpha: 0.8
-        fallback_on_error: true
-        audit_logging: true
-        log_path: "./dki_audit.log"
-
-    ab_test:
+    # Vector search configuration
+    vector_search:
         enabled: true
-        dki_percentage: 10 # Start with 10% traffic
+        type: dynamic # pgvector | faiss | dynamic | none
+
+        # Dynamic vector processing (used when no pre-computed vectors)
+        dynamic:
+            strategy: hybrid # lazy | batch | hybrid
+            # hybrid = BM25 initial filtering + embedding reranking
+
+        # Retrieval parameters
+        top_k: 10
+        similarity_threshold: 0.5
+
+    # Cache configuration
+    cache_enabled: true
+    cache_ttl: 300 # 5 minutes
 ```
+
+### Configuration Notes
+
+**Core philosophy of adapter configuration**:
+
+-   Upstream apps **don't need to implement any interface**
+-   Just provide config file specifying database connection and field mapping
+-   DKI uses SQLAlchemy to dynamically reflect table structure
+-   Supports PostgreSQL, MySQL, SQLite and other mainstream databases
 
 ## 📊 Experiments
 
@@ -394,41 +543,63 @@ results = runner.run_alpha_sensitivity(
 
 ## 📈 API Reference
 
-### REST API
+### DKI Plugin API
 
-| Endpoint                     | Method | Description                |
-| ---------------------------- | ------ | -------------------------- |
-| `/api/chat`                  | POST   | Chat with DKI/RAG/Baseline |
-| `/api/memory`                | POST   | Add memory                 |
-| `/api/memories/{session_id}` | GET    | Get session memories       |
-| `/api/search`                | POST   | Search memories            |
-| `/api/stats`                 | GET    | Get system statistics      |
-| `/api/experiment/run`        | POST   | Run experiment             |
+| Endpoint       | Method | Description                                 |
+| -------------- | ------ | ------------------------------------------- |
+| `/v1/dki/chat` | POST   | DKI enhanced chat (upstream apps call this) |
+| `/v1/dki/info` | GET    | Get DKI plugin status                       |
 
-### Chat Request
+### Monitoring API
+
+| Endpoint         | Method | Description           |
+| ---------------- | ------ | --------------------- |
+| `/api/stats`     | GET    | Get system statistics |
+| `/api/stats/dki` | GET    | Get DKI statistics    |
+| `/api/health`    | GET    | Health check          |
+
+### DKI Chat Request
+
+Upstream apps only need to pass `user_id` and raw input:
 
 ```json
 {
     "query": "Recommend a restaurant",
-    "session_id": "user_001",
-    "mode": "dki",
-    "force_alpha": 0.7,
-    "max_new_tokens": 256,
-    "temperature": 0.7
+    "user_id": "user_001",
+    "session_id": "session_001",
+    "temperature": 0.7,
+    "max_tokens": 512
 }
 ```
 
-### Chat Response
+### DKI Chat Response
 
 ```json
 {
-    "response": "Based on your preference for vegetarian food...",
-    "mode": "dki",
-    "session_id": "user_001",
-    "latency_ms": 156.3,
-    "memories_used": [...],
-    "alpha": 0.72,
-    "cache_hit": true
+    "id": "dki-abc12345",
+    "text": "Based on your preference for vegetarian food...",
+    "input_tokens": 128,
+    "output_tokens": 256,
+    "dki_metadata": {
+        "injection_enabled": true,
+        "alpha": 0.4,
+        "preference_tokens": 85,
+        "history_tokens": 320,
+        "cache_hit": true,
+        "cache_tier": "memory",
+        "latency_ms": 156.3
+    },
+    "choices": [
+        {
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "Based on your preference..."
+            },
+            "finish_reason": "stop"
+        }
+    ],
+    "created": 1707523200
 }
 ```
 
@@ -747,84 +918,99 @@ print(f"Attention FLOPs: {budget.attention_flops}")
 ### FAQ
 
 **Q: Does DKI require retraining the model?**  
-A: No. DKI is an inference-time enhancement using frozen model parameters. Only the α predictor and QCP are optional small networks (if training is needed).
+A: No. DKI is an inference-time enhancement using frozen model parameters, injecting K/V via Attention Hooks.
 
-**Q: Can DKI be combined with existing RAG systems?**  
-A: Yes! DKI handles user-level memory, RAG handles external knowledge. They are complementary:
+**Q: What's the difference between DKI and RAG?**  
+A:
 
--   RAG: Document retrieval, knowledge bases
--   DKI: User preferences, session history
+-   **RAG**: Concatenates retrieved content at token level, consumes context window
+-   **DKI**: Injects K/V at attention level, doesn't consume token budget
+-   They are complementary: RAG handles external knowledge, DKI handles user-level memory
 
-**Q: What about memory footprint?**  
-A: Each 200-token memory is ~100MB (uncompressed). Using tiered cache and GEAR compression can achieve 8× compression. For user-level memory (typically < 200 tokens), this is very manageable.
+**Q: What changes does the upstream app need to make?**  
+A:
 
-**Q: Which position encoding schemes are supported?**  
-A: Currently RoPE and ALiBi are supported. For short preferences (< 100 tokens), negative position mapping is safe. For longer content, use suffix prompt injection.
+1. Provide adapter config file (specify database connection and field mapping)
+2. Remove RAG/Prompt engineering code
+3. Pass `user_id` and raw input when calling DKI API
 
-**Q: How to debug injection decisions?**  
-A: Enable audit logging (`audit_logging: true` in `config.yaml`), all injection decisions will be logged including memory_ids, α values, and gating reasons.
+**Q: What if the upstream app's database doesn't have vector indexes?**  
+A: DKI supports dynamic vector processing, just configure `vector_search.type: dynamic`. Three strategies supported:
+
+-   `lazy`: Compute embedding on-demand
+-   `batch`: Batch pre-computation
+-   `hybrid`: BM25 initial filtering + embedding reranking (recommended)
 
 **Q: What's the difference between preference and history injection?**  
 A:
 
--   **Preferences**: K/V injection at negative positions, implicit influence, cached
--   **History**: Suffix prompt at positive positions, explicit reference, dynamic
+-   **Preferences**: K/V injection at negative positions via Attention Hook, implicit influence, cached
+-   **History**: Suffix prompt at positive positions, standard token concatenation, explicit reference, dynamic
 
 **Q: How to integrate DKI into existing systems?**  
-A: Use the plugin interface:
+A:
 
 ```python
-from dki.core.plugin_interface import DKIPlugin
-plugin = DKIPlugin.from_config("./dki_config.yaml")
-plugin.attach(model)
+from dki.core.dki_plugin import DKIPlugin
+
+# Create from config file (recommended)
+dki = await DKIPlugin.from_config(
+    model_adapter=your_model_adapter,
+    adapter_config_path="config/adapter_config.yaml",
+)
+
+# Only pass user_id and raw input when calling
+response = await dki.chat(
+    query="User's raw input",
+    user_id="user_123",
+    session_id="session_456",
+)
 ```
+
+**Q: Does DKI need to consider distributed deployment?**  
+A: No. DKI as an LLM plugin only reads user config and message data to complete injection. Distributed deployment is the responsibility of the LLM engine and upstream application. DKI itself is stateless (except for preference K/V cache) and can scale horizontally with LLM instances.
 
 **Q: Production deployment recommendations?**  
 A:
 
-1. Start with hybrid injection enabled
+1. Enable hybrid injection
 2. Set preference α to 0.4 (conservative)
-3. Enable A/B testing with 10% traffic initially
-4. Monitor hallucination rate and user satisfaction
-5. Gradually increase DKI traffic based on metrics
+3. Configure adapter to connect to upstream app's database
+4. Monitor injection rate and latency
+5. Adjust alpha and cache strategy based on metrics
 
 ### Roadmap
 
--   [x] Core DKI implementation
--   [x] vLLM adapter
+-   [x] Core DKI implementation (Attention Hook K/V injection)
+-   [x] vLLM/LLaMA/DeepSeek/GLM adapters
+-   [x] Hybrid injection strategy (preference K/V + history suffix)
+-   [x] Config-driven adapter (SQLAlchemy dynamic table mapping)
+-   [x] Dynamic vector processing (BM25 + Embedding hybrid search)
+-   [x] Preference K/V cache (memory + optional Redis)
+-   [x] Monitoring API (stats/logs/health)
+-   [x] Vue3 Example Frontend UI
 -   [x] Experiment framework
--   [x] LLaMA/DeepSeek/GLM adapters
--   [x] FlashAttention-3 integration
--   [x] Hybrid injection strategy (preferences + history)
--   [x] Plugin architecture (configuration-driven)
--   [x] A/B testing support
--   [x] User data adapter interface (PostgreSQL/MySQL/MongoDB/Redis/REST API)
--   [x] Tiered preference cache (L1 Memory + L2 Redis)
--   [x] Non-vectorized data handler (BM25 + Embedding hybrid search)
--   [x] OpenAI-compatible API (/v1/chat/completions)
--   [ ] Vue3 Frontend UI (in development)
--   [ ] Attention visualization tools (Streamlit debugger)
+-   [ ] Attention visualization tools
 -   [ ] Multi-modal extension (image memory)
--   [ ] Distributed deployment support
 -   [ ] LangChain/LlamaIndex integration
 
-### Frontend UI Technology Stack
+### Example Frontend UI
 
-The DKI system frontend UI will be developed using **Vue3** framework:
+DKI provides a **Vue3** based example frontend UI to demonstrate DKI integration:
 
 -   **Vue 3 + TypeScript**: Type-safe modern frontend development
 -   **Vite**: Fast development server and build tool
 -   **Pinia**: Vue3 official state management
--   **Element Plus / Naive UI**: Enterprise-grade UI component library
--   **WebSocket**: Real-time streaming response support
+-   **Element Plus**: Enterprise-grade UI component library
 
-Planned UI Features:
+UI Features:
 
 -   Chat interface (with DKI metadata badges)
 -   User preference management panel
--   DKI debug panel (α slider, gating decision visualization)
 -   Session history browser
--   System statistics dashboard
+-   System statistics dashboard (requires password)
+
+**Note**: Chat UI is an example application, DKI's adapter reads its database to get user preferences and history messages.
 
 ### Acknowledgments
 

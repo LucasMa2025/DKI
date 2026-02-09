@@ -1,76 +1,90 @@
 """
-Base User Data Adapter Interface and Data Models
-Defines the standard interface for connecting DKI to external user data sources
+External User Data Adapter Interface
+
+外部用户数据适配器接口
+
+职责: 读取上层应用的数据库，获取用户偏好和历史消息
+注意: 这是读取外部系统的数据，不是 DKI 自己的数据存储
+
+DKI 作为 LLM 插件，需要从上层应用获取:
+1. 用户偏好 (用于 K/V 注入)
+2. 历史消息 (用于后缀提示词)
+
+上层应用可能是:
+- 第三方 Chat 系统
+- 企业内部应用
+- 任何需要 LLM 增强的系统
 
 Author: AGI Demo Project
-Version: 1.0.0
+Version: 2.0.0
 """
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 import hashlib
 
 from loguru import logger
 
 
 class AdapterType(str, Enum):
-    """Supported adapter types."""
+    """支持的适配器类型"""
     POSTGRESQL = "postgresql"
     MYSQL = "mysql"
     MONGODB = "mongodb"
     REDIS = "redis"
     REST_API = "rest_api"
-    MEMORY = "memory"
     SQLITE = "sqlite"
+    MEMORY = "memory"  # 仅用于示例/测试
     CUSTOM = "custom"
 
 
 @dataclass
 class AdapterConfig:
     """
-    Configuration for user data adapter.
+    外部数据适配器配置
     
-    Supports multiple connection types with unified configuration.
+    用于连接上层应用的数据库
     """
     adapter_type: AdapterType = AdapterType.MEMORY
     
-    # Database connection
+    # 数据库连接
     host: str = "localhost"
     port: int = 5432
     database: str = ""
     username: str = ""
     password: str = ""
     
-    # Connection string (alternative to individual params)
+    # 连接字符串 (替代单独参数)
     connection_string: Optional[str] = None
     
-    # Schema/Collection names
+    # 表名/集合名 (上层应用的表结构)
     schema: str = "public"
     users_table: str = "users"
     messages_table: str = "messages"
     preferences_table: str = "user_preferences"
+    sessions_table: str = "sessions"
     
-    # REST API specific
+    # REST API 配置
     base_url: str = ""
     api_key: str = ""
     timeout: int = 30
     
-    # Connection pool
+    # 连接池
     pool_size: int = 5
     max_overflow: int = 10
     
-    # Cache settings
+    # 缓存
     enable_cache: bool = True
-    cache_ttl: int = 300  # 5 minutes
+    cache_ttl: int = 300  # 5 分钟
     
-    # Additional options
+    # 额外选项
     options: Dict[str, Any] = field(default_factory=dict)
     
     def get_connection_string(self) -> str:
-        """Build connection string from config."""
+        """构建连接字符串"""
         if self.connection_string:
             return self.connection_string
         
@@ -84,6 +98,8 @@ class AdapterConfig:
             if self.password:
                 return f"redis://:{self.password}@{self.host}:{self.port}/0"
             return f"redis://{self.host}:{self.port}/0"
+        elif self.adapter_type == AdapterType.SQLITE:
+            return f"sqlite:///{self.database}"
         else:
             return ""
 
@@ -91,39 +107,34 @@ class AdapterConfig:
 @dataclass
 class UserProfile:
     """
-    User profile data structure.
+    用户画像数据结构
     
-    Contains user identity and configuration information.
+    来源: 上层应用的 users 表
     """
     user_id: str
     username: Optional[str] = None
     display_name: Optional[str] = None
     email: Optional[str] = None
     
-    # User preferences as structured data
+    # 用户偏好 (结构化数据)
     preferences: Dict[str, Any] = field(default_factory=dict)
     
-    # User settings (UI preferences, language, etc.)
+    # 用户设置 (UI 偏好、语言等)
     settings: Dict[str, Any] = field(default_factory=dict)
     
-    # Additional metadata
+    # 元数据
     metadata: Dict[str, Any] = field(default_factory=dict)
     
-    # Timestamps
+    # 时间戳
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
     last_active_at: Optional[datetime] = None
     
-    # Status
+    # 状态
     is_active: bool = True
     
     def get_preference_text(self) -> str:
-        """
-        Convert preferences to text format for DKI injection.
-        
-        Returns:
-            Formatted preference text
-        """
+        """将偏好转换为文本格式 (用于 DKI 注入)"""
         if not self.preferences:
             return ""
         
@@ -136,7 +147,6 @@ class UserProfile:
         return "\n".join(lines)
     
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary."""
         return {
             "user_id": self.user_id,
             "username": self.username,
@@ -153,21 +163,18 @@ class UserProfile:
     
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "UserProfile":
-        """Create from dictionary."""
-        # Parse datetime fields
         for field_name in ["created_at", "updated_at", "last_active_at"]:
             if data.get(field_name) and isinstance(data[field_name], str):
                 data[field_name] = datetime.fromisoformat(data[field_name])
-        
         return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
 
 
 @dataclass
 class ChatMessage:
     """
-    Chat message data structure.
+    聊天消息数据结构
     
-    Represents a single message in conversation history.
+    来源: 上层应用的 messages 表
     """
     message_id: str
     session_id: str
@@ -176,20 +183,19 @@ class ChatMessage:
     content: str
     timestamp: datetime
     
-    # Optional embedding for vector search
+    # 可选的 embedding (用于向量检索)
     embedding: Optional[List[float]] = None
     
-    # Message metadata
+    # 消息元数据
     metadata: Dict[str, Any] = field(default_factory=dict)
     
-    # Token count (if available)
+    # Token 数量 (如果可用)
     token_count: Optional[int] = None
     
-    # Parent message ID (for threading)
+    # 父消息 ID (用于线程)
     parent_id: Optional[str] = None
     
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary."""
         return {
             "message_id": self.message_id,
             "session_id": self.session_id,
@@ -205,58 +211,56 @@ class ChatMessage:
     
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ChatMessage":
-        """Create from dictionary."""
         if data.get("timestamp") and isinstance(data["timestamp"], str):
             data["timestamp"] = datetime.fromisoformat(data["timestamp"])
-        
         return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
     
     def content_hash(self) -> str:
-        """Get hash of message content for caching."""
+        """获取内容哈希 (用于缓存)"""
         return hashlib.md5(self.content.encode()).hexdigest()
 
 
 @dataclass
 class UserPreference:
     """
-    User preference data structure.
+    用户偏好数据结构
     
-    Represents a specific user preference for DKI injection.
+    来源: 上层应用的 user_preferences 表
+    用途: DKI K/V 注入
     """
     user_id: str
     preference_text: str
     preference_type: str  # "dietary" | "communication" | "interests" | "custom"
     
-    # Preference ID (optional)
+    # 偏好 ID
     preference_id: Optional[str] = None
     
-    # Priority for ordering (higher = more important)
+    # 优先级 (越高越重要)
     priority: int = 0
     
-    # Category for grouping
+    # 分类
     category: Optional[str] = None
     
-    # Metadata
+    # 元数据
     metadata: Dict[str, Any] = field(default_factory=dict)
     
-    # Timestamps
+    # 时间戳
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
     
-    # Expiration (optional)
+    # 过期时间 (可选)
     expires_at: Optional[datetime] = None
     
-    # Status
+    # 状态
     is_active: bool = True
     
     def is_expired(self) -> bool:
-        """Check if preference has expired."""
+        """检查偏好是否过期"""
         if self.expires_at is None:
             return False
         return datetime.utcnow() > self.expires_at
     
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary."""
         return {
             "user_id": self.user_id,
             "preference_id": self.preference_id,
@@ -273,39 +277,44 @@ class UserPreference:
     
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "UserPreference":
-        """Create from dictionary."""
         for field_name in ["created_at", "updated_at", "expires_at"]:
             if data.get(field_name) and isinstance(data[field_name], str):
                 data[field_name] = datetime.fromisoformat(data[field_name])
-        
         return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
 
 
 class IUserDataAdapter(ABC):
     """
-    User Data Adapter Interface.
+    外部用户数据适配器接口
     
-    All external data sources must implement this interface to integrate with DKI.
+    职责: 读取上层应用的数据库，获取用户偏好和历史消息
     
-    This interface provides:
-    - User profile retrieval
-    - Session history access
-    - User preference management
-    - Relevant history search
+    注意:
+    - 这是读取外部系统的数据，不是 DKI 自己的数据存储
+    - 上层应用负责数据的写入和管理
+    - DKI 只读取数据用于注入
     
-    Example Implementation:
-        class MyDatabaseAdapter(IUserDataAdapter):
-            async def get_user_profile(self, user_id: str) -> Optional[UserProfile]:
-                # Fetch from your database
-                ...
+    实现示例:
+    ```python
+    class MyAppAdapter(IUserDataAdapter):
+        '''连接我的应用数据库'''
+        
+        async def get_user_preferences(self, user_id: str) -> List[UserPreference]:
+            # 从我的应用的 user_preferences 表读取
+            rows = await self.db.fetch(
+                "SELECT * FROM user_preferences WHERE user_id = $1",
+                user_id
+            )
+            return [UserPreference.from_dict(row) for row in rows]
+    ```
     """
     
     def __init__(self, config: Optional[AdapterConfig] = None):
         """
-        Initialize adapter with configuration.
+        初始化适配器
         
         Args:
-            config: Adapter configuration
+            config: 适配器配置 (连接上层应用的数据库)
         """
         self.config = config or AdapterConfig()
         self._connected = False
@@ -313,37 +322,57 @@ class IUserDataAdapter(ABC):
     
     @property
     def is_connected(self) -> bool:
-        """Check if adapter is connected."""
+        """检查是否已连接"""
         return self._connected
     
     @abstractmethod
     async def connect(self) -> None:
         """
-        Establish connection to data source.
+        建立与上层应用数据库的连接
         
-        Should be called before any data operations.
+        在使用适配器前必须调用
         """
         pass
     
     @abstractmethod
     async def disconnect(self) -> None:
         """
-        Close connection to data source.
-        
-        Should be called when adapter is no longer needed.
+        关闭与上层应用数据库的连接
         """
         pass
     
     @abstractmethod
     async def get_user_profile(self, user_id: str) -> Optional[UserProfile]:
         """
-        Get user profile by user ID.
+        从上层应用的数据库获取用户画像
         
         Args:
-            user_id: Unique user identifier
+            user_id: 用户标识
             
         Returns:
-            UserProfile if found, None otherwise
+            UserProfile 或 None
+        """
+        pass
+    
+    @abstractmethod
+    async def get_user_preferences(
+        self,
+        user_id: str,
+        preference_types: Optional[List[str]] = None,
+        include_expired: bool = False,
+    ) -> List[UserPreference]:
+        """
+        从上层应用的数据库获取用户偏好
+        
+        这是 DKI K/V 注入的数据来源
+        
+        Args:
+            user_id: 用户标识
+            preference_types: 过滤偏好类型
+            include_expired: 是否包含过期偏好
+            
+        Returns:
+            用户偏好列表 (按优先级排序)
         """
         pass
     
@@ -356,36 +385,16 @@ class IUserDataAdapter(ABC):
         after: Optional[datetime] = None,
     ) -> List[ChatMessage]:
         """
-        Get conversation history for a session.
+        从上层应用的数据库获取会话历史
         
         Args:
-            session_id: Session identifier
-            limit: Maximum number of messages to return
-            before: Get messages before this timestamp
-            after: Get messages after this timestamp
+            session_id: 会话标识
+            limit: 最大消息数
+            before: 获取此时间之前的消息
+            after: 获取此时间之后的消息
             
         Returns:
-            List of messages in chronological order
-        """
-        pass
-    
-    @abstractmethod
-    async def get_user_preferences(
-        self,
-        user_id: str,
-        preference_types: Optional[List[str]] = None,
-        include_expired: bool = False,
-    ) -> List[UserPreference]:
-        """
-        Get user preferences.
-        
-        Args:
-            user_id: User identifier
-            preference_types: Filter by preference types
-            include_expired: Include expired preferences
-            
-        Returns:
-            List of user preferences sorted by priority
+            消息列表 (按时间顺序)
         """
         pass
     
@@ -398,30 +407,32 @@ class IUserDataAdapter(ABC):
         session_id: Optional[str] = None,
     ) -> List[ChatMessage]:
         """
-        Search for messages relevant to a query.
+        从上层应用的数据库检索与查询相关的历史消息
+        
+        这是 DKI 历史后缀注入的数据来源
         
         Args:
-            user_id: User identifier
-            query: Search query
-            limit: Maximum results
-            session_id: Optional session filter
+            user_id: 用户标识
+            query: 搜索查询
+            limit: 最大结果数
+            session_id: 可选的会话过滤
             
         Returns:
-            Relevant messages sorted by relevance
+            相关消息列表 (按相关性排序)
         """
         pass
     
     @abstractmethod
     async def health_check(self) -> bool:
         """
-        Check if data source is healthy and accessible.
+        检查与上层应用数据库的连接是否健康
         
         Returns:
-            True if healthy, False otherwise
+            True 如果健康
         """
         pass
     
-    # Optional methods with default implementations
+    # ============ 可选方法 (带默认实现) ============
     
     async def get_user_sessions(
         self,
@@ -430,68 +441,18 @@ class IUserDataAdapter(ABC):
         active_only: bool = True,
     ) -> List[Dict[str, Any]]:
         """
-        Get user's sessions.
+        获取用户的会话列表
         
         Args:
-            user_id: User identifier
-            limit: Maximum sessions to return
-            active_only: Only return active sessions
+            user_id: 用户标识
+            limit: 最大会话数
+            active_only: 仅返回活跃会话
             
         Returns:
-            List of session info dictionaries
+            会话信息列表
         """
-        logger.warning(f"{self.__class__.__name__} does not implement get_user_sessions")
+        logger.warning(f"{self.__class__.__name__} 未实现 get_user_sessions")
         return []
-    
-    async def save_message(
-        self,
-        message: ChatMessage,
-    ) -> bool:
-        """
-        Save a message to the data source.
-        
-        Args:
-            message: Message to save
-            
-        Returns:
-            True if saved successfully
-        """
-        logger.warning(f"{self.__class__.__name__} does not implement save_message")
-        return False
-    
-    async def update_user_preference(
-        self,
-        preference: UserPreference,
-    ) -> bool:
-        """
-        Update or create a user preference.
-        
-        Args:
-            preference: Preference to update/create
-            
-        Returns:
-            True if successful
-        """
-        logger.warning(f"{self.__class__.__name__} does not implement update_user_preference")
-        return False
-    
-    async def delete_user_preference(
-        self,
-        user_id: str,
-        preference_id: str,
-    ) -> bool:
-        """
-        Delete a user preference.
-        
-        Args:
-            user_id: User identifier
-            preference_id: Preference identifier
-            
-        Returns:
-            True if deleted successfully
-        """
-        logger.warning(f"{self.__class__.__name__} does not implement delete_user_preference")
-        return False
     
     async def get_preference_text(
         self,
@@ -499,20 +460,20 @@ class IUserDataAdapter(ABC):
         max_tokens: int = 100,
     ) -> str:
         """
-        Get formatted preference text for DKI injection.
+        获取格式化的偏好文本 (用于 DKI 注入)
         
         Args:
-            user_id: User identifier
-            max_tokens: Maximum tokens (approximate)
+            user_id: 用户标识
+            max_tokens: 最大 token 数 (近似)
             
         Returns:
-            Formatted preference text
+            格式化的偏好文本
         """
         preferences = await self.get_user_preferences(user_id)
         if not preferences:
             return ""
         
-        # Sort by priority and format
+        # 按优先级排序并格式化
         preferences.sort(key=lambda p: p.priority, reverse=True)
         
         lines = []
@@ -523,7 +484,7 @@ class IUserDataAdapter(ABC):
                 continue
             
             line = f"- {pref.preference_type}: {pref.preference_text}"
-            line_tokens = len(line.split()) * 1.3  # Rough estimate
+            line_tokens = len(line.split()) * 1.3  # 粗略估算
             
             if estimated_tokens + line_tokens > max_tokens:
                 break
@@ -537,10 +498,10 @@ class IUserDataAdapter(ABC):
         return f"{self.__class__.__name__}(type={self.config.adapter_type}, connected={self._connected})"
     
     async def __aenter__(self):
-        """Async context manager entry."""
+        """异步上下文管理器入口"""
         await self.connect()
         return self
     
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Async context manager exit."""
+        """异步上下文管理器出口"""
         await self.disconnect()

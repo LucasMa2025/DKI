@@ -1,18 +1,40 @@
 #!/usr/bin/env python3
 """
-Development Server Startup Script
-Starts both the backend API server and frontend dev server
+DKI Development Server Startup Script
+
+Starts both the backend API server and frontend dev server.
+The frontend is an example Chat UI that demonstrates DKI integration.
 
 Usage:
     python start_dev.py          # Start both servers
     python start_dev.py backend  # Start only backend
     python start_dev.py frontend # Start only frontend
+
+Architecture:
+    ┌─────────────────────────────────────────────────────────┐
+    │  Example Chat UI (Vue3)                                 │
+    │  └── Only passes user_id + raw input to DKI            │
+    └─────────────────────────────┬───────────────────────────┘
+                                  │
+                                  ▼
+    ┌─────────────────────────────────────────────────────────┐
+    │  DKI Plugin API (FastAPI)                               │
+    │  ├── /v1/dki/chat - DKI enhanced chat                  │
+    │  └── /v1/dki/info - DKI plugin status                  │
+    └─────────────────────────────┬───────────────────────────┘
+                                  │
+                                  ▼
+    ┌─────────────────────────────────────────────────────────┐
+    │  DKI Plugin Core                                        │
+    │  ├── Config-driven adapter reads Chat UI's database    │
+    │  ├── Preferences → K/V injection (Attention Hook)      │
+    │  └── History → Suffix prompt                           │
+    └─────────────────────────────────────────────────────────┘
 """
 
 import subprocess
 import sys
 import os
-import signal
 import time
 from pathlib import Path
 
@@ -27,8 +49,10 @@ UI_DIR = ROOT_DIR / "ui"
 
 
 def start_backend():
-    """Start the FastAPI backend server."""
-    print(f"🚀 Starting backend server on http://localhost:{BACKEND_PORT}")
+    """Start the FastAPI backend server with DKI plugin."""
+    print(f"🚀 Starting DKI backend server on http://localhost:{BACKEND_PORT}")
+    print("   - DKI Plugin API: /v1/dki/chat")
+    print("   - API Docs: /docs")
     
     env = os.environ.copy()
     env["PYTHONPATH"] = str(ROOT_DIR)
@@ -48,8 +72,10 @@ def start_backend():
 
 
 def start_frontend():
-    """Start the Vue3 frontend dev server."""
-    print(f"🎨 Starting frontend server on http://localhost:{FRONTEND_PORT}")
+    """Start the Vue3 example Chat UI dev server."""
+    print(f"🎨 Starting example Chat UI on http://localhost:{FRONTEND_PORT}")
+    print("   - This is an example app demonstrating DKI integration")
+    print("   - Chat UI only passes user_id + raw input to DKI")
     
     # Check if node_modules exists
     if not (UI_DIR / "node_modules").exists():
@@ -75,6 +101,11 @@ def main():
     # Parse arguments
     mode = sys.argv[1] if len(sys.argv) > 1 else "all"
     
+    print("\n" + "=" * 60)
+    print("  DKI - Dynamic KV Injection Development Environment")
+    print("  Attention-Level User Memory Plugin for LLMs")
+    print("=" * 60 + "\n")
+    
     try:
         if mode in ("all", "backend"):
             backend_proc = start_backend()
@@ -85,20 +116,25 @@ def main():
             frontend_proc = start_frontend()
             processes.append(frontend_proc)
         
-        print("\n" + "=" * 50)
+        print("\n" + "=" * 60)
         print("🎉 DKI Development Servers Started!")
-        print("=" * 50)
+        print("=" * 60)
         
         if mode in ("all", "backend"):
-            print(f"  Backend API:  http://localhost:{BACKEND_PORT}")
-            print(f"  API Docs:     http://localhost:{BACKEND_PORT}/docs")
+            print(f"  Backend API:      http://localhost:{BACKEND_PORT}")
+            print(f"  DKI Chat API:     http://localhost:{BACKEND_PORT}/v1/dki/chat")
+            print(f"  API Docs:         http://localhost:{BACKEND_PORT}/docs")
         
         if mode in ("all", "frontend"):
-            print(f"  Frontend UI:  http://localhost:{FRONTEND_PORT}")
+            print(f"  Example Chat UI:  http://localhost:{FRONTEND_PORT}")
         
-        print("=" * 50)
-        print("Press Ctrl+C to stop all servers")
-        print("=" * 50 + "\n")
+        print("=" * 60)
+        print("\n📝 Integration Notes:")
+        print("   - Chat UI is an EXAMPLE app demonstrating DKI integration")
+        print("   - DKI adapter reads Chat UI's database for preferences/history")
+        print("   - Upstream apps only need to pass user_id + raw input")
+        print("\nPress Ctrl+C to stop all servers")
+        print("=" * 60 + "\n")
         
         # Wait for processes
         for proc in processes:

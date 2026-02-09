@@ -1,6 +1,6 @@
 # DKI Quick Start Guide
 
-快速开始使用 DKI (Dynamic KV Injection) 系统。
+快速开始使用 DKI (Dynamic KV Injection) - LLM 注意力层级用户记忆插件。
 
 ## 📋 Prerequisites
 
@@ -24,174 +24,144 @@ chmod +x scripts/*.sh
 ./scripts/setup.sh
 ```
 
-### Step 2: Start the System
+### Step 2: Start Development Servers
 
 ```bash
-# Windows
-scripts\start.bat web
-
-# Linux/Mac
-./scripts/start.sh web
+# Start both backend and example Chat UI
+python start_dev.py
 ```
 
-### Step 3: Open Web UI
+### Step 3: Open Example Chat UI
 
-Open http://localhost:8080 in your browser.
+Open http://localhost:3000 in your browser.
 
-## 💻 Quick Python Example
+## 💻 Integration Example (Recommended)
+
+DKI 作为 LLM 插件，上层应用只需传递 `user_id` 和原始输入：
 
 ```python
-from dki import DKISystem
+from dki.core.dki_plugin import DKIPlugin
+from dki.models.vllm_adapter import VLLMAdapter
 
-# Initialize DKI
-dki = DKISystem()
+# 1. 初始化 LLM 适配器
+model_adapter = VLLMAdapter(model_name="Qwen/Qwen2-7B-Instruct")
 
-# Add some memories about the user
-session_id = "demo_user"
+# 2. 从配置文件创建 DKI 插件
+# 配置文件指定如何连接上层应用的数据库
+dki = await DKIPlugin.from_config(
+    model_adapter=model_adapter,
+    adapter_config_path="config/adapter_config.yaml",
+)
 
-dki.add_memory(session_id, "I prefer vegetarian food")
-dki.add_memory(session_id, "I'm allergic to seafood")
-dki.add_memory(session_id, "I live in Beijing")
-dki.add_memory(session_id, "I enjoy hiking on weekends")
-
-# Chat - memories are automatically injected
-response = dki.chat(
-    query="Where should I eat tonight?",
-    session_id=session_id
+# 3. 调用 DKI - 只需传递 user_id 和原始输入
+# DKI 会自动:
+# - 通过适配器读取用户偏好 → K/V 注入 (Attention Hook)
+# - 通过适配器检索相关历史 → 后缀提示词
+response = await dki.chat(
+    query="今晚想找一家餐厅",  # 原始输入，无需任何 prompt 构造
+    user_id="user_001",
+    session_id="session_001",
 )
 
 print(f"Response: {response.text}")
-print(f"Injection Alpha: {response.gating_decision.alpha:.2f}")
-print(f"Memories Used: {len(response.memories_used)}")
-print(f"Latency: {response.latency_ms:.0f}ms")
+print(f"Injection Enabled: {response.metadata.injection_enabled}")
+print(f"Alpha: {response.metadata.alpha:.2f}")
+print(f"Preference Tokens: {response.metadata.preference_tokens}")
+print(f"History Tokens: {response.metadata.history_tokens}")
+print(f"Cache Hit: {response.metadata.preference_cache_hit}")
+print(f"Latency: {response.metadata.latency_ms:.0f}ms")
 ```
 
-## 🔄 Compare DKI vs RAG
+## 🔧 Adapter Configuration
 
-```python
-from dki import DKISystem, RAGSystem
+创建 `config/adapter_config.yaml` 配置如何连接上层应用的数据库：
 
-dki = DKISystem()
-rag = RAGSystem()
-
-session_id = "comparison_test"
-query = "Recommend a restaurant"
-
-# Add same memories to both systems
-memories = [
-    "User prefers vegetarian food",
-    "User is allergic to seafood",
-]
-
-for mem in memories:
-    dki.add_memory(session_id, mem)
-    rag.add_memory(session_id, mem)
-
-# Compare responses
-dki_response = dki.chat(query, session_id)
-rag_response = rag.chat(query, session_id)
-
-print("=== DKI Response ===")
-print(f"Text: {dki_response.text}")
-print(f"Latency: {dki_response.latency_ms:.0f}ms")
-print(f"Alpha: {dki_response.gating_decision.alpha:.2f}")
-
-print("\n=== RAG Response ===")
-print(f"Text: {rag_response.text}")
-print(f"Latency: {rag_response.latency_ms:.0f}ms")
+```yaml
+user_adapter:
+  # 数据库连接 (连接到上层应用的数据库)
+  database:
+    type: postgresql  # postgresql | mysql | sqlite
+    host: localhost
+    database: my_app_db
+    username: user
+    password: pass
+  
+  # 偏好表映射
+  preferences:
+    table: user_preferences
+    fields:
+      user_id: user_id
+      preference_text: content
+      preference_type: type
+  
+  # 消息表映射
+  messages:
+    table: chat_messages
+    fields:
+      message_id: id
+      session_id: session_id
+      user_id: user_id
+      role: role
+      content: content
+      timestamp: created_at
+  
+  # 向量检索 (支持动态向量处理)
+  vector_search:
+    type: dynamic
+    dynamic:
+      strategy: hybrid  # BM25 + embedding
 ```
 
 ## 🎛️ Control Injection Strength
 
 ```python
-# Force specific alpha value
-response = dki.chat(
-    query="What should I do this weekend?",
-    session_id=session_id,
-    force_alpha=0.8  # Strong memory influence
+# 强制指定 alpha 值
+response = await dki.chat(
+    query="推荐一家餐厅",
+    user_id="user_001",
+    session_id="session_001",
+    force_alpha=0.8,  # 强注入
 )
 
-# Disable injection entirely
-response = dki.chat(
-    query="What is 2+2?",
-    session_id=session_id,
-    allow_injection=False  # Pure LLM response
-)
+# 查看注入详情
+print(f"Alpha: {response.metadata.alpha}")
+print(f"Gating Decision: {response.metadata.gating_decision}")
 ```
 
-## 📊 Run Experiments
+## 📊 Monitoring
 
 ```python
-from dki.experiment.runner import ExperimentRunner, ExperimentConfig
-from dki.experiment.data_generator import ExperimentDataGenerator
+# 获取统计数据
+stats = dki.get_stats()
+print(f"Total Requests: {stats['total_requests']}")
+print(f"Injection Rate: {stats['injection_rate']:.2%}")
+print(f"Cache Hit Rate: {stats['cache_hit_rate']:.2%}")
+print(f"Avg Latency: {stats['avg_latency_ms']:.1f}ms")
 
-# Generate test data
-generator = ExperimentDataGenerator("./data")
-generator.generate_all()
-
-# Run comparison experiment
-runner = ExperimentRunner()
-config = ExperimentConfig(
-    name="Quick Test",
-    modes=["dki", "rag"],
-    datasets=["memory_qa"],
-    max_samples=20
-)
-
-results = runner.run_experiment(config)
-print(f"DKI avg latency: {results['aggregated_metrics']['dki']['latency_p50']:.0f}ms")
-print(f"RAG avg latency: {results['aggregated_metrics']['rag']['latency_p50']:.0f}ms")
-```
-
-## 🔧 Configuration Tips
-
-### Use Different Models
-
-Edit `config/config.yaml`:
-
-```yaml
-model:
-  default_engine: "llama"  # Change from vllm to llama
-  engines:
-    llama:
-      model_name: "meta-llama/Llama-3.2-3B-Instruct"
-```
-
-### Tune Gating Thresholds
-
-```yaml
-dki:
-  gating:
-    entropy_threshold: 0.3    # Lower = more likely to inject
-    relevance_threshold: 0.5  # Lower = accept less similar memories
-```
-
-### Adjust Cache Settings
-
-```yaml
-dki:
-  cache:
-    max_size: 200       # Increase cache size
-    strategy: "lru"     # Use simple LRU instead of weighted
-    ttl_seconds: 7200   # Cache valid for 2 hours
+# 获取注入日志
+logs = dki.get_injection_logs(limit=5)
+for log in logs:
+    print(f"[{log['timestamp']}] alpha={log['alpha']:.2f}")
 ```
 
 ## 🌐 REST API Usage
 
-### Add Memory
+### DKI Chat (上层应用调用此接口)
 
 ```bash
-curl -X POST http://localhost:8080/api/memory \
+curl -X POST http://localhost:8080/v1/dki/chat \
   -H "Content-Type: application/json" \
-  -d '{"session_id": "test", "content": "I like coffee"}'
+  -d '{
+    "query": "推荐一家餐厅",
+    "user_id": "user_001",
+    "session_id": "session_001"
+  }'
 ```
 
-### Chat
+### Get DKI Status
 
 ```bash
-curl -X POST http://localhost:8080/api/chat \
-  -H "Content-Type: application/json" \
-  -d '{"query": "What drink should I order?", "session_id": "test", "mode": "dki"}'
+curl http://localhost:8080/v1/dki/info
 ```
 
 ### Get Stats
@@ -210,34 +180,52 @@ curl http://localhost:8080/api/stats
 
 ### Slow First Response
 
-- First turn computes K/V cache
+- First turn computes K/V cache for preferences
 - Subsequent turns use cached K/V
 - This is expected behavior
 
-### No Memory Injection
+### No Injection
 
-Check gating decision:
+Check metadata:
 ```python
-response = dki.chat(query, session_id)
-print(response.gating_decision.reasoning)
-# "High uncertainty but no relevant memory (open-ended question)"
+response = await dki.chat(query, user_id, session_id)
+print(f"Injection Enabled: {response.metadata.injection_enabled}")
+print(f"Preferences Count: {response.metadata.preferences_count}")
+print(f"History Count: {response.metadata.relevant_history_count}")
 ```
 
-Lower thresholds if needed:
-```python
-dki.gating.update_thresholds(
-    entropy_threshold=0.3,
-    relevance_threshold=0.5
-)
-```
+确保:
+1. 适配器配置正确连接到数据库
+2. 数据库中有该用户的偏好或历史数据
+3. 字段映射正确
+
+## 📚 Key Concepts
+
+### DKI vs RAG
+
+| 特性 | DKI | RAG |
+|------|-----|-----|
+| 注入层级 | 注意力层级 (K/V) | Token 层级 (prompt) |
+| Token 消耗 | 不消耗 | 消耗上下文窗口 |
+| 适用场景 | 用户级记忆 | 外部知识库 |
+| 上层应用改动 | 只需传 user_id | 需要 prompt 工程 |
+
+### Hybrid Injection
+
+- **偏好**: K/V 注入 (负位置, Attention Hook)
+  - 隐式影响，如同人格
+  - 可缓存，高复用
+- **历史**: 后缀提示词 (正位置)
+  - 显式参考，可引用
+  - 动态变化
 
 ## 📚 Next Steps
 
 1. Read the full [README.md](README.md)
-2. Explore the [DKI Paper](../AGAPaper/DKI_Paper_v1.md)
-3. Run the full experiment suite
-4. Try different model engines
-5. Customize for your use case
+2. Check [Integration Guide](docs/Integration_Guide.md)
+3. Explore the [DKI Paper](../DKIPaper/DKI_Paper_v2.md)
+4. Run experiments with different models
+5. Customize adapter config for your database
 
 ---
 
