@@ -34,11 +34,11 @@ class Session(Base):
     conversations = relationship("Conversation", back_populates="session", cascade="all, delete-orphan")
     
     @hybrid_property
-    def metadata(self) -> Dict[str, Any]:
+    def extra_metadata(self) -> Dict[str, Any]:
         return json.loads(self._metadata) if self._metadata else {}
     
-    @metadata.setter
-    def metadata(self, value: Dict[str, Any]):
+    @extra_metadata.setter
+    def extra_metadata(self, value: Dict[str, Any]):
         self._metadata = json.dumps(value, ensure_ascii=False)
     
     def to_dict(self) -> Dict[str, Any]:
@@ -47,7 +47,7 @@ class Session(Base):
             'user_id': self.user_id,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,
-            'metadata': self.metadata,
+            'metadata': self.extra_metadata,
             'is_active': self.is_active,
             'memory_count': len(self.memories) if self.memories else 0,
         }
@@ -72,11 +72,11 @@ class Memory(Base):
     kv_caches = relationship("KVCache", back_populates="memory", cascade="all, delete-orphan")
     
     @hybrid_property
-    def metadata(self) -> Dict[str, Any]:
+    def extra_metadata(self) -> Dict[str, Any]:
         return json.loads(self._metadata) if self._metadata else {}
     
-    @metadata.setter
-    def metadata(self, value: Dict[str, Any]):
+    @extra_metadata.setter
+    def extra_metadata(self, value: Dict[str, Any]):
         self._metadata = json.dumps(value, ensure_ascii=False)
     
     def to_dict(self) -> Dict[str, Any]:
@@ -86,7 +86,7 @@ class Memory(Base):
             'content': self.content,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,
-            'metadata': self.metadata,
+            'metadata': self.extra_metadata,
             'is_active': self.is_active,
         }
 
@@ -119,11 +119,11 @@ class Conversation(Base):
         self._memory_ids = json.dumps(value)
     
     @hybrid_property
-    def metadata(self) -> Dict[str, Any]:
+    def extra_metadata(self) -> Dict[str, Any]:
         return json.loads(self._metadata) if self._metadata else {}
     
-    @metadata.setter
-    def metadata(self, value: Dict[str, Any]):
+    @extra_metadata.setter
+    def extra_metadata(self, value: Dict[str, Any]):
         self._metadata = json.dumps(value, ensure_ascii=False)
     
     def to_dict(self) -> Dict[str, Any]:
@@ -137,7 +137,7 @@ class Conversation(Base):
             'injection_alpha': self.injection_alpha,
             'memory_ids': self.memory_ids,
             'latency_ms': self.latency_ms,
-            'metadata': self.metadata,
+            'metadata': self.extra_metadata,
         }
 
 
@@ -166,11 +166,11 @@ class KVCache(Base):
     )
     
     @hybrid_property
-    def metadata(self) -> Dict[str, Any]:
+    def extra_metadata(self) -> Dict[str, Any]:
         return json.loads(self._metadata) if self._metadata else {}
     
-    @metadata.setter
-    def metadata(self, value: Dict[str, Any]):
+    @extra_metadata.setter
+    def extra_metadata(self, value: Dict[str, Any]):
         self._metadata = json.dumps(value, ensure_ascii=False)
 
 
@@ -201,11 +201,11 @@ class Experiment(Base):
         self._config = json.dumps(value, ensure_ascii=False)
     
     @hybrid_property
-    def metadata(self) -> Dict[str, Any]:
+    def extra_metadata(self) -> Dict[str, Any]:
         return json.loads(self._metadata) if self._metadata else {}
     
-    @metadata.setter
-    def metadata(self, value: Dict[str, Any]):
+    @extra_metadata.setter
+    def extra_metadata(self, value: Dict[str, Any]):
         self._metadata = json.dumps(value, ensure_ascii=False)
     
     def to_dict(self) -> Dict[str, Any]:
@@ -218,7 +218,7 @@ class Experiment(Base):
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'started_at': self.started_at.isoformat() if self.started_at else None,
             'completed_at': self.completed_at.isoformat() if self.completed_at else None,
-            'metadata': self.metadata,
+            'metadata': self.extra_metadata,
         }
 
 
@@ -248,11 +248,11 @@ class ExperimentResult(Base):
         self._metrics = json.dumps(value, ensure_ascii=False)
     
     @hybrid_property
-    def metadata(self) -> Dict[str, Any]:
+    def extra_metadata(self) -> Dict[str, Any]:
         return json.loads(self._metadata) if self._metadata else {}
     
-    @metadata.setter
-    def metadata(self, value: Dict[str, Any]):
+    @extra_metadata.setter
+    def extra_metadata(self, value: Dict[str, Any]):
         self._metadata = json.dumps(value, ensure_ascii=False)
     
     def to_dict(self) -> Dict[str, Any]:
@@ -264,7 +264,7 @@ class ExperimentResult(Base):
             'metrics': self.metrics,
             'sample_count': self.sample_count,
             'created_at': self.created_at.isoformat() if self.created_at else None,
-            'metadata': self.metadata,
+            'metadata': self.extra_metadata,
         }
 
 
@@ -291,11 +291,11 @@ class AuditLog(Base):
         self._memory_ids = json.dumps(value)
     
     @hybrid_property
-    def metadata(self) -> Dict[str, Any]:
+    def extra_metadata(self) -> Dict[str, Any]:
         return json.loads(self._metadata) if self._metadata else {}
     
-    @metadata.setter
-    def metadata(self, value: Dict[str, Any]):
+    @extra_metadata.setter
+    def extra_metadata(self, value: Dict[str, Any]):
         self._metadata = json.dumps(value, ensure_ascii=False)
 
 
@@ -321,9 +321,9 @@ class ModelRegistry(Base):
         self._config = json.dumps(value, ensure_ascii=False)
     
     @hybrid_property
-    def metadata(self) -> Dict[str, Any]:
+    def extra_metadata(self) -> Dict[str, Any]:
         return json.loads(self._metadata) if self._metadata else {}
     
-    @metadata.setter
-    def metadata(self, value: Dict[str, Any]):
+    @extra_metadata.setter
+    def extra_metadata(self, value: Dict[str, Any]):
         self._metadata = json.dumps(value, ensure_ascii=False)

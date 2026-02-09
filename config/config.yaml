@@ -198,6 +198,87 @@ server:
   workers: 4
   reload: false
 
+# ============ User Data Adapter Settings ============
+# Configure external user data source
+user_adapter:
+  # Adapter type: postgresql | mysql | mongodb | redis | rest_api | memory
+  type: "memory"
+  
+  # Database connection (for postgresql/mysql/mongodb)
+  host: "localhost"
+  port: 5432
+  database: "chat_db"
+  username: ""
+  password: ""
+  
+  # Table/Collection names
+  users_table: "users"
+  messages_table: "messages"
+  preferences_table: "user_preferences"
+  
+  # REST API settings (for rest_api type)
+  base_url: ""
+  api_key: ""
+  timeout: 30
+  
+  # Connection pool
+  pool_size: 5
+  
+  # Cache settings
+  enable_cache: true
+  cache_ttl: 300
+
+# ============ Preference Cache Settings ============
+preference_cache:
+  # L1 (Memory) settings
+  l1_max_size: 1000
+  l1_max_memory_mb: 5000
+  
+  # L2 (Redis) settings
+  l2_enabled: false
+  l2_ttl_seconds: 86400
+  l2_key_prefix: "dki:pref_kv"
+  
+  # Redis connection (if L2 enabled)
+  redis_host: "localhost"
+  redis_port: 6379
+  redis_password: ""
+  
+  # Compression
+  enable_compression: true
+  compression_level: 6
+
+# ============ Non-Vectorized Data Handler Settings ============
+non_vectorized_handler:
+  # Default strategy: lazy | batch | hybrid
+  default_strategy: "hybrid"
+  
+  # Strategy thresholds
+  lazy_max_messages: 100
+  batch_trigger_count: 1000
+  
+  # BM25 settings
+  bm25_candidates_multiplier: 4
+  bm25_min_candidates: 20
+  
+  # Embedding cache
+  cache_embeddings: true
+  cache_max_size: 100000
+  cache_ttl_hours: 168
+  
+  # Batch computation
+  batch_size: 100
+  max_concurrent_batches: 4
+
+# ============ UI Settings ============
+ui:
+  # Frontend framework: vue3 (planned)
+  framework: "vue3"
+  # Development server port
+  dev_port: 3000
+  # API proxy target
+  api_proxy: "http://localhost:8080"
+
 # ============ Experiment Settings ============
 experiment:
   output_dir: "./experiment_results"

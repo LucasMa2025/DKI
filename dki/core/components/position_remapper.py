@@ -133,7 +133,7 @@ class PositionRemapper:
         Standard ALiBi uses slopes that decrease exponentially.
         """
         def get_slopes_power_of_2(n):
-            start = 2 ** (-(2 ** -(torch.log2(torch.tensor(n)) - 3).ceil().item())))
+            start = 2 ** (-(2 ** -(torch.log2(torch.tensor(n)) - 3).ceil().item()))
             ratio = start
             return [start * (ratio ** i) for i in range(n)]
         

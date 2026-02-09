@@ -1,6 +1,12 @@
 """
 FastAPI Web Application for DKI System
 Provides REST API and Web UI for testing
+
+Updated to include:
+- OpenAI-compatible API endpoints
+- DKI-specific injection API
+- User preference management
+- Integrated with new adapter and cache systems
 """
 
 import os
@@ -12,6 +18,7 @@ from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from loguru import logger
 
@@ -22,6 +29,9 @@ from dki.database.repository import SessionRepository, MemoryRepository, Experim
 from dki.experiment.runner import ExperimentRunner, ExperimentConfig
 from dki.experiment.data_generator import ExperimentDataGenerator
 from dki.config.config_loader import ConfigLoader
+from dki.api.routes import create_api_router
+from dki.api.dependencies import init_dependencies, cleanup_dependencies
+from dki.adapters import AdapterFactory, AdapterConfig, AdapterType
 
 
 # Request/Response Models
@@ -75,6 +85,17 @@ def create_app() -> FastAPI:
         title="DKI System",
         description="Dynamic KV Injection - Attention-Level Memory Augmentation",
         version="1.0.0",
+        docs_url="/docs",
+        redoc_url="/redoc",
+    )
+    
+    # Add CORS middleware for Vue3 frontend
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],  # Configure appropriately for production
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
     )
     
     # Initialize systems (lazy)
@@ -89,6 +110,49 @@ def create_app() -> FastAPI:
         if 'rag' not in _systems:
             _systems['rag'] = RAGSystem()
         return _systems['rag']
+    
+    # Initialize user data adapter from config
+    def get_user_adapter():
+        if 'user_adapter' not in _systems:
+            adapter_config = getattr(config, 'user_adapter', None)
+            if adapter_config:
+                _systems['user_adapter'] = AdapterFactory.create_from_dict(
+                    adapter_config.__dict__ if hasattr(adapter_config, '__dict__') else {}
+                )
+            else:
+                _systems['user_adapter'] = AdapterFactory.create_memory()
+        return _systems['user_adapter']
+    
+    # Initialize dependencies for API routes
+    @app.on_event("startup")
+    async def startup_event():
+        """Initialize dependencies on startup."""
+        dki = get_dki_system()
+        adapter = get_user_adapter()
+        
+        # Connect adapter
+        try:
+            await adapter.connect()
+        except Exception as e:
+            logger.warning(f"Failed to connect user adapter: {e}")
+        
+        # Initialize API dependencies
+        init_dependencies(
+            dki_system=dki,
+            user_adapter=adapter,
+        )
+        
+        logger.info("DKI System started")
+    
+    @app.on_event("shutdown")
+    async def shutdown_event():
+        """Cleanup on shutdown."""
+        await cleanup_dependencies()
+        logger.info("DKI System stopped")
+    
+    # Include OpenAI-compatible API routes
+    api_router = create_api_router()
+    app.include_router(api_router)
     
     # API Routes
     @app.get("/api/health")

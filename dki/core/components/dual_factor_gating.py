@@ -209,6 +209,7 @@ class DualFactorGating:
         query: str,
         alpha: float = 1.0,
         top_k: int = 5,
+        threshold: float = -1.0,
     ) -> GatingDecision:
         """
         Force injection without gating check.
@@ -218,11 +219,12 @@ class DualFactorGating:
             query: User query
             alpha: Fixed injection strength
             top_k: Number of memories
+            threshold: Similarity threshold (default 0.0 for force inject)
             
         Returns:
             GatingDecision with forced injection
         """
-        top_results = router.search(query, top_k=top_k)
+        top_results = router.search(query, top_k=top_k, threshold=threshold)
         
         return GatingDecision(
             should_inject=len(top_results) > 0,

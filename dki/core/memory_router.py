@@ -101,6 +101,10 @@ class MemoryRouter:
         
         embedding = embedding.astype(np.float32).reshape(1, -1)
         
+        # Normalize for cosine similarity with inner product
+        import faiss
+        faiss.normalize_L2(embedding)
+        
         # Add to index
         idx = len(self._memories)
         self.index.add(embedding)
@@ -184,6 +188,10 @@ class MemoryRouter:
         # Embed query
         query_embedding = self.embedding_service.embed(query)
         query_embedding = query_embedding.astype(np.float32).reshape(1, -1)
+        
+        # Normalize for cosine similarity with inner product
+        import faiss
+        faiss.normalize_L2(query_embedding)
         
         # Search
         k = min(top_k, len(self._memories))
