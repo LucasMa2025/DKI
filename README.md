@@ -1,4 +1,4 @@
-# DKI - Dynamic KV Injection
+# DKI - Dynamic KV Injection -- An Attention-Level User Memory System for Large Language Models
 
 > Attention-Level User Memory Plugin for Large Language Models
 
@@ -67,17 +67,17 @@ DKI operates as an **attention-level plugin** for LLMs, implementing K/V injecti
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                         DKI Plugin Architecture                          │
+│                         DKI Plugin Architecture                         │
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                         │
 │  ┌─────────────────────────────────────────────────────────────────┐    │
 │  │  Upstream Application (Chat UI / Customer Service / Other Apps) │    │
 │  │  └── Only needs to pass: user_id + raw user input               │    │
-│  │      (No RAG, No Prompt Engineering, No Interface Implementation)│    │
+│  │     (No RAG, No Prompt Engineering, No Interface Implementation)│    │
 │  └─────────────────────────────┬───────────────────────────────────┘    │
 │                                ▼                                        │
 │  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  DKI Plugin                                                      │    │
+│  │  DKI Plugin                                                     │    │
 │  │  ├── Config-Driven Adapter (SQLAlchemy dynamic table mapping)   │    │
 │  │  │   └── Reads upstream app database (preferences + history)    │    │
 │  │  ├── Preference Processing → K/V Injection (negative pos, Hook) │    │
@@ -99,7 +99,7 @@ DKI uses a **layered injection approach** that mirrors human cognition:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                    DKI Hybrid Injection Architecture                     │
+│                    DKI Hybrid Injection Architecture                    │
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                         │
 │  ┌─────────────────────────────────────────────────────────────────┐    │
@@ -1037,3 +1037,4 @@ Contributions are welcome! Please read our contributing guidelines first.
 ---
 
 **DKI** - Rethinking Memory Augmentation at the Attention Level
+
