@@ -1,4 +1,4 @@
-# DKI - Dynamic KV Injection -- An Attention-Level User Memory System for Large Language Models
+# DKI - Dynamic KV Injection
 
 > Attention-Level User Memory Plugin for Large Language Models
 
@@ -67,17 +67,17 @@ DKI operates as an **attention-level plugin** for LLMs, implementing K/V injecti
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                         DKI Plugin Architecture                         │
+│                         DKI Plugin Architecture                          │
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                         │
 │  ┌─────────────────────────────────────────────────────────────────┐    │
 │  │  Upstream Application (Chat UI / Customer Service / Other Apps) │    │
 │  │  └── Only needs to pass: user_id + raw user input               │    │
-│  │     (No RAG, No Prompt Engineering, No Interface Implementation)│    │
+│  │      (No RAG, No Prompt Engineering, No Interface Implementation)│    │
 │  └─────────────────────────────┬───────────────────────────────────┘    │
 │                                ▼                                        │
 │  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  DKI Plugin                                                     │    │
+│  │  DKI Plugin                                                      │    │
 │  │  ├── Config-Driven Adapter (SQLAlchemy dynamic table mapping)   │    │
 │  │  │   └── Reads upstream app database (preferences + history)    │    │
 │  │  ├── Preference Processing → K/V Injection (negative pos, Hook) │    │
@@ -99,7 +99,7 @@ DKI uses a **layered injection approach** that mirrors human cognition:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                    DKI Hybrid Injection Architecture                    │
+│                    DKI Hybrid Injection Architecture                     │
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                         │
 │  ┌─────────────────────────────────────────────────────────────────┐    │
@@ -979,20 +979,367 @@ A:
 4. Monitor injection rate and latency
 5. Adjust alpha and cache strategy based on metrics
 
+### Latest Optimizations (v2.5)
+
+#### Memory Trigger
+
+Detects memory-related signals in user input, deciding "what to remember":
+
+```python
+# Supports 5 trigger types
+- META_COGNITIVE: "what we just discussed", "you said earlier"
+- STATE_CHANGE: "I changed my mind", "let me add"
+- LONG_TERM_VALUE: "please remember I like...", "I'm vegetarian"
+- RECALL_REQUEST: "what did we discuss recently"
+- OPINION_QUERY: "do you have new thoughts"
+
+# Rules are configurable, can be enhanced with classifier later
+trigger = MemoryTrigger(language="auto")
+result = trigger.detect("What did we just talk about?")
+```
+
+#### Reference Resolver
+
+Parses referential expressions in user input, determines history recall scope:
+
+```python
+# Recall turns are externally configurable
+resolver = ReferenceResolver(config=ReferenceResolverConfig(
+    last_few_turns=5,    # "just now" recalls 5 turns
+    recent_turns=20,     # "recently" recalls 20 turns
+))
+
+# Supports runtime dynamic updates
+dki.update_reference_resolver_config(
+    just_now_turns=3,
+    recently_turns=15,
+)
+```
+
+#### Why Rolling Summary Is Not Needed
+
+Unlike ChatGPT/Claude/Grok, DKI **does not need** Rolling Summary:
+
+| Approach | Reason | DKI Alternative |
+|----------|--------|-----------------|
+| RAG+Prompt | Context window limit, needs compression | K/V injection doesn't consume context |
+| Rolling Summary | Information loss from compression | Memory Trigger for precise recall |
+| Summary Generation | Extra LLM call overhead | Reference Resolver for on-demand retrieval |
+
 ### Roadmap
+
+**Completed**:
 
 -   [x] Core DKI implementation (Attention Hook K/V injection)
 -   [x] vLLM/LLaMA/DeepSeek/GLM adapters
 -   [x] Hybrid injection strategy (preference K/V + history suffix)
 -   [x] Config-driven adapter (SQLAlchemy dynamic table mapping)
 -   [x] Dynamic vector processing (BM25 + Embedding hybrid search)
--   [x] Preference K/V cache (memory + optional Redis)
+-   [x] Preference K/V cache (memory level)
 -   [x] Monitoring API (stats/logs/health)
 -   [x] Vue3 Example Frontend UI
 -   [x] Experiment framework
+-   [x] Memory Trigger
+-   [x] Reference Resolver (configurable recall turns)
+
+**In Progress**:
+
+-   [ ] Stance State Machine
+-   [ ] Classifier-enhanced Memory Trigger
+
+**Future Work**:
+
+-   [ ] Redis distributed cache integration
 -   [ ] Attention visualization tools
--   [ ] Multi-modal extension (image memory)
+-   [ ] Multi-modal extension (image/audio memory)
 -   [ ] LangChain/LlamaIndex integration
+
+---
+
+## 🔮 Future Work Directions
+
+### 1. Redis Distributed Cache Integration ⭐ Recommended Priority
+
+**Current State**: Preference K/V cache is memory-only, effective for single instance.
+
+**Optimization Goal**: Integrate Redis for cross-instance shared caching.
+
+**Why Redis Integration Is the Most Important Optimization**:
+
+One of DKI's core advantages is **preference K/V cache reuse**—after computing K/V on the first turn, subsequent requests use the cache directly, reducing latency by 43.7%. However, the current memory cache has a critical limitation: **only effective for single instance**.
+
+In production environments, LLM services are typically multi-instance deployments (load balanced). If user requests are routed to different instances, cache misses occur, and DKI's core advantage is significantly diminished:
+
+| Deployment Mode | Cache Hit Rate | DKI Advantage |
+|-----------------|----------------|---------------|
+| Single Instance | ~70% | Full benefit |
+| 2 Instances | ~35% | Halved |
+| 4 Instances | ~17.5% | Greatly reduced |
+| N Instances | ~70%/N | Nearly ineffective |
+
+**After Redis Integration**: Regardless of instance count, cache hit rate remains ~70%, DKI advantage fully preserved.
+
+**Core Value**:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    Current Architecture (Single-Instance Cache)          │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  LLM Instance 1          LLM Instance 2          LLM Instance 3         │
+│  ┌─────────────┐         ┌─────────────┐         ┌─────────────┐        │
+│  │ DKI Plugin  │         │ DKI Plugin  │         │ DKI Plugin  │        │
+│  │ ┌─────────┐ │         │ ┌─────────┐ │         │ ┌─────────┐ │        │
+│  │ │ Memory  │ │         │ │ Memory  │ │         │ │ Memory  │ │        │
+│  │ │ user_001│ │         │ │ user_002│ │         │ │ user_003│ │        │
+│  │ └─────────┘ │         │ └─────────┘ │         │ └─────────┘ │        │
+│  └─────────────┘         └─────────────┘         └─────────────┘        │
+│                                                                         │
+│  Problems:                                                              │
+│  - user_001 request to Instance 2 = cache miss, K/V recomputation      │
+│  - Cache hit rate decreases with more instances                        │
+│  - Cannot achieve true horizontal scaling                              │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    Optimized Architecture (Redis Distributed Cache)      │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  LLM Instance 1          LLM Instance 2          LLM Instance 3         │
+│  ┌─────────────┐         ┌─────────────┐         ┌─────────────┐        │
+│  │ DKI Plugin  │         │ DKI Plugin  │         │ DKI Plugin  │        │
+│  │ ┌─────────┐ │         │ ┌─────────┐ │         │ ┌─────────┐ │        │
+│  │ │ L1 Mem  │ │         │ │ L1 Mem  │ │         │ │ L1 Mem  │ │        │
+│  │ │ (Hot)   │ │         │ │ (Hot)   │ │         │ │ (Hot)   │ │        │
+│  │ └────┬────┘ │         │ └────┬────┘ │         │ └────┬────┘ │        │
+│  └──────┼──────┘         └──────┼──────┘         └──────┼──────┘        │
+│         │                       │                       │               │
+│         └───────────────────────┼───────────────────────┘               │
+│                                 ▼                                       │
+│                    ┌─────────────────────────┐                          │
+│                    │      Redis Cluster       │                          │
+│                    │  ┌─────────────────────┐ │                          │
+│                    │  │ L2 Distributed Cache│ │                          │
+│                    │  │ user_001, user_002  │ │                          │
+│                    │  │ user_003, ...       │ │                          │
+│                    │  └─────────────────────┘ │                          │
+│                    └─────────────────────────┘                          │
+│                                                                         │
+│  Benefits:                                                              │
+│  - Any instance can hit cache                                          │
+│  - Cache hit rate unaffected by instance count                         │
+│  - True horizontal scaling support                                     │
+│  - Cache persistence, survives restarts                                │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**Implementation Plan**:
+
+```python
+# Configuration example
+cache:
+  type: tiered  # memory | redis | tiered
+  tiered:
+    l1:
+      type: memory
+      max_size_mb: 512
+      ttl: 300  # 5 minutes
+    l2:
+      type: redis
+      host: redis-cluster.example.com
+      port: 6379
+      password: ${REDIS_PASSWORD}
+      db: 0
+      ttl: 3600  # 1 hour
+      key_prefix: "dki:kv:"
+      serialization: msgpack  # compressed serialization
+```
+
+**Feasibility Assessment**:
+
+| Dimension | Rating | Notes |
+|-----------|--------|-------|
+| Technical Complexity | ⭐⭐ Medium | Redis client mature, main work is K/V Tensor serialization |
+| Performance Impact | ⭐⭐ Medium | Network latency ~1-5ms, but avoids K/V recomputation (~50-200ms) |
+| Benefit | ⭐⭐⭐ High | Essential for multi-instance deployment, significant cache hit improvement |
+| Dependencies | ⭐ Low | Only redis-py, optional dependency |
+
+**Key Technical Points**:
+
+1. **K/V Tensor Serialization**: Use `msgpack` + `numpy` compression to reduce network transfer
+2. **Cache Invalidation Strategy**: Active invalidation on preference change, TTL as fallback
+3. **Hot Data Local Cache**: L1 memory cache for high-frequency users, reduce Redis access
+
+### 2. Attention Visualization Tools
+
+**Goal**: Debug K/V injection effects, understand injection impact on attention distribution.
+
+**Design Plan**:
+
+```python
+# Visualization API
+from dki.visualization import AttentionVisualizer
+
+visualizer = AttentionVisualizer(dki_plugin)
+
+# Generate attention heatmap
+heatmap = visualizer.generate_heatmap(
+    query="Recommend a restaurant",
+    user_id="user_001",
+    layer_indices=[0, 12, 24],  # Visualize specific layers
+)
+
+# Compare before/after injection
+comparison = visualizer.compare_injection(
+    query="Recommend a restaurant",
+    user_id="user_001",
+    show_diff=True,
+)
+
+# Export as HTML report
+visualizer.export_report("attention_analysis.html")
+```
+
+**Feasibility Assessment**:
+
+| Dimension | Rating | Notes |
+|-----------|--------|-------|
+| Technical Complexity | ⭐⭐ Medium | Need to hook attention weights, visualization libs mature |
+| Performance Impact | ⭐⭐⭐ High | Only enabled during debugging, disabled in production |
+| Benefit | ⭐⭐ Medium | Valuable for debugging and paper presentation |
+| Dependencies | ⭐ Low | matplotlib, plotly as optional dependencies |
+
+### 3. Multi-Modal Extension (Image/Audio Memory)
+
+**Goal**: Support images and audio as part of user memory.
+
+**Design Plan**:
+
+```python
+# Multi-modal preferences
+preferences = [
+    {"type": "text", "content": "likes minimalist style"},
+    {"type": "image", "content": "user_avatar.jpg", "embedding": [...]},
+    {"type": "audio", "content": "voice_sample.wav", "embedding": [...]},
+]
+
+# Multi-modal K/V injection
+# Images/audio first converted to embedding via encoder, then K/V computed
+```
+
+**Feasibility Assessment**:
+
+| Dimension | Rating | Notes |
+|-----------|--------|-------|
+| Technical Complexity | ⭐⭐⭐ High | Needs multi-modal encoders, K/V computation method adjustment |
+| Performance Impact | ⭐⭐⭐ High | Image/audio encoding overhead is large |
+| Benefit | ⭐⭐ Medium | Valuable for specific scenarios (e.g., virtual assistants) |
+| Dependencies | ⭐⭐⭐ High | Requires CLIP, Whisper, etc. |
+
+**Recommendation**: Long-term goal, lower priority.
+
+### 4. LangChain/LlamaIndex Integration
+
+**Goal**: Package DKI as LangChain/LlamaIndex module to expand ecosystem.
+
+**Design Plan**:
+
+```python
+# LangChain integration
+from langchain_dki import DKIMemory
+
+memory = DKIMemory(
+    adapter_config_path="config/adapter_config.yaml",
+)
+
+chain = ConversationChain(
+    llm=llm,
+    memory=memory,  # DKI as Memory module
+)
+
+# LlamaIndex integration
+from llama_index_dki import DKIRetriever
+
+retriever = DKIRetriever(
+    adapter_config_path="config/adapter_config.yaml",
+)
+
+query_engine = index.as_query_engine(
+    retriever=retriever,  # DKI as Retriever
+)
+```
+
+**Feasibility Assessment**:
+
+| Dimension | Rating | Notes |
+|-----------|--------|-------|
+| Technical Complexity | ⭐⭐ Medium | Need to adapt LangChain/LlamaIndex interfaces |
+| Performance Impact | ⭐ Low | Wrapper layer only, no extra overhead |
+| Benefit | ⭐⭐⭐ High | Expand user base, lower adoption barrier |
+| Dependencies | ⭐⭐ Medium | langchain, llama-index as optional dependencies |
+
+**Recommendation**: Medium priority, implement after core features stabilize.
+
+### Priority Ranking
+
+| Priority | Optimization Direction | Reason |
+|----------|----------------------|--------|
+| P1 | Redis Distributed Cache | Essential for multi-instance, clear benefit |
+| P2 | Attention Visualization | Valuable for debugging and papers |
+| P3 | LangChain/LlamaIndex Integration | Expand ecosystem, but not core |
+| P4 | Multi-Modal Extension | High complexity, specific scenarios |
+
+### Additional Value of Redis Integration
+
+Beyond solving multi-instance caching, Redis integration brings additional value:
+
+1. **Cache Persistence**
+   - Cache survives service restarts
+   - Reduces K/V recomputation on cold start
+
+2. **Cache Warming**
+   - Pre-compute K/V for high-frequency users
+   - Batch import historical user preferences
+
+3. **Cache Monitoring**
+   - Redis provides rich monitoring metrics
+   - Analyze cache hit rate, memory usage, etc.
+
+4. **Cache Eviction Strategies**
+   - Mature LRU/LFU strategies
+   - Automatic cache capacity management
+
+5. **Cross-Service Sharing**
+   - Multiple DKI instances share the same cache
+   - Can even share across different LLM services (if using same model)
+
+**Cost Analysis**:
+
+| Resource | Estimate | Notes |
+|----------|----------|-------|
+| Redis Memory | ~100MB/10K users | Assuming ~10KB K/V per user |
+| Network Latency | 1-5ms | Within LAN |
+| Ops Cost | Low | Redis ops is mature |
+
+**ROI Analysis**:
+
+```
+Assumptions:
+- 4 instance deployment
+- Current cache hit rate ~17.5% (70%/4)
+- Post-Redis cache hit rate ~70%
+
+Benefits:
+- Cache hit rate improves 4x
+- Subsequent turn latency reduces ~40%
+- Overall throughput improves ~30%
+
+Costs:
+- Redis instance ~$50/month (cloud service)
+- Development effort ~2-3 person-days
+```
 
 ### Example Frontend UI
 
@@ -1037,4 +1384,3 @@ Contributions are welcome! Please read our contributing guidelines first.
 ---
 
 **DKI** - Rethinking Memory Augmentation at the Attention Level
-
