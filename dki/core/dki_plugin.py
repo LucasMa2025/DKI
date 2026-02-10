@@ -37,6 +37,19 @@ from dki.adapters.base import (
 from dki.models.base import BaseModelAdapter, ModelOutput, KVCacheEntry
 from dki.core.components.memory_influence_scaling import MemoryInfluenceScaling
 from dki.core.components.dual_factor_gating import DualFactorGating, GatingDecision
+from dki.core.components.memory_trigger import (
+    MemoryTrigger,
+    MemoryTriggerConfig,
+    TriggerType,
+    TriggerResult,
+)
+from dki.core.components.reference_resolver import (
+    ReferenceResolver,
+    ReferenceResolverConfig,
+    ReferenceType,
+    ResolvedReference,
+    Message as ResolverMessage,
+)
 from dki.config.config_loader import ConfigLoader
 
 
@@ -71,6 +84,15 @@ class InjectionMetadata:
     history_messages_count: int = 0
     relevant_history_count: int = 0
     
+    # Memory Trigger 信息
+    memory_triggered: bool = False
+    trigger_type: Optional[str] = None
+    
+    # Reference Resolver 信息
+    reference_resolved: bool = False
+    reference_type: Optional[str] = None
+    reference_scope: Optional[str] = None
+    
     # 时间戳
     timestamp: datetime = field(default_factory=datetime.utcnow)
     request_id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
@@ -103,6 +125,15 @@ class InjectionMetadata:
                 "relevant_history_count": self.relevant_history_count,
             },
             "gating_decision": self.gating_decision,
+            "memory_trigger": {
+                "triggered": self.memory_triggered,
+                "type": self.trigger_type,
+            },
+            "reference_resolver": {
+                "resolved": self.reference_resolved,
+                "type": self.reference_type,
+                "scope": self.reference_scope,
+            },
         }
 
 
@@ -205,6 +236,8 @@ Please respond based on the above history and the user's current question.
         user_data_adapter: IUserDataAdapter,
         config: Optional[Any] = None,
         language: str = "en",
+        memory_trigger_config: Optional[MemoryTriggerConfig] = None,
+        reference_resolver_config: Optional[ReferenceResolverConfig] = None,
     ):
         """
         初始化 DKI 插件
@@ -214,6 +247,8 @@ Please respond based on the above history and the user's current question.
             user_data_adapter: 外部数据适配器 (读取上层应用的数据库)
             config: 配置 (可选，默认从 config.yaml 加载)
             language: 语言 ("en" | "cn")
+            memory_trigger_config: Memory Trigger 配置 (可选)
+            reference_resolver_config: Reference Resolver 配置 (可选)
         """
         self.model = model_adapter
         self.data_adapter = user_data_adapter
@@ -223,6 +258,22 @@ Please respond based on the above history and the user's current question.
         # DKI 组件 (延迟初始化)
         self._mis: Optional[MemoryInfluenceScaling] = None
         self._gating: Optional[DualFactorGating] = None
+        
+        # Memory Trigger (可配置)
+        self._memory_trigger = MemoryTrigger(
+            config=memory_trigger_config,
+            language="auto",
+        )
+        
+        # Reference Resolver (召回轮数可配置)
+        self._reference_resolver = ReferenceResolver(
+            config=reference_resolver_config,
+            language="auto",
+        )
+        
+        # 短期历史缓存 (用于指代解析)
+        self._short_term_history: Dict[str, List[ResolverMessage]] = {}
+        self._max_history_per_session = 50
         
         # 偏好 K/V 缓存 (user_id -> (kv_entries, hash))
         self._preference_kv_cache: Dict[str, Tuple[List[KVCacheEntry], str]] = {}
@@ -238,6 +289,8 @@ Please respond based on the above history and the user's current question.
             "cache_hits": 0,
             "total_latency_ms": 0.0,
             "avg_alpha": 0.0,
+            "memory_trigger_count": 0,
+            "reference_resolved_count": 0,
         }
         
         logger.info(f"DKI Plugin initialized (language={language})")
@@ -250,6 +303,8 @@ Please respond based on the above history and the user's current question.
         adapter_config_path: Optional[str] = None,
         config: Optional[Any] = None,
         language: str = "cn",
+        memory_trigger_config: Optional[Union[Dict[str, Any], MemoryTriggerConfig]] = None,
+        reference_resolver_config: Optional[Union[Dict[str, Any], ReferenceResolverConfig]] = None,
     ) -> "DKIPlugin":
         """
         从配置创建 DKI 插件 (推荐方式)
@@ -262,6 +317,8 @@ Please respond based on the above history and the user's current question.
             adapter_config_path: 适配器配置文件路径 (YAML)
             config: DKI 配置
             language: 语言
+            memory_trigger_config: Memory Trigger 配置 (可选)
+            reference_resolver_config: Reference Resolver 配置 (可选，支持外置召回轮数)
             
         Returns:
             初始化完成的 DKI 插件
@@ -274,13 +331,18 @@ Please respond based on the above history and the user's current question.
                 adapter_config_path="config/adapter_config.yaml",
             )
             
-            # 从配置字典创建
+            # 从配置字典创建，带自定义 Reference Resolver 配置
             dki = await DKIPlugin.from_config(
                 model_adapter=vllm_adapter,
                 adapter_config={
                     "database": {"type": "postgresql", ...},
                     "preferences": {"table": "user_preferences", ...},
                     "messages": {"table": "chat_messages", ...},
+                },
+                reference_resolver_config={
+                    "just_now_turns": 5,    # "刚刚" 召回 5 轮
+                    "recently_turns": 20,   # "最近" 召回 20 轮
+                    "last_topic_turns": 15, # "那件事" 召回 15 轮
                 },
             )
             ```
@@ -316,12 +378,30 @@ Please respond based on the above history and the user's current question.
         # 连接数据库
         await user_adapter.connect()
         
+        # 处理 Memory Trigger 配置
+        mt_config = None
+        if memory_trigger_config:
+            if isinstance(memory_trigger_config, dict):
+                mt_config = MemoryTriggerConfig(**memory_trigger_config)
+            else:
+                mt_config = memory_trigger_config
+        
+        # 处理 Reference Resolver 配置 (支持外置召回轮数)
+        rr_config = None
+        if reference_resolver_config:
+            if isinstance(reference_resolver_config, dict):
+                rr_config = ReferenceResolverConfig(**reference_resolver_config)
+            else:
+                rr_config = reference_resolver_config
+        
         # 创建插件
         plugin = cls(
             model_adapter=model_adapter,
             user_data_adapter=user_adapter,
             config=config,
             language=language,
+            memory_trigger_config=mt_config,
+            reference_resolver_config=rr_config,
         )
         
         logger.info("DKI Plugin created from configuration")
@@ -378,6 +458,35 @@ Please respond based on the above history and the user's current question.
         metadata = InjectionMetadata()
         
         try:
+            # ============ Step 0: Memory Trigger & Reference Resolver ============
+            # 检测是否触发记忆存储/更新
+            trigger_result = self._memory_trigger.detect(query)
+            metadata.memory_triggered = trigger_result.triggered
+            metadata.trigger_type = trigger_result.trigger_type.value if trigger_result.triggered else None
+            
+            if trigger_result.triggered:
+                self._stats["memory_trigger_count"] += 1
+                logger.debug(
+                    f"Memory trigger detected: {trigger_result.trigger_type.value}, "
+                    f"confidence={trigger_result.confidence:.2f}"
+                )
+            
+            # 解析指代表达，确定历史召回范围
+            reference_result = self._reference_resolver.resolve(query)
+            metadata.reference_resolved = reference_result.reference_type != ReferenceType.NONE
+            metadata.reference_type = reference_result.reference_type.value
+            metadata.reference_scope = reference_result.scope.value if reference_result.scope else None
+            
+            # 根据指代类型确定召回轮数
+            recall_limit = 10  # 默认
+            if reference_result.reference_type != ReferenceType.NONE:
+                self._stats["reference_resolved_count"] += 1
+                recall_limit = reference_result.recall_turns or recall_limit
+                logger.debug(
+                    f"Reference resolved: {reference_result.reference_type.value}, "
+                    f"recall_turns={recall_limit}"
+                )
+            
             # ============ Step 1: 通过适配器读取外部数据 ============
             adapter_start = time.time()
             
@@ -386,11 +495,12 @@ Please respond based on the above history and the user's current question.
             metadata.preferences_count = len(preferences)
             
             # 读取相关历史 (从上层应用的数据库)
+            # 使用 Reference Resolver 确定的召回轮数
             relevant_history = await self.data_adapter.search_relevant_history(
                 user_id=user_id,
                 query=query,
                 session_id=session_id,
-                limit=10,
+                limit=recall_limit,
             )
             metadata.relevant_history_count = len(relevant_history)
             
@@ -633,6 +743,21 @@ Please respond based on the above history and the user's current question.
             ),
             "avg_alpha": self._stats["avg_alpha"],
             "preference_cache_size": len(self._preference_kv_cache),
+            # Memory Trigger 统计
+            "memory_trigger_count": self._stats["memory_trigger_count"],
+            "memory_trigger_rate": (
+                self._stats["memory_trigger_count"] / self._stats["total_requests"]
+                if self._stats["total_requests"] > 0 else 0
+            ),
+            # Reference Resolver 统计
+            "reference_resolved_count": self._stats["reference_resolved_count"],
+            "reference_resolved_rate": (
+                self._stats["reference_resolved_count"] / self._stats["total_requests"]
+                if self._stats["total_requests"] > 0 else 0
+            ),
+            # 组件配置信息
+            "memory_trigger_config": self._memory_trigger.get_stats(),
+            "reference_resolver_config": self._reference_resolver.get_stats(),
         }
     
     def get_injection_logs(
@@ -657,3 +782,56 @@ Please respond based on the above history and the user's current question.
                 del self._preference_kv_cache[key]
         else:
             self._preference_kv_cache.clear()
+    
+    # ============ 组件配置更新方法 ============
+    
+    def update_reference_resolver_config(
+        self,
+        just_now_turns: Optional[int] = None,
+        recently_turns: Optional[int] = None,
+        last_topic_turns: Optional[int] = None,
+        assistant_stance_turns: Optional[int] = None,
+    ):
+        """
+        运行时更新 Reference Resolver 配置
+        
+        允许外部动态调整召回轮数
+        
+        Args:
+            just_now_turns: "刚刚" 指代的召回轮数
+            recently_turns: "最近" 指代的召回轮数
+            last_topic_turns: "那件事" 指代的召回轮数
+            assistant_stance_turns: "你之前说的" 指代的召回轮数
+        """
+        self._reference_resolver.update_config(
+            just_now_turns=just_now_turns,
+            recently_turns=recently_turns,
+            last_topic_turns=last_topic_turns,
+            assistant_stance_turns=assistant_stance_turns,
+        )
+        logger.info(f"Reference Resolver config updated: {self._reference_resolver.get_stats()}")
+    
+    def update_memory_trigger_config(
+        self,
+        enabled: Optional[bool] = None,
+        custom_patterns: Optional[List[Dict[str, Any]]] = None,
+    ):
+        """
+        运行时更新 Memory Trigger 配置
+        
+        Args:
+            enabled: 是否启用
+            custom_patterns: 自定义规则列表
+        """
+        self._memory_trigger.update_config(
+            enabled=enabled,
+            custom_patterns=custom_patterns,
+        )
+        logger.info(f"Memory Trigger config updated: {self._memory_trigger.get_stats()}")
+    
+    def get_component_configs(self) -> Dict[str, Any]:
+        """获取所有组件的当前配置"""
+        return {
+            "memory_trigger": self._memory_trigger.get_stats(),
+            "reference_resolver": self._reference_resolver.get_stats(),
+        }
