@@ -51,6 +51,13 @@ from dki.core.components.reference_resolver import (
     Message as ResolverMessage,
 )
 from dki.config.config_loader import ConfigLoader
+from dki.cache import (
+    PreferenceCacheManager,
+    CacheConfig,
+    DKIRedisClient,
+    RedisConfig,
+    REDIS_AVAILABLE,
+)
 
 
 @dataclass
@@ -238,6 +245,8 @@ Please respond based on the above history and the user's current question.
         language: str = "en",
         memory_trigger_config: Optional[MemoryTriggerConfig] = None,
         reference_resolver_config: Optional[ReferenceResolverConfig] = None,
+        redis_client: Optional[DKIRedisClient] = None,
+        cache_config: Optional[CacheConfig] = None,
     ):
         """
         初始化 DKI 插件
@@ -249,6 +258,8 @@ Please respond based on the above history and the user's current question.
             language: 语言 ("en" | "cn")
             memory_trigger_config: Memory Trigger 配置 (可选)
             reference_resolver_config: Reference Resolver 配置 (可选)
+            redis_client: Redis 客户端 (可选，用于分布式缓存)
+            cache_config: 缓存配置 (可选)
         """
         self.model = model_adapter
         self.data_adapter = user_data_adapter
@@ -275,8 +286,16 @@ Please respond based on the above history and the user's current question.
         self._short_term_history: Dict[str, List[ResolverMessage]] = {}
         self._max_history_per_session = 50
         
-        # 偏好 K/V 缓存 (user_id -> (kv_entries, hash))
-        self._preference_kv_cache: Dict[str, Tuple[List[KVCacheEntry], str]] = {}
+        # ============ 偏好 K/V 缓存 (支持 Redis 分布式) ============
+        # 重要: 多实例部署时启用 Redis 可保持缓存命中率
+        # - 没有 Redis: 缓存命中率 = 70%/N (N = 实例数)
+        # - 有 Redis: 缓存命中率 = 70% (恒定)
+        self._redis_client = redis_client
+        self._cache_config = cache_config or CacheConfig()
+        self._preference_cache = PreferenceCacheManager(
+            redis_client=redis_client,
+            config=self._cache_config,
+        )
         
         # 工作日志 (用于监控 API)
         self._injection_logs: List[InjectionMetadata] = []
@@ -293,7 +312,14 @@ Please respond based on the above history and the user's current question.
             "reference_resolved_count": 0,
         }
         
-        logger.info(f"DKI Plugin initialized (language={language})")
+        # 日志输出缓存状态
+        cache_status = "L1 only"
+        if redis_client and redis_client.is_available:
+            cache_status = "L1 + L2 (Redis)"
+        elif self._cache_config.l2_enabled:
+            cache_status = "L1 + L2 (Redis not connected)"
+        
+        logger.info(f"DKI Plugin initialized (language={language}, cache={cache_status})")
     
     @classmethod
     async def from_config(
@@ -305,6 +331,8 @@ Please respond based on the above history and the user's current question.
         language: str = "cn",
         memory_trigger_config: Optional[Union[Dict[str, Any], MemoryTriggerConfig]] = None,
         reference_resolver_config: Optional[Union[Dict[str, Any], ReferenceResolverConfig]] = None,
+        enable_redis: Optional[bool] = None,
+        redis_config: Optional[Union[Dict[str, Any], RedisConfig]] = None,
     ) -> "DKIPlugin":
         """
         从配置创建 DKI 插件 (推荐方式)
@@ -319,6 +347,8 @@ Please respond based on the above history and the user's current question.
             language: 语言
             memory_trigger_config: Memory Trigger 配置 (可选)
             reference_resolver_config: Reference Resolver 配置 (可选，支持外置召回轮数)
+            enable_redis: 是否启用 Redis (可选，覆盖配置文件)
+            redis_config: Redis 配置 (可选)
             
         Returns:
             初始化完成的 DKI 插件
@@ -345,9 +375,21 @@ Please respond based on the above history and the user's current question.
                     "last_topic_turns": 15, # "那件事" 召回 15 轮
                 },
             )
+            
+            # 启用 Redis 分布式缓存 (多实例部署推荐)
+            dki = await DKIPlugin.from_config(
+                model_adapter=vllm_adapter,
+                adapter_config_path="config/adapter_config.yaml",
+                enable_redis=True,
+                redis_config={"host": "redis.example.com", "port": 6379},
+            )
             ```
         """
         from dki.adapters.config_driven_adapter import ConfigDrivenAdapter
+        
+        # 加载全局配置
+        config_loader = ConfigLoader()
+        global_config = config_loader.config
         
         # 创建配置驱动的适配器
         if adapter_config_path:
@@ -385,6 +427,8 @@ Please respond based on the above history and the user's current question.
                 mt_config = MemoryTriggerConfig(**memory_trigger_config)
             else:
                 mt_config = memory_trigger_config
+        elif global_config.get('memory_trigger'):
+            mt_config = MemoryTriggerConfig.from_dict(global_config['memory_trigger'])
         
         # 处理 Reference Resolver 配置 (支持外置召回轮数)
         rr_config = None
@@ -393,6 +437,53 @@ Please respond based on the above history and the user's current question.
                 rr_config = ReferenceResolverConfig(**reference_resolver_config)
             else:
                 rr_config = reference_resolver_config
+        elif global_config.get('reference_resolver'):
+            rr_config = ReferenceResolverConfig.from_dict(global_config['reference_resolver'])
+        
+        # ============ 处理 Redis 配置 ============
+        redis_client = None
+        cache_config = CacheConfig()
+        
+        # 从全局配置加载缓存配置
+        if global_config.get('preference_cache'):
+            cache_config = CacheConfig.from_dict(global_config['preference_cache'])
+        
+        # 确定是否启用 Redis
+        should_enable_redis = enable_redis
+        if should_enable_redis is None:
+            # 从配置文件读取
+            should_enable_redis = global_config.get('redis', {}).get('enabled', False)
+        
+        if should_enable_redis and REDIS_AVAILABLE:
+            # 创建 Redis 配置
+            if redis_config:
+                if isinstance(redis_config, dict):
+                    r_config = RedisConfig.from_dict(redis_config)
+                else:
+                    r_config = redis_config
+            elif global_config.get('redis'):
+                r_config = RedisConfig.from_dict(global_config['redis'])
+            else:
+                r_config = RedisConfig(enabled=True)
+            
+            # 确保启用
+            r_config.enabled = True
+            
+            # 创建并连接 Redis 客户端
+            redis_client = DKIRedisClient(r_config)
+            connected = await redis_client.connect()
+            
+            if connected:
+                logger.info("Redis connected for distributed cache")
+                cache_config.l2_enabled = True
+            else:
+                logger.warning("Redis connection failed, falling back to L1 only")
+                redis_client = None
+        elif should_enable_redis and not REDIS_AVAILABLE:
+            logger.warning(
+                "Redis requested but redis library not installed. "
+                "Install with: pip install redis"
+            )
         
         # 创建插件
         plugin = cls(
@@ -402,6 +493,8 @@ Please respond based on the above history and the user's current question.
             language=language,
             memory_trigger_config=mt_config,
             reference_resolver_config=rr_config,
+            redis_client=redis_client,
+            cache_config=cache_config,
         )
         
         logger.info("DKI Plugin created from configuration")
@@ -725,6 +818,9 @@ Please respond based on the above history and the user's current question.
     
     def get_stats(self) -> Dict[str, Any]:
         """获取统计数据 (用于监控 API)"""
+        # 获取缓存统计
+        cache_stats = self._preference_cache.get_stats()
+        
         return {
             "total_requests": self._stats["total_requests"],
             "injection_enabled_count": self._stats["injection_enabled_count"],
@@ -742,7 +838,6 @@ Please respond based on the above history and the user's current question.
                 if self._stats["total_requests"] > 0 else 0
             ),
             "avg_alpha": self._stats["avg_alpha"],
-            "preference_cache_size": len(self._preference_kv_cache),
             # Memory Trigger 统计
             "memory_trigger_count": self._stats["memory_trigger_count"],
             "memory_trigger_rate": (
@@ -758,6 +853,8 @@ Please respond based on the above history and the user's current question.
             # 组件配置信息
             "memory_trigger_config": self._memory_trigger.get_stats(),
             "reference_resolver_config": self._reference_resolver.get_stats(),
+            # 缓存统计 (包含 Redis)
+            "cache": cache_stats,
         }
     
     def get_injection_logs(
@@ -835,3 +932,50 @@ Please respond based on the above history and the user's current question.
             "memory_trigger": self._memory_trigger.get_stats(),
             "reference_resolver": self._reference_resolver.get_stats(),
         }
+    
+    async def close(self):
+        """
+        关闭 DKI 插件
+        
+        清理资源，包括:
+        - 关闭 Redis 连接
+        - 关闭数据库连接
+        """
+        # 关闭 Redis 连接
+        if self._redis_client:
+            await self._redis_client.close()
+            logger.info("Redis connection closed")
+        
+        # 关闭数据库连接
+        if hasattr(self.data_adapter, 'close'):
+            await self.data_adapter.close()
+            logger.info("Database connection closed")
+        
+        logger.info("DKI Plugin closed")
+    
+    async def invalidate_user_cache(self, user_id: str) -> int:
+        """
+        使用户缓存失效
+        
+        当用户偏好更新时调用此方法
+        
+        Args:
+            user_id: 用户 ID
+            
+        Returns:
+            失效的缓存条目数
+        """
+        return await self._preference_cache.invalidate(user_id)
+    
+    def get_cache_stats(self) -> Dict[str, Any]:
+        """
+        获取缓存统计
+        
+        Returns:
+            缓存统计信息，包括:
+            - L1 (Memory) 命中率
+            - L2 (Redis) 命中率
+            - 总体命中率
+            - Redis 连接状态
+        """
+        return self._preference_cache.get_stats()

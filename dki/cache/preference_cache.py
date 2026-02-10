@@ -4,11 +4,17 @@ Tiered caching system for user preference K/V data
 
 Architecture:
 - L1 (In-Memory): Active session preferences, < 1ms latency
-- L2 (Redis): Recently active users, 1-5ms latency
+- L2 (Redis): Recently active users, 1-5ms latency (distributed)
 - L3 (Recompute): Cold users, compute on demand
 
+Key Features:
+- Multi-instance cache sharing via Redis
+- Automatic compression for large K/V tensors
+- Graceful degradation when Redis unavailable
+- Configurable via YAML
+
 Author: AGI Demo Project
-Version: 1.0.0
+Version: 2.0.0
 """
 
 import asyncio
@@ -18,10 +24,13 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union, TYPE_CHECKING
 
 import torch
 from loguru import logger
+
+if TYPE_CHECKING:
+    from dki.cache.redis_client import DKIRedisClient
 
 
 class CacheTier(str, Enum):
@@ -40,6 +49,7 @@ class CacheTierInfo:
     hit: bool
     user_id: str
     preference_hash: str
+    size_bytes: int = 0
 
 
 @dataclass
@@ -61,13 +71,26 @@ class CacheConfig:
     l1_max_memory_mb: int = 5000  # Max memory in MB
     
     # L2 (Redis) settings
-    l2_enabled: bool = True
+    l2_enabled: bool = False  # Disabled by default, enable via config
     l2_ttl_seconds: int = 86400  # 24 hours
     l2_key_prefix: str = "dki:pref_kv"
     
     # General settings
     enable_compression: bool = True
     compression_level: int = 6
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "CacheConfig":
+        """Create config from dictionary"""
+        return cls(
+            l1_max_size=data.get('l1_max_size', 1000),
+            l1_max_memory_mb=data.get('l1_max_memory_mb', 5000),
+            l2_enabled=data.get('l2_enabled', False),
+            l2_ttl_seconds=data.get('l2_ttl_seconds', 86400),
+            l2_key_prefix=data.get('l2_key_prefix', 'dki:pref_kv'),
+            enable_compression=data.get('enable_compression', True),
+            compression_level=data.get('compression_level', 6),
+        )
 
 
 class LRUCache:
@@ -165,14 +188,26 @@ class PreferenceCacheManager:
     Tiered cache manager for user preference K/V data.
     
     Strategy:
-    - L1 (Memory): Hot data for active sessions
-    - L2 (Redis): Warm data for recently active users
-    - L3 (Recompute): Cold data computed on demand
+    - L1 (Memory): Hot data for active sessions (< 1ms)
+    - L2 (Redis): Warm data shared across instances (1-5ms)
+    - L3 (Recompute): Cold data computed on demand (50-200ms)
     
     Cache Key Format: {user_id}:{preference_hash}
     
+    Why Redis (L2) is Important:
+    - In multi-instance deployments, L1 cache is per-instance
+    - Without L2, cache hit rate drops to ~70%/N (N = instance count)
+    - With L2 (Redis), cache hit rate stays at ~70% regardless of instances
+    
     Example:
-        cache = PreferenceCacheManager(redis_client=redis)
+        # Without Redis (single instance or degraded mode)
+        cache = PreferenceCacheManager()
+        
+        # With Redis (recommended for production)
+        from dki.cache.redis_client import DKIRedisClient, RedisConfig
+        redis_client = DKIRedisClient(RedisConfig(enabled=True))
+        await redis_client.connect()
+        cache = PreferenceCacheManager(redis_client=redis_client)
         
         # Get preference K/V (checks L1 -> L2 -> computes)
         kv_entries, tier_info = await cache.get_preference_kv(
@@ -187,18 +222,18 @@ class PreferenceCacheManager:
     
     def __init__(
         self,
-        redis_client: Optional[Any] = None,
+        redis_client: Optional["DKIRedisClient"] = None,
         config: Optional[CacheConfig] = None,
     ):
         """
         Initialize cache manager.
         
         Args:
-            redis_client: Redis client (async or sync)
+            redis_client: DKIRedisClient instance (recommended for production)
             config: Cache configuration
         """
         self.config = config or CacheConfig()
-        self.redis = redis_client
+        self._redis_client = redis_client
         
         # L1 cache (in-memory)
         self._l1_cache = LRUCache(maxsize=self.config.l1_max_size)
@@ -210,12 +245,43 @@ class PreferenceCacheManager:
             "l3_computes": 0,
             "total_requests": 0,
             "invalidations": 0,
+            "l2_errors": 0,
+            "total_bytes_cached": 0,
         }
+        
+        # Check Redis availability
+        l2_status = "disabled"
+        if self.config.l2_enabled:
+            if redis_client and redis_client.is_available:
+                l2_status = "enabled (connected)"
+            elif redis_client:
+                l2_status = "enabled (not connected)"
+            else:
+                l2_status = "enabled (no client)"
         
         logger.info(
             f"PreferenceCacheManager initialized "
-            f"(L1 max={self.config.l1_max_size}, "
-            f"L2 enabled={self.config.l2_enabled})"
+            f"(L1 max={self.config.l1_max_size}, L2 {l2_status})"
+        )
+    
+    @property
+    def redis(self) -> Optional["DKIRedisClient"]:
+        """Get Redis client"""
+        return self._redis_client
+    
+    @redis.setter
+    def redis(self, client: Optional["DKIRedisClient"]):
+        """Set Redis client (allows late binding)"""
+        self._redis_client = client
+        if client and client.is_available:
+            logger.info("Redis client connected to PreferenceCacheManager")
+    
+    def _is_l2_available(self) -> bool:
+        """Check if L2 (Redis) is available"""
+        return (
+            self.config.l2_enabled
+            and self._redis_client is not None
+            and self._redis_client.is_available
         )
     
     def _compute_preference_hash(self, preference_text: str) -> str:
@@ -283,15 +349,16 @@ class PreferenceCacheManager:
             )
         
         # L2: Check Redis cache
-        if self.config.l2_enabled and self.redis:
+        if self._is_l2_available():
             redis_key = self._make_redis_key(cache_key)
             
             try:
-                cached_data = await self._redis_get(redis_key)
+                cached_data = await self._redis_client.get_raw(redis_key)
                 
                 if cached_data:
                     # Deserialize
                     kv_entries = self._deserialize_kv(cached_data)
+                    size_bytes = len(cached_data)
                     
                     # Promote to L1
                     await self._l1_cache.put(cache_key, CacheEntry(
@@ -299,10 +366,16 @@ class PreferenceCacheManager:
                         preference_hash=preference_hash,
                         created_at=time.time(),
                         last_accessed=time.time(),
+                        size_bytes=size_bytes,
                     ))
                     
                     self._stats["l2_hits"] += 1
                     latency_ms = (time.time() - start_time) * 1000
+                    
+                    logger.debug(
+                        f"L2 cache hit for user {user_id} "
+                        f"(size={size_bytes/1024:.1f}KB, latency={latency_ms:.1f}ms)"
+                    )
                     
                     return kv_entries, CacheTierInfo(
                         tier=CacheTier.L2_REDIS,
@@ -310,10 +383,12 @@ class PreferenceCacheManager:
                         hit=True,
                         user_id=user_id,
                         preference_hash=preference_hash,
+                        size_bytes=size_bytes,
                     )
                     
             except Exception as e:
                 logger.warning(f"Redis cache error: {e}")
+                self._stats["l2_errors"] += 1
         
         # L3: Compute K/V
         kv_entries = await self._compute_kv(preference_text, model)
@@ -359,27 +434,38 @@ class PreferenceCacheManager:
         """Store K/V in all cache tiers."""
         now = time.time()
         
+        # Serialize once for both caches
+        serialized = self._serialize_kv(kv_entries)
+        size_bytes = len(serialized)
+        self._stats["total_bytes_cached"] += size_bytes
+        
         # L1: Store in memory
         await self._l1_cache.put(cache_key, CacheEntry(
             kv_data=kv_entries,
             preference_hash=preference_hash,
             created_at=now,
             last_accessed=now,
+            size_bytes=size_bytes,
         ))
         
-        # L2: Store in Redis
-        if self.config.l2_enabled and self.redis:
+        # L2: Store in Redis (async, non-blocking)
+        if self._is_l2_available():
             try:
                 redis_key = self._make_redis_key(cache_key)
-                serialized = self._serialize_kv(kv_entries)
                 
-                await self._redis_setex(
+                await self._redis_client.set_raw(
                     redis_key,
-                    self.config.l2_ttl_seconds,
                     serialized,
+                    ttl=self.config.l2_ttl_seconds,
+                )
+                
+                logger.debug(
+                    f"Stored in L2 cache: {cache_key} "
+                    f"(size={size_bytes/1024:.1f}KB, ttl={self.config.l2_ttl_seconds}s)"
                 )
             except Exception as e:
                 logger.warning(f"Failed to store in Redis: {e}")
+                self._stats["l2_errors"] += 1
     
     async def invalidate(self, user_id: str) -> int:
         """
@@ -402,13 +488,16 @@ class PreferenceCacheManager:
         count += l1_count
         
         # L2: Clear from Redis
-        if self.config.l2_enabled and self.redis:
+        if self._is_l2_available():
             try:
-                pattern = f"{self.config.l2_key_prefix}:{user_id}:*"
-                l2_count = await self._redis_delete_pattern(pattern)
+                pattern = f"{user_id}:*"
+                l2_count = await self._redis_client.delete_pattern(
+                    f"{self.config.l2_key_prefix}:{pattern}"
+                )
                 count += l2_count
             except Exception as e:
                 logger.warning(f"Failed to invalidate Redis cache: {e}")
+                self._stats["l2_errors"] += 1
         
         logger.debug(f"Invalidated {count} cache entries for user {user_id}")
         return count
@@ -417,12 +506,16 @@ class PreferenceCacheManager:
         """Clear all cache entries."""
         await self._l1_cache.clear()
         
-        if self.config.l2_enabled and self.redis:
+        if self._is_l2_available():
             try:
                 pattern = f"{self.config.l2_key_prefix}:*"
-                await self._redis_delete_pattern(pattern)
+                await self._redis_client.delete_pattern(pattern)
             except Exception as e:
                 logger.warning(f"Failed to clear Redis cache: {e}")
+                self._stats["l2_errors"] += 1
+        
+        # Reset stats
+        self._stats["total_bytes_cached"] = 0
         
         logger.info("Cleared all preference caches")
     
@@ -486,53 +579,19 @@ class PreferenceCacheManager:
             logger.error(f"Deserialization error: {e}")
             return []
     
-    # Redis helper methods (handle both async and sync clients)
-    
-    async def _redis_get(self, key: str) -> Optional[bytes]:
-        """Get from Redis."""
-        if hasattr(self.redis, 'get'):
-            result = self.redis.get(key)
-            if asyncio.iscoroutine(result):
-                return await result
-            return result
-        return None
-    
-    async def _redis_setex(self, key: str, ttl: int, value: bytes) -> None:
-        """Set with expiration in Redis."""
-        if hasattr(self.redis, 'setex'):
-            result = self.redis.setex(key, ttl, value)
-            if asyncio.iscoroutine(result):
-                await result
-    
-    async def _redis_delete_pattern(self, pattern: str) -> int:
-        """Delete keys matching pattern."""
-        count = 0
-        
-        if hasattr(self.redis, 'scan_iter'):
-            # Async redis
-            if hasattr(self.redis, 'scan'):
-                cursor = 0
-                while True:
-                    result = self.redis.scan(cursor, match=pattern, count=100)
-                    if asyncio.iscoroutine(result):
-                        cursor, keys = await result
-                    else:
-                        cursor, keys = result
-                    
-                    for key in keys:
-                        del_result = self.redis.delete(key)
-                        if asyncio.iscoroutine(del_result):
-                            await del_result
-                        count += 1
-                    
-                    if cursor == 0:
-                        break
-        
-        return count
-    
     def get_stats(self) -> Dict[str, Any]:
         """Get cache statistics."""
         total = self._stats["total_requests"]
+        
+        # Calculate hit rates
+        l1_hit_rate = self._stats["l1_hits"] / total if total > 0 else 0
+        l2_hit_rate = self._stats["l2_hits"] / total if total > 0 else 0
+        overall_hit_rate = (self._stats["l1_hits"] + self._stats["l2_hits"]) / total if total > 0 else 0
+        
+        # Get Redis stats if available
+        redis_stats = {}
+        if self._redis_client:
+            redis_stats = self._redis_client.get_stats()
         
         return {
             "total_requests": total,
@@ -540,8 +599,76 @@ class PreferenceCacheManager:
             "l2_hits": self._stats["l2_hits"],
             "l3_computes": self._stats["l3_computes"],
             "invalidations": self._stats["invalidations"],
-            "l1_hit_rate": self._stats["l1_hits"] / total if total > 0 else 0,
-            "l2_hit_rate": self._stats["l2_hits"] / total if total > 0 else 0,
-            "overall_hit_rate": (self._stats["l1_hits"] + self._stats["l2_hits"]) / total if total > 0 else 0,
+            "l2_errors": self._stats["l2_errors"],
+            "l1_hit_rate": l1_hit_rate,
+            "l2_hit_rate": l2_hit_rate,
+            "overall_hit_rate": overall_hit_rate,
+            "total_bytes_cached": self._stats["total_bytes_cached"],
+            "total_mb_cached": self._stats["total_bytes_cached"] / (1024 * 1024),
             "l1_cache": self._l1_cache.get_stats(),
+            "l2_enabled": self.config.l2_enabled,
+            "l2_available": self._is_l2_available(),
+            "redis": redis_stats,
         }
+    
+    async def warm_cache(
+        self,
+        user_ids: List[str],
+        preference_getter: Any,  # Callable[[str], str]
+        model: Any,
+    ) -> Dict[str, Any]:
+        """
+        Pre-warm cache for a list of users.
+        
+        Useful for:
+        - Service startup
+        - Batch pre-computation for high-frequency users
+        
+        Args:
+            user_ids: List of user IDs to warm
+            preference_getter: Async function to get preference text for user
+            model: Model adapter for K/V computation
+            
+        Returns:
+            Warming statistics
+        """
+        stats = {
+            "total": len(user_ids),
+            "success": 0,
+            "failed": 0,
+            "skipped": 0,
+        }
+        
+        for user_id in user_ids:
+            try:
+                # Get preference text
+                preference_text = await preference_getter(user_id)
+                
+                if not preference_text:
+                    stats["skipped"] += 1
+                    continue
+                
+                # Compute and cache
+                _, tier_info = await self.get_preference_kv(
+                    user_id=user_id,
+                    preference_text=preference_text,
+                    model=model,
+                )
+                
+                if tier_info.hit:
+                    stats["skipped"] += 1  # Already cached
+                else:
+                    stats["success"] += 1
+                    
+            except Exception as e:
+                logger.warning(f"Failed to warm cache for user {user_id}: {e}")
+                stats["failed"] += 1
+        
+        logger.info(
+            f"Cache warming complete: "
+            f"{stats['success']} computed, "
+            f"{stats['skipped']} skipped, "
+            f"{stats['failed']} failed"
+        )
+        
+        return stats
