@@ -67,17 +67,17 @@ DKI operates as an **attention-level plugin** for LLMs, implementing K/V injecti
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                         DKI Plugin Architecture                          │
+│                         DKI Plugin Architecture                         │
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                         │
 │  ┌─────────────────────────────────────────────────────────────────┐    │
 │  │  Upstream Application (Chat UI / Customer Service / Other Apps) │    │
 │  │  └── Only needs to pass: user_id + raw user input               │    │
-│  │      (No RAG, No Prompt Engineering, No Interface Implementation)│    │
+│  │     (No RAG, No Prompt Engineering, No Interface Implementation)│    │
 │  └─────────────────────────────┬───────────────────────────────────┘    │
 │                                ▼                                        │
 │  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  DKI Plugin                                                      │    │
+│  │  DKI Plugin                                                     │    │
 │  │  ├── Config-Driven Adapter (SQLAlchemy dynamic table mapping)   │    │
 │  │  │   └── Reads upstream app database (preferences + history)    │    │
 │  │  ├── Preference Processing → K/V Injection (negative pos, Hook) │    │
@@ -99,7 +99,7 @@ DKI uses a **layered injection approach** that mirrors human cognition:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                    DKI Hybrid Injection Architecture                     │
+│                    DKI Hybrid Injection Architecture                    │
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                         │
 │  ┌─────────────────────────────────────────────────────────────────┐    │
@@ -132,7 +132,7 @@ DKI uses a **layered injection approach** that mirrors human cognition:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                         DKI Data Flow                                    │
+│                         DKI Data Flow                                   │
 ├─────────────────────────────────────────────────────────────────────────┤
 │  User Query + user_id + session_id                                      │
 │       │                                                                 │
@@ -1020,11 +1020,11 @@ dki.update_reference_resolver_config(
 
 Unlike ChatGPT/Claude/Grok, DKI **does not need** Rolling Summary:
 
-| Approach | Reason | DKI Alternative |
-|----------|--------|-----------------|
-| RAG+Prompt | Context window limit, needs compression | K/V injection doesn't consume context |
-| Rolling Summary | Information loss from compression | Memory Trigger for precise recall |
-| Summary Generation | Extra LLM call overhead | Reference Resolver for on-demand retrieval |
+| Approach           | Reason                                  | DKI Alternative                            |
+| ------------------ | --------------------------------------- | ------------------------------------------ |
+| RAG+Prompt         | Context window limit, needs compression | K/V injection doesn't consume context      |
+| Rolling Summary    | Information loss from compression       | Memory Trigger for precise recall          |
+| Summary Generation | Extra LLM call overhead                 | Reference Resolver for on-demand retrieval |
 
 ### Roadmap
 
@@ -1070,12 +1070,12 @@ One of DKI's core advantages is **preference K/V cache reuse**—after computing
 
 In production environments, LLM services are typically multi-instance deployments (load balanced). If user requests are routed to different instances, cache misses occur, and DKI's core advantage is significantly diminished:
 
-| Deployment Mode | Cache Hit Rate | DKI Advantage |
-|-----------------|----------------|---------------|
-| Single Instance | ~70% | Full benefit |
-| 2 Instances | ~35% | Halved |
-| 4 Instances | ~17.5% | Greatly reduced |
-| N Instances | ~70%/N | Nearly ineffective |
+| Deployment Mode | Cache Hit Rate | DKI Advantage      |
+| --------------- | -------------- | ------------------ |
+| Single Instance | ~70%           | Full benefit       |
+| 2 Instances     | ~35%           | Halved             |
+| 4 Instances     | ~17.5%         | Greatly reduced    |
+| N Instances     | ~70%/N         | Nearly ineffective |
 
 **After Redis Integration**: Regardless of instance count, cache hit rate remains ~70%, DKI advantage fully preserved.
 
@@ -1083,7 +1083,7 @@ In production environments, LLM services are typically multi-instance deployment
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                    Current Architecture (Single-Instance Cache)          │
+│                    Current Architecture (Single-Instance Cache)         │
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                         │
 │  LLM Instance 1          LLM Instance 2          LLM Instance 3         │
@@ -1096,14 +1096,14 @@ In production environments, LLM services are typically multi-instance deployment
 │  └─────────────┘         └─────────────┘         └─────────────┘        │
 │                                                                         │
 │  Problems:                                                              │
-│  - user_001 request to Instance 2 = cache miss, K/V recomputation      │
-│  - Cache hit rate decreases with more instances                        │
-│  - Cannot achieve true horizontal scaling                              │
+│  - user_001 request to Instance 2 = cache miss, K/V recomputation       │
+│  - Cache hit rate decreases with more instances                         │
+│  - Cannot achieve true horizontal scaling                               │
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                    Optimized Architecture (Redis Distributed Cache)      │
+│                    Optimized Architecture (Redis Distributed Cache)     │
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                         │
 │  LLM Instance 1          LLM Instance 2          LLM Instance 3         │
@@ -1118,19 +1118,19 @@ In production environments, LLM services are typically multi-instance deployment
 │         └───────────────────────┼───────────────────────┘               │
 │                                 ▼                                       │
 │                    ┌─────────────────────────┐                          │
-│                    │      Redis Cluster       │                          │
-│                    │  ┌─────────────────────┐ │                          │
-│                    │  │ L2 Distributed Cache│ │                          │
-│                    │  │ user_001, user_002  │ │                          │
-│                    │  │ user_003, ...       │ │                          │
-│                    │  └─────────────────────┘ │                          │
+│                    │      Redis Cluster      │                          │
+│                    │  ┌────────────────────┐ │                          │
+│                    │  │L2 Distributed Cache│ │                          │
+│                    │  │user_001, user_002  │ │                          │
+│                    │  │user_003, ...       │ │                          │
+│                    │  └────────────────────┘ │                          │
 │                    └─────────────────────────┘                          │
 │                                                                         │
 │  Benefits:                                                              │
-│  - Any instance can hit cache                                          │
-│  - Cache hit rate unaffected by instance count                         │
-│  - True horizontal scaling support                                     │
-│  - Cache persistence, survives restarts                                │
+│  - Any instance can hit cache                                           │
+│  - Cache hit rate unaffected by instance count                          │
+│  - True horizontal scaling support                                      │
+│  - Cache persistence, survives restarts                                 │
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
@@ -1159,12 +1159,12 @@ cache:
 
 **Feasibility Assessment**:
 
-| Dimension | Rating | Notes |
-|-----------|--------|-------|
-| Technical Complexity | ⭐⭐ Medium | Redis client mature, main work is K/V Tensor serialization |
-| Performance Impact | ⭐⭐ Medium | Network latency ~1-5ms, but avoids K/V recomputation (~50-200ms) |
-| Benefit | ⭐⭐⭐ High | Essential for multi-instance deployment, significant cache hit improvement |
-| Dependencies | ⭐ Low | Only redis-py, optional dependency |
+| Dimension            | Rating      | Notes                                                                      |
+| -------------------- | ----------- | -------------------------------------------------------------------------- |
+| Technical Complexity | ⭐⭐ Medium | Redis client mature, main work is K/V Tensor serialization                 |
+| Performance Impact   | ⭐⭐ Medium | Network latency ~1-5ms, but avoids K/V recomputation (~50-200ms)           |
+| Benefit              | ⭐⭐⭐ High | Essential for multi-instance deployment, significant cache hit improvement |
+| Dependencies         | ⭐ Low      | Only redis-py, optional dependency                                         |
 
 **Key Technical Points**:
 
@@ -1204,12 +1204,12 @@ visualizer.export_report("attention_analysis.html")
 
 **Feasibility Assessment**:
 
-| Dimension | Rating | Notes |
-|-----------|--------|-------|
+| Dimension            | Rating      | Notes                                                     |
+| -------------------- | ----------- | --------------------------------------------------------- |
 | Technical Complexity | ⭐⭐ Medium | Need to hook attention weights, visualization libs mature |
-| Performance Impact | ⭐⭐⭐ High | Only enabled during debugging, disabled in production |
-| Benefit | ⭐⭐ Medium | Valuable for debugging and paper presentation |
-| Dependencies | ⭐ Low | matplotlib, plotly as optional dependencies |
+| Performance Impact   | ⭐⭐⭐ High | Only enabled during debugging, disabled in production     |
+| Benefit              | ⭐⭐ Medium | Valuable for debugging and paper presentation             |
+| Dependencies         | ⭐ Low      | matplotlib, plotly as optional dependencies               |
 
 ### 3. Multi-Modal Extension (Image/Audio Memory)
 
@@ -1231,12 +1231,12 @@ preferences = [
 
 **Feasibility Assessment**:
 
-| Dimension | Rating | Notes |
-|-----------|--------|-------|
+| Dimension            | Rating      | Notes                                                         |
+| -------------------- | ----------- | ------------------------------------------------------------- |
 | Technical Complexity | ⭐⭐⭐ High | Needs multi-modal encoders, K/V computation method adjustment |
-| Performance Impact | ⭐⭐⭐ High | Image/audio encoding overhead is large |
-| Benefit | ⭐⭐ Medium | Valuable for specific scenarios (e.g., virtual assistants) |
-| Dependencies | ⭐⭐⭐ High | Requires CLIP, Whisper, etc. |
+| Performance Impact   | ⭐⭐⭐ High | Image/audio encoding overhead is large                        |
+| Benefit              | ⭐⭐ Medium | Valuable for specific scenarios (e.g., virtual assistants)    |
+| Dependencies         | ⭐⭐⭐ High | Requires CLIP, Whisper, etc.                                  |
 
 **Recommendation**: Long-term goal, lower priority.
 
@@ -1273,55 +1273,59 @@ query_engine = index.as_query_engine(
 
 **Feasibility Assessment**:
 
-| Dimension | Rating | Notes |
-|-----------|--------|-------|
-| Technical Complexity | ⭐⭐ Medium | Need to adapt LangChain/LlamaIndex interfaces |
-| Performance Impact | ⭐ Low | Wrapper layer only, no extra overhead |
-| Benefit | ⭐⭐⭐ High | Expand user base, lower adoption barrier |
-| Dependencies | ⭐⭐ Medium | langchain, llama-index as optional dependencies |
+| Dimension            | Rating      | Notes                                           |
+| -------------------- | ----------- | ----------------------------------------------- |
+| Technical Complexity | ⭐⭐ Medium | Need to adapt LangChain/LlamaIndex interfaces   |
+| Performance Impact   | ⭐ Low      | Wrapper layer only, no extra overhead           |
+| Benefit              | ⭐⭐⭐ High | Expand user base, lower adoption barrier        |
+| Dependencies         | ⭐⭐ Medium | langchain, llama-index as optional dependencies |
 
 **Recommendation**: Medium priority, implement after core features stabilize.
 
 ### Priority Ranking
 
-| Priority | Optimization Direction | Reason |
-|----------|----------------------|--------|
-| P1 | Redis Distributed Cache | Essential for multi-instance, clear benefit |
-| P2 | Attention Visualization | Valuable for debugging and papers |
-| P3 | LangChain/LlamaIndex Integration | Expand ecosystem, but not core |
-| P4 | Multi-Modal Extension | High complexity, specific scenarios |
+| Priority | Optimization Direction           | Reason                                      |
+| -------- | -------------------------------- | ------------------------------------------- |
+| P1       | Redis Distributed Cache          | Essential for multi-instance, clear benefit |
+| P2       | Attention Visualization          | Valuable for debugging and papers           |
+| P3       | LangChain/LlamaIndex Integration | Expand ecosystem, but not core              |
+| P4       | Multi-Modal Extension            | High complexity, specific scenarios         |
 
 ### Additional Value of Redis Integration
 
 Beyond solving multi-instance caching, Redis integration brings additional value:
 
 1. **Cache Persistence**
-   - Cache survives service restarts
-   - Reduces K/V recomputation on cold start
+
+    - Cache survives service restarts
+    - Reduces K/V recomputation on cold start
 
 2. **Cache Warming**
-   - Pre-compute K/V for high-frequency users
-   - Batch import historical user preferences
+
+    - Pre-compute K/V for high-frequency users
+    - Batch import historical user preferences
 
 3. **Cache Monitoring**
-   - Redis provides rich monitoring metrics
-   - Analyze cache hit rate, memory usage, etc.
+
+    - Redis provides rich monitoring metrics
+    - Analyze cache hit rate, memory usage, etc.
 
 4. **Cache Eviction Strategies**
-   - Mature LRU/LFU strategies
-   - Automatic cache capacity management
+
+    - Mature LRU/LFU strategies
+    - Automatic cache capacity management
 
 5. **Cross-Service Sharing**
-   - Multiple DKI instances share the same cache
-   - Can even share across different LLM services (if using same model)
+    - Multiple DKI instances share the same cache
+    - Can even share across different LLM services (if using same model)
 
 **Cost Analysis**:
 
-| Resource | Estimate | Notes |
-|----------|----------|-------|
-| Redis Memory | ~100MB/10K users | Assuming ~10KB K/V per user |
-| Network Latency | 1-5ms | Within LAN |
-| Ops Cost | Low | Redis ops is mature |
+| Resource        | Estimate         | Notes                       |
+| --------------- | ---------------- | --------------------------- |
+| Redis Memory    | ~100MB/10K users | Assuming ~10KB K/V per user |
+| Network Latency | 1-5ms            | Within LAN                  |
+| Ops Cost        | Low              | Redis ops is mature         |
 
 **ROI Analysis**:
 
