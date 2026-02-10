@@ -342,6 +342,68 @@ reference_resolver:
   #     scope: "last_1_3_turns"
   #     type: "temporal"
 
+# ============ FlashAttention Settings ============
+# FlashAttention-3/2 integration for optimized K/V injection
+# Provides significant performance improvements on supported GPUs
+flash_attention:
+  # Enable FlashAttention optimization
+  enabled: true
+  
+  # Backend selection: auto | fa3 | fa2 | standard
+  # auto: Automatically detect GPU and select best backend
+  # fa3: Force FlashAttention-3 (requires H100/H200)
+  # fa2: Force FlashAttention-2 (requires A100/RTX 4090)
+  # standard: Use PyTorch standard attention (fallback)
+  backend: "auto"
+  
+  # FlashAttention-3 specific settings (H100/H200 only)
+  fa3:
+    # Enable FP8 precision (further reduces memory, may affect accuracy)
+    use_fp8: false
+    # Enable async execution (uses TMA)
+    enable_async: true
+    # Enable warp specialization
+    enable_warp_specialization: true
+    # Software pipelining stages
+    num_stages: 2
+  
+  # FlashAttention-2 settings (A100/RTX 4090)
+  fa2:
+    # Enable causal masking
+    causal: false
+    # Dropout rate (use 0 for inference)
+    dropout: 0.0
+    # Softmax scale (null = 1/sqrt(head_dim))
+    softmax_scale: null
+    # Return softmax statistics (for debugging)
+    return_softmax: false
+  
+  # K/V injection optimization
+  kv_injection:
+    # Enable optimized K/V injection
+    enabled: true
+    # Injection strategy: prepend | interleave
+    strategy: "prepend"
+    # Use chunked injection for large K/V
+    chunked: true
+    # Chunk size for chunked injection
+    chunk_size: 1024
+    # Enable alpha blending (soft injection)
+    alpha_blending: true
+  
+  # Performance profiling
+  profiling:
+    # Enable profiling
+    enabled: false
+    # Log memory usage
+    log_memory: true
+    # Log latency
+    log_latency: true
+    # Log FLOPS
+    log_flops: false
+    # Log output path
+    log_path: "./logs/flash_attn_profile.json"
+
 # ============ Experiment Settings ============
 experiment:
   output_dir: "./experiment_results"
