@@ -1,8 +1,12 @@
 """
-DKI -  Dynamic KV Injection
+DKI - Dynamic KV Injection
 Attention-Level User Memory Plugin for LLMs
 
 Setup script for package installation
+
+Version History:
+- 2.0.0: Config-driven adapters, hybrid injection
+- 2.5.0: Memory Trigger, Reference Resolver, Redis distributed cache
 """
 
 from setuptools import setup, find_packages
@@ -15,13 +19,13 @@ with open("requirements.txt", "r", encoding="utf-8") as fh:
 
 setup(
     name="dki",
-    version="2.0.0",
-    author="AGI Demo Project",
-    author_email="",
+    version="2.5.0",
+    author="Lucas Ma",
+    author_email="lucas_ma2025@126.com",
     description="DKI - Attention-Level User Memory Plugin for LLMs via K/V Injection",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/your-repo/dki",
+    url="https://github.com/LucasMa2025/DKI",
     packages=find_packages(),
     classifiers=[
         "Development Status :: 4 - Beta",
@@ -55,8 +59,16 @@ setup(
         "mysql": [
             "aiomysql>=0.2.0",
         ],
+        # Redis is now included in base requirements (important for production)
+        # This extra is kept for backwards compatibility
         "redis": [
             "redis>=5.0.0",
+        ],
+        # Full production setup
+        "production": [
+            "redis>=5.0.0",
+            "asyncpg>=0.29.0",
+            "uvloop>=0.19.0",  # Faster event loop
         ],
     },
     entry_points={
@@ -74,4 +86,3 @@ setup(
         ],
     },
 )
-

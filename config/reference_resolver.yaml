@@ -1,0 +1,99 @@
+# Reference Resolver Configuration
+# 指代解析器配置
+#
+# This file configures the Reference Resolver component which
+# interprets temporal and referential expressions in user queries.
+#
+# Reference Types:
+# - temporal: "刚刚", "最近", "上次"
+# - referential: "那件事", "那个问题"
+# - stance: "你之前说的", "你的看法"
+
+reference_resolver:
+  # ============ Recall Turns Configuration (核心可配置项) ============
+  # These settings control how many conversation turns to recall
+  # for different types of temporal references.
+  
+  # "刚刚/刚才/just now" - very recent context
+  last_few_turns: 3
+  
+  # "最近/recently" - broader recent context
+  recent_turns: 10
+  
+  # Maximum turns to recall for current session
+  session_max_turns: 50
+  
+  # ============ Reference Mappings (Chinese) ============
+  # Maps keywords to scope and type
+  reference_mappings_cn:
+    "刚刚":
+      scope: "last_1_3_turns"
+      type: "temporal"
+    "刚才":
+      scope: "last_1_3_turns"
+      type: "temporal"
+    "最近":
+      scope: "current_session"
+      type: "temporal"
+    "那件事":
+      scope: "last_shared_topic"
+      type: "referential"
+    "那个问题":
+      scope: "last_shared_topic"
+      type: "referential"
+    "那个话题":
+      scope: "last_shared_topic"
+      type: "referential"
+    "之前你说的":
+      scope: "assistant_last_stance"
+      type: "stance"
+    "你上次说":
+      scope: "assistant_last_stance"
+      type: "stance"
+    "你之前提到":
+      scope: "assistant_last_stance"
+      type: "stance"
+    "上次":
+      scope: "last_5_10_turns"
+      type: "temporal"
+    "前几天":
+      scope: "last_5_10_turns"
+      type: "temporal"
+  
+  # ============ Reference Mappings (English) ============
+  reference_mappings_en:
+    "just now":
+      scope: "last_1_3_turns"
+      type: "temporal"
+    "just":
+      scope: "last_1_3_turns"
+      type: "temporal"
+    "recently":
+      scope: "current_session"
+      type: "temporal"
+    "that thing":
+      scope: "last_shared_topic"
+      type: "referential"
+    "that issue":
+      scope: "last_shared_topic"
+      type: "referential"
+    "that topic":
+      scope: "last_shared_topic"
+      type: "referential"
+    "you said earlier":
+      scope: "assistant_last_stance"
+      type: "stance"
+    "you mentioned":
+      scope: "assistant_last_stance"
+      type: "stance"
+    "last time":
+      scope: "last_5_10_turns"
+      type: "temporal"
+    "earlier":
+      scope: "last_5_10_turns"
+      type: "temporal"
+  
+  # ============ LLM Fallback (Future) ============
+  # Use LLM for complex reference resolution
+  use_llm_fallback: false
+  llm_fallback_threshold: 0.5   # Use LLM if rule confidence < this

@@ -28,8 +28,11 @@ asyncpg>=0.29.0  # PostgreSQL async (recommended)
 # aiomysql>=0.2.0  # MySQL async
 # pymysql>=1.1.0  # MySQL sync
 
-# Redis (optional - for L2 preference cache)
-redis>=5.0.0  # Async Redis support included
+# ============ Redis (Distributed Cache) ============
+# IMPORTANT: Required for multi-instance deployments!
+# Without Redis: cache hit rate = 70%/N (N = instances)
+# With Redis: cache hit rate = 70% (constant)
+redis>=5.0.0  # Async Redis support included (redis.asyncio)
 
 # ============ Web Server & API ============
 fastapi>=0.104.0
@@ -71,4 +74,3 @@ isort>=5.12.0
 matplotlib>=3.7.0
 seaborn>=0.12.0
 plotly>=5.18.0
-

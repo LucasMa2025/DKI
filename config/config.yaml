@@ -230,23 +230,48 @@ user_adapter:
 
 # ============ Preference Cache Settings ============
 preference_cache:
-  # L1 (Memory) settings
-  l1_max_size: 1000
-  l1_max_memory_mb: 5000
+  # L1 (Memory) settings - per-instance hot cache
+  l1_max_size: 1000           # Max users in memory
+  l1_max_memory_mb: 5000      # Max memory in MB
   
-  # L2 (Redis) settings
-  l2_enabled: false
-  l2_ttl_seconds: 86400
+  # L2 (Redis) settings - distributed warm cache
+  # IMPORTANT: Enable for multi-instance deployments!
+  # Without Redis: cache hit rate = 70%/N (N = instances)
+  # With Redis: cache hit rate = 70% (constant)
+  l2_enabled: false           # Set to true for production
+  l2_ttl_seconds: 86400       # 24 hours
   l2_key_prefix: "dki:pref_kv"
   
-  # Redis connection (if L2 enabled)
-  redis_host: "localhost"
-  redis_port: 6379
-  redis_password: ""
-  
-  # Compression
+  # Compression (reduces Redis memory usage by ~60%)
   enable_compression: true
   compression_level: 6
+
+# ============ Redis Settings ============
+# Distributed cache for multi-instance deployments
+redis:
+  enabled: false              # Set to true for production
+  host: "localhost"
+  port: 6379
+  password: ""                # Leave empty if no auth
+  db: 0                       # Redis database number
+  
+  # Connection pool settings
+  max_connections: 50         # Max connections in pool
+  socket_timeout: 5.0         # Socket timeout in seconds
+  socket_connect_timeout: 5.0 # Connection timeout
+  retry_on_timeout: true      # Auto-retry on timeout
+  
+  # Key settings
+  key_prefix: "dki"           # Prefix for all DKI keys
+  default_ttl: 86400          # Default TTL (24 hours)
+  
+  # Compression settings
+  enable_compression: true    # Compress large values
+  compression_level: 6        # zlib compression level (1-9)
+  compression_threshold: 1024 # Only compress if > 1KB
+  
+  # Health check
+  health_check_interval: 30   # Health check interval (seconds)
 
 # ============ Non-Vectorized Data Handler Settings ============
 non_vectorized_handler:
@@ -278,6 +303,44 @@ ui:
   dev_port: 3000
   # API proxy target
   api_proxy: "http://localhost:8080"
+
+# ============ Memory Trigger Settings ============
+# Detects when user input indicates memory-related signals
+# See: DKI/dki/core/components/memory_trigger.py
+memory_trigger:
+  enabled: true
+  language: "auto"            # "cn", "en", "auto"
+  
+  # Use classifier enhancement (future feature)
+  use_classifier: false
+  classifier_model: null
+  classifier_threshold: 0.7
+  
+  # Custom patterns can be added here or via external config
+  # Format: list of {trigger_type, pattern, language}
+  # custom_patterns:
+  #   - trigger_type: "meta_cognitive"
+  #     pattern: "我们之前.*?讨论"
+  #     language: "cn"
+
+# ============ Reference Resolver Settings ============
+# Resolves temporal and referential expressions in user queries
+# See: DKI/dki/core/components/reference_resolver.py
+reference_resolver:
+  # Recall turns configuration (EXTERNALLY CONFIGURABLE)
+  last_few_turns: 3           # "刚刚/刚才/just now" recall turns
+  recent_turns: 10            # "最近/recently" recall turns
+  session_max_turns: 50       # Maximum session recall turns
+  
+  # LLM fallback (for complex references)
+  use_llm_fallback: false
+  llm_fallback_threshold: 0.5
+  
+  # Custom reference mappings can be added here
+  # reference_mappings_cn:
+  #   "自定义关键词":
+  #     scope: "last_1_3_turns"
+  #     type: "temporal"
 
 # ============ Experiment Settings ============
 experiment:

@@ -1,0 +1,103 @@
+# Memory Trigger Configuration
+# 记忆触发器配置
+#
+# This file configures the Memory Trigger component which detects
+# when user input indicates memory-related signals.
+#
+# Trigger Types:
+# - meta_cognitive: "我们刚刚讨论的", "之前你说过"
+# - state_change: "我现在改变想法了", "补充一点"
+# - long_term_value: "请记住", "我喜欢"
+# - recall_request: "最近我们聊了什么"
+# - opinion_query: "你有新的看法吗"
+
+memory_trigger:
+  # Enable/disable memory trigger
+  enabled: true
+  
+  # Language detection: "cn", "en", "auto"
+  language: "auto"
+  
+  # ============ Meta-Cognitive Patterns (元认知表达) ============
+  # Triggers when user references past conversations
+  meta_cognitive_patterns_cn:
+    - "我们(刚刚|刚才|之前|上次).*?(讨论|聊|说|谈)"
+    - "(之前|上次|前几天)你(说|提到|建议)"
+    - "(那件事|那个问题|那个话题)"
+    - "你(还记得|记得).*?吗"
+    - "我(之前|上次)(说|提到|问)过"
+  
+  meta_cognitive_patterns_en:
+    - "we (just|recently|previously) (discussed|talked|mentioned)"
+    - "(earlier|last time|before) you (said|mentioned|suggested)"
+    - "(that thing|that issue|that topic)"
+    - "do you (remember|recall)"
+    - "I (previously|earlier) (said|mentioned|asked)"
+  
+  # ============ State Change Patterns (状态变化) ============
+  # Triggers when user indicates preference/opinion changes
+  state_change_patterns_cn:
+    - "我(现在|已经)?(改变|改了|变了).*?(想法|主意|看法)"
+    - "(补充|更正|纠正)一(下|点)"
+    - "其实我(想|觉得|认为)"
+    - "我的(偏好|喜好|习惯)是"
+    - "我(不再|不想|不要).*?了"
+  
+  state_change_patterns_en:
+    - "I('ve| have)? (changed|updated) my (mind|opinion|view)"
+    - "(let me|I want to) (add|correct|clarify)"
+    - "actually I (think|believe|want)"
+    - "my (preference|habit) is"
+    - "I (no longer|don't want to)"
+  
+  # ============ Long-Term Value Patterns (长期价值信号) ============
+  # Triggers for preferences, habits, and persistent information
+  long_term_value_patterns_cn:
+    - "请(记住|记下|保存)"
+    - "我(喜欢|不喜欢|偏好|讨厌)"
+    - "我的(计划|目标|打算)是"
+    - "(定义|规定|约定).*?为"
+    - "我(总是|通常|一般|习惯)"
+    - "我是.*?(素食|过敏|不吃)"
+  
+  long_term_value_patterns_en:
+    - "please (remember|note|save)"
+    - "I (like|dislike|prefer|hate)"
+    - "my (plan|goal|intention) is"
+    - "(define|set|establish).*?as"
+    - "I (always|usually|typically|tend to)"
+    - "I am.*?(vegetarian|allergic|don't eat)"
+  
+  # ============ Recall Request Patterns (回顾请求) ============
+  # Triggers when user asks about conversation history
+  recall_request_patterns_cn:
+    - "(最近|刚才)我们(聊|讨论|谈)了(什么|哪些)"
+    - "我们(讨论|聊)过(什么|哪些)(话题|问题)"
+    - "(总结|回顾)一下我们的(对话|讨论)"
+    - "我们(之前|上次)说(了|过)什么"
+  
+  recall_request_patterns_en:
+    - "what (did|have) we (discussed|talked about) (recently|earlier)"
+    - "what (topics|issues) have we (discussed|covered)"
+    - "(summarize|recap) our (conversation|discussion)"
+    - "what did we (say|talk about) (before|earlier)"
+  
+  # ============ Opinion Query Patterns (观点查询) ============
+  # Triggers when user asks about assistant's evolving opinions
+  opinion_query_patterns_cn:
+    - "你(对|关于).*?(有|有没有)(新|什么)(看法|想法|观点)"
+    - "你(现在|目前)(怎么|如何)(看|想|认为)"
+    - "你的(看法|观点|想法)(变|改变)了吗"
+    - "你(还是|仍然)(认为|觉得)"
+  
+  opinion_query_patterns_en:
+    - "do you have (any|new) (thoughts|views|opinions) (on|about)"
+    - "what do you (think|believe) (now|currently)"
+    - "has your (view|opinion|thought) changed"
+    - "do you still (think|believe)"
+  
+  # ============ Classifier Enhancement (Future) ============
+  # Enable lightweight classifier for better accuracy
+  use_classifier: false
+  classifier_model: null      # Path to classifier model
+  classifier_threshold: 0.7   # Confidence threshold
