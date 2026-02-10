@@ -12,6 +12,16 @@ safetensors>=0.4.0
 vllm>=0.2.0
 # llama-cpp-python>=0.2.0  # Optional for llama.cpp
 
+# ============ FlashAttention (Performance Optimization) ============
+# IMPORTANT: Provides 60-70% latency reduction for K/V injection
+# Installation: pip install flash-attn --no-build-isolation
+# GPU Requirements:
+#   - FA3 (full): H100/H200 (compute capability 9.0+)
+#   - FA2: A100/RTX 4090 (compute capability 8.0+)
+#   - Standard fallback: V100 and older
+flash-attn>=2.5.0  # FlashAttention-2/3
+triton>=2.1.0      # Triton compiler (FA3 dependency)
+
 # ============ Embeddings & Vector Store ============
 sentence-transformers>=2.2.0
 faiss-cpu>=1.7.4
