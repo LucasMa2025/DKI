@@ -112,7 +112,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import {
   Plus,
@@ -126,6 +126,7 @@ import {
   MoreFilled,
   Edit,
   Delete,
+  View,
 } from '@element-plus/icons-vue'
 import { ElMessageBox, ElMessage } from 'element-plus'
 import { useAuthStore } from '@/stores/auth'
@@ -151,6 +152,7 @@ const navItems = [
   { path: '/', icon: ChatDotRound, label: '聊天' },
   { path: '/sessions', icon: Document, label: '会话管理' },
   { path: '/preferences', icon: Setting, label: '偏好设置' },
+  { path: '/visualization', icon: View, label: '注入可视化' },
   { path: '/stats', icon: DataAnalysis, label: '系统统计' },
 ]
 

@@ -202,6 +202,29 @@ export const api = {
       return http.get('/health')
     },
   },
+  
+  // Visualization
+  visualization: {
+    async getLatest(): Promise<any> {
+      return http.get('/v1/dki/visualization/latest')
+    },
+    
+    async getHistory(page: number = 1, pageSize: number = 20): Promise<{ items: any[]; total: number; page: number; page_size: number }> {
+      return http.get('/v1/dki/visualization/history', { params: { page, page_size: pageSize } })
+    },
+    
+    async getDetail(requestId: string): Promise<any> {
+      return http.get(`/v1/dki/visualization/detail/${requestId}`)
+    },
+    
+    async getFlowDiagram(): Promise<any> {
+      return http.get('/v1/dki/visualization/flow-diagram')
+    },
+    
+    async clearHistory(): Promise<{ message: string; success: boolean }> {
+      return http.delete('/v1/dki/visualization/history')
+    },
+  },
 }
 
 export default api

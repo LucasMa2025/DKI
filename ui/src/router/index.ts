@@ -35,6 +35,11 @@ const routes: RouteRecordRaw[] = [
         component: () => import('@/views/StatsView.vue'),
         meta: { requiresStatsAuth: true },
       },
+      {
+        path: 'visualization',
+        name: 'Visualization',
+        component: () => import('@/views/InjectionVizView.vue'),
+      },
     ],
   },
   {
