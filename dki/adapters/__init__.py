@@ -69,3 +69,31 @@ __all__ = [
     # 示例适配器 (仅用于演示)
     "ExampleAdapter",
 ]
+
+# 新增：导入 AdapterFactory 类
+from dki.adapters.factory import AdapterFactory
+
+__all__ = [
+    # 基础接口
+    "IUserDataAdapter",
+    "AdapterConfig",
+    "AdapterType",
+    "UserProfile",
+    "UserPreference",
+    "ChatMessage",
+    
+    # 配置驱动适配器 (推荐)
+    "ConfigDrivenAdapter",
+    "ConfigDrivenAdapterConfig",
+    "DatabaseConfig",
+    "DatabaseType",
+    "TableMapping",
+    "VectorSearchConfig",
+    "VectorSearchType",
+    
+    # 示例适配器 (仅用于演示)
+    "ExampleAdapter",
+    
+    # 适配器工厂类
+    "AdapterFactory",
+]
