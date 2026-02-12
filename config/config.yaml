@@ -74,13 +74,20 @@ rag:
 # NOT for: External knowledge bases, public data retrieval (use RAG)
 dki:
   enabled: true
-  version: "2.5"
+  version: "2.6"
   
   # Use tiered cache instead of simple cache (recommended for production)
   use_tiered_cache: true
   
+  # ============ Injection Strategy Selection ============
+  # Choose between stable (production) and full_attention (research)
+  # - stable: Preferences via K/V, History via suffix prompt (default)
+  # - full_attention: Both Preferences and History via K/V injection (research)
+  injection_strategy: "stable"  # stable | full_attention
+  
   # ============ Hybrid Injection Strategy (Paper Section 3.9) ============
   # Layered approach: Preferences via K/V, History via suffix prompt
+  # Used when injection_strategy = "stable"
   hybrid_injection:
     enabled: true
     language: "en"  # en | cn (affects prompt templates)
@@ -101,6 +108,45 @@ dki:
       max_tokens: 500                # Can be longer than preferences
       max_messages: 10               # Recent messages to include
       prompt_template: "default"     # default | custom path
+  
+  # ============ Full Attention Strategy (Research - Plan C) ============
+  # Both preferences and history injected via K/V at negative positions
+  # Aims for 0% context usage, but may have OOD risks
+  # Used when injection_strategy = "full_attention"
+  full_attention:
+    enabled: true
+    
+    # Position configuration
+    # C1: Fixed negative position for all injected K/V
+    position_mode: "fixed_negative"  # fixed_negative | constant | nope
+    
+    # Preference K/V (same as stable strategy)
+    preference:
+      position_start: -100           # Starting position for preference K/V
+      alpha: 0.4                     # α for preference injection
+      max_tokens: 100
+    
+    # History K/V (NEW: injected via K/V instead of suffix)
+    history:
+      position_start: -500           # Starting position for history K/V
+      alpha: 0.3                     # Lower α for history (more tokens, more risk)
+      max_tokens: 400                # Max tokens for history K/V
+      max_messages: 10               # Max messages to convert to K/V
+    
+    # Global indication (minimal context usage)
+    # A short hint to guide model attention to negative positions
+    global_indication:
+      enabled: true
+      text_en: "[Memory Context Available]"
+      text_cn: "[记忆上下文可用]"
+      # This is the ONLY context usage in full_attention mode
+      # Approximately 3-5 tokens
+    
+    # Safety settings for research
+    safety:
+      max_total_kv_tokens: 600       # Hard limit on total K/V tokens
+      fallback_to_stable: true       # Fall back to stable if K/V too large
+      log_attention_patterns: true   # Log attention for analysis
   
   # ============ Memory Source Configuration ============
   # Connect to external memory database
@@ -200,6 +246,7 @@ server:
 
 # ============ User Data Adapter Settings ============
 # Configure external user data source
+# For detailed configuration, see: config/adapter_config.example.yaml
 user_adapter:
   # Adapter type: postgresql | mysql | mongodb | redis | rest_api | memory
   type: "memory"
@@ -215,6 +262,18 @@ user_adapter:
   users_table: "users"
   messages_table: "messages"
   preferences_table: "user_preferences"
+  
+  # ============ JSON Content Extraction ============
+  # If your content field stores JSON strings (e.g., raw AI responses),
+  # specify the JSON key to extract the actual text content.
+  #
+  # Example: If content = '{"text": "Hello", "model": "gpt-4"}'
+  # Set content_json_key: "text" to extract "Hello"
+  #
+  # Supports nested keys: "data.text", "choices.0.text"
+  # If JSON parsing fails or key not found, uses raw content (safe fallback)
+  messages_content_json_key: null  # e.g., "text", "content", "message"
+  preferences_content_json_key: null
   
   # REST API settings (for rest_api type)
   base_url: ""
