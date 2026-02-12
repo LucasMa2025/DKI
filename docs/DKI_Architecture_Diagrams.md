@@ -355,7 +355,7 @@
 │  ═══ Full Attention Strategy (Research) ═══                                         │
 │                                                                                     │
 │  Token Position Layout:                                                             │
-│  ◄──────────────── All Negative Positions ──────────────────►│◄── Positive ──►     │
+│  ◄──────────────── All Negative Positions ──────────────────►│◄── Positive ──►      │
 │                                                               │                     │
 │  ┌────────────────────────────────────────────────────────────┼───────────────────┐ │
 │  │                                                            │                   │ │
@@ -708,5 +708,5 @@
 -   [集成指南 / Integration Guide](Integration_Guide.md)
 -   [FlashAttention-3 集成方案](FlashAttention3_Integration.md)
 -   [动态向量检索说明](Dynamic_Vector_Search.md)
--   [用户记忆注入完整系统方案](DKI_用户记忆注入完整系统方案.md)
 -   [DKI 演化路径的思考](DKI演化路径的思考.md)
+
