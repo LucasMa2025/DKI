@@ -93,13 +93,28 @@ DKI 作为 LLM 的**注意力层级插件**，通过 PyTorch Hook 机制实现 K
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 混合注入策略
+### 注入策略选择
 
-DKI 使用**分层注入方法**，模拟人类认知：
+DKI 提供两种注入策略，可通过配置切换：
+
+| 策略               | 适用场景 | Context 占用 | 稳定性     | 研究价值   |
+| ------------------ | -------- | ------------ | ---------- | ---------- |
+| **stable** (默认)  | 生产环境 | 中等         | ⭐⭐⭐⭐⭐ | ⭐⭐       |
+| **full_attention** | 研究实验 | 极小         | ⭐⭐⭐     | ⭐⭐⭐⭐⭐ |
+
+```yaml
+# config.yaml
+dki:
+    injection_strategy: "stable" # stable | full_attention
+```
+
+### 混合注入策略 (Stable)
+
+**默认策略**，使用**分层注入方法**，模拟人类认知：
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                      DKI 混合注入架构                                    │
+│                      DKI 混合注入架构 (Stable)                           │
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                         │
 │  ┌─────────────────────────────────────────────────────────────────┐    │
@@ -126,6 +141,82 @@ DKI 使用**分层注入方法**，模拟人类认知：
 │  └─────────────────────────────────────────────────────────────────┘    │
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Full Attention 策略 (研究)
+
+**研究策略**，基于 Plan C 方案，偏好和历史均通过 K/V 注入：
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                   DKI Full Attention 架构 (Research)                    │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  位置布局:                                                               │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │  [History KV]     │  [Preference KV]   │  [Query + Indication]  │    │
+│  │  pos: -500~-101   │  pos: -100~-1      │  pos: 0~L              │    │
+│  │  α: 0.3           │  α: 0.4            │  α: 1.0                │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                         │
+│  特点:                                                                  │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │  ✅ Context 占用极小 (仅 3-5 tokens 全局指示)                    │    │
+│  │  ✅ 历史也通过 K/V 注入，不消耗 token 预算                        │    │
+│  │  ⚠️ 可能存在 OOD 风险 (需要实验验证)                              │    │
+│  │  ⚠️ 历史无法被显式引用 (隐式影响)                                 │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                         │
+│  研究目的:                                                               │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │  1. 验证历史消息 K/V 注入的可行性                                 │    │
+│  │  2. 对比 Stable 策略的输出质量                                    │    │
+│  │  3. 收集 attention pattern 数据                                  │    │
+│  │  4. 探索 0% Context 占用的极限                                   │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**配置示例**：
+
+```yaml
+dki:
+    injection_strategy: "full_attention"
+
+    full_attention:
+        enabled: true
+        position_mode: "fixed_negative" # fixed_negative | constant | nope
+
+        preference:
+            position_start: -100
+            alpha: 0.4
+
+        history:
+            position_start: -500
+            alpha: 0.3
+            max_tokens: 400
+
+        global_indication:
+            enabled: true
+            text_en: "[Memory Context Available]"
+            text_cn: "[记忆上下文可用]"
+```
+
+**运行时切换策略**：
+
+```python
+# 切换到 full_attention 策略
+dki.switch_injection_strategy("full_attention")
+
+# 切换回 stable 策略
+dki.switch_injection_strategy("stable")
+
+# 获取 full_attention 统计
+stats = dki.get_full_attention_stats()
+
+# 获取 attention pattern 日志 (用于研究分析)
+logs = dki.get_full_attention_logs(limit=50)
 ```
 
 ### 数据流
@@ -266,12 +357,48 @@ user_adapter:
             content: content
             timestamp: created_at
 
+        # JSON 内容解析 (重要!)
+        # 如果 content 字段存储的是 JSON 字符串 (如 AI 原始响应)
+        # 可以指定 JSON key 来提取实际文本内容
+        #
+        # 场景: 上层应用直接存储 AI 响应，content 字段可能是:
+        #   '{"text": "推荐川菜馆", "model": "gpt-4", "tokens": 100}'
+        #
+        # 配置 content_json_key: "text" 后，DKI 会自动提取 "推荐川菜馆"
+        # 如果 JSON 解析失败或 key 不存在，则使用原始内容 (安全回退)
+        content_json_key:
+            null # 设置为 JSON key 名称，如 "text", "content"
+            # 支持嵌套: "data.text", "choices.0.message.content"
+
     # 向量检索配置 (支持动态向量处理)
     vector_search:
         type: dynamic # pgvector | faiss | dynamic
         dynamic:
             strategy: hybrid # lazy | batch | hybrid (BM25 + embedding)
 ```
+
+#### JSON 内容解析说明
+
+许多应用直接将 AI 的原始响应存储在数据库中，`content` 字段可能是 JSON 字符串：
+
+```json
+{
+    "text": "推荐您去川菜馆",
+    "model": "gpt-4",
+    "tokens": 50,
+    "finish_reason": "stop"
+}
+```
+
+通过配置 `content_json_key`，DKI 可以自动提取实际的文本内容：
+
+| 配置值                        | JSON 数据                      | 提取结果     |
+| ----------------------------- | ------------------------------ | ------------ |
+| `"text"`                      | `{"text": "Hello"}`            | `"Hello"`    |
+| `"data.text"`                 | `{"data": {"text": "Nested"}}` | `"Nested"`   |
+| `"choices.0.message.content"` | OpenAI 格式响应                | 实际回复内容 |
+
+**安全回退**：如果 JSON 解析失败或指定的 key 不存在，DKI 会使用原始内容，不会报错。
 
 ### Chat UI 示例界面
 
@@ -334,68 +461,251 @@ REST API 端点：
 
 ```
 DKI/
-├── config/
-│   ├── config.yaml              # 主配置文件
-│   └── adapter_config.example.yaml  # 适配器配置示例
-├── dki/
-│   ├── core/
-│   │   ├── dki_plugin.py        # ⭐ DKI 插件核心
-│   │   ├── dki_system.py        # DKI 系统封装
-│   │   ├── memory_router.py     # 基于FAISS的检索
-│   │   ├── embedding_service.py
-│   │   └── components/
-│   │       ├── memory_influence_scaling.py   # MIS 组件
-│   │       ├── query_conditioned_projection.py  # QCP 组件
-│   │       ├── dual_factor_gating.py         # 双因子门控
-│   │       ├── hybrid_injector.py            # 混合注入器
-│   │       ├── session_kv_cache.py
-│   │       ├── tiered_kv_cache.py    # L1/L2/L3/L4 内存层次
-│   │       └── position_remapper.py  # 位置编码重映射
-│   ├── adapters/
-│   │   ├── base.py              # 适配器基类
-│   │   └── config_driven_adapter.py  # ⭐ 配置驱动适配器
-│   ├── api/
-│   │   └── dki_routes.py        # ⭐ DKI API 路由
-│   ├── models/
-│   │   ├── factory.py           # 模型工厂
-│   │   ├── base.py              # 基础适配器
-│   │   ├── vllm_adapter.py
-│   │   ├── llama_adapter.py
-│   │   ├── deepseek_adapter.py
-│   │   └── glm_adapter.py
-│   ├── cache/
-│   │   └── non_vectorized_handler.py  # 动态向量处理
-│   ├── database/
-│   │   ├── models.py            # SQLAlchemy模型
-│   │   └── connection.py        # 数据库连接管理
-│   ├── experiment/
-│   │   ├── runner.py            # 实验运行器
-│   │   ├── metrics.py           # 评估指标
-│   │   └── data_generator.py    # 测试数据生成
-│   └── web/
-│       └── app.py               # FastAPI 应用
-├── ui/                          # Vue3 示例前端界面
+├── config/                              # 配置文件目录
+│   ├── config.yaml                      # ⭐ 主配置文件
+│   ├── adapter_config.example.yaml      # ⭐ 适配器配置示例
+│   ├── memory_trigger.yaml              # Memory Trigger 配置
+│   └── reference_resolver.yaml          # Reference Resolver 配置
+│
+├── dki/                                 # 核心代码目录
+│   ├── __init__.py
+│   │
+│   ├── core/                            # ⭐ 核心模块
+│   │   ├── __init__.py
+│   │   ├── dki_plugin.py                # ⭐ DKI 插件核心 (入口)
+│   │   ├── dki_system.py                # DKI 系统封装
+│   │   ├── architecture.py              # 架构定义
+│   │   ├── plugin_interface.py          # 插件接口定义
+│   │   ├── memory_router.py             # 基于 FAISS 的向量检索
+│   │   ├── embedding_service.py         # 嵌入计算服务
+│   │   ├── rag_system.py               # RAG 基线 (对比实验用)
+│   │   │
+│   │   ├── injection/                   # ⭐ 注入策略
+│   │   │   ├── __init__.py
+│   │   │   └── full_attention_injector.py  # Full Attention 策略 (研究)
+│   │   │
+│   │   └── components/                  # ⭐ 核心算法组件
+│   │       ├── __init__.py
+│   │       ├── memory_influence_scaling.py    # MIS - 记忆影响缩放
+│   │       ├── query_conditioned_projection.py  # QCP - 查询条件投影
+│   │       ├── dual_factor_gating.py          # 双因子门控决策
+│   │       ├── hybrid_injector.py             # 混合注入器
+│   │       ├── memory_trigger.py              # ⭐ 记忆触发检测
+│   │       ├── reference_resolver.py          # ⭐ 指代解析器
+│   │       ├── attention_budget.py            # 注意力预算追踪
+│   │       ├── session_kv_cache.py            # 会话级 K/V 缓存
+│   │       ├── tiered_kv_cache.py             # L1/L2/L3/L4 分层缓存
+│   │       └── position_remapper.py           # 位置编码重映射 (RoPE/ALiBi)
+│   │
+│   ├── adapters/                        # ⭐ 外部数据适配器
+│   │   ├── __init__.py
+│   │   ├── base.py                      # 适配器抽象基类
+│   │   ├── config_driven_adapter.py     # ⭐ 配置驱动适配器 (核心)
+│   │   ├── factory.py                   # 适配器工厂
+│   │   ├── example_adapter.py           # 示例适配器
+│   │   ├── memory_adapter.py            # 内存适配器
+│   │   ├── postgresql_adapter.py        # PostgreSQL 适配器
+│   │   ├── mysql_adapter.py             # MySQL 适配器
+│   │   ├── mongodb_adapter.py           # MongoDB 适配器
+│   │   ├── redis_adapter.py             # Redis 适配器
+│   │   └── rest_adapter.py              # REST API 适配器
+│   │
+│   ├── attention/                       # ⭐ FlashAttention 集成
+│   │   ├── __init__.py
+│   │   ├── config.py                    # FlashAttention 配置
+│   │   ├── backend.py                   # 后端检测 (FA3/FA2/Standard)
+│   │   ├── kv_injection.py              # 优化的 K/V 注入计算
+│   │   └── profiler.py                  # 性能分析器
+│   │
+│   ├── api/                             # REST API 路由
+│   │   ├── __init__.py
+│   │   ├── dki_routes.py                # ⭐ DKI 聊天 API
+│   │   ├── visualization_routes.py      # ⭐ 注入可视化 API
+│   │   ├── stats_routes.py              # 统计数据 API
+│   │   ├── monitoring_routes.py         # 监控 API
+│   │   ├── auth_routes.py               # 认证 API
+│   │   ├── session_routes.py            # 会话管理 API
+│   │   ├── preference_routes.py         # 偏好管理 API
+│   │   ├── routes.py                    # 路由注册
+│   │   ├── dependencies.py              # 依赖注入
+│   │   └── models.py                    # API 数据模型
+│   │
+│   ├── models/                          # LLM 模型适配器
+│   │   ├── __init__.py
+│   │   ├── factory.py                   # 模型工厂
+│   │   ├── base.py                      # 基础适配器 (含 FlashAttention)
+│   │   ├── vllm_adapter.py              # vLLM 适配器
+│   │   ├── llama_adapter.py             # LLaMA 适配器
+│   │   ├── deepseek_adapter.py          # DeepSeek 适配器
+│   │   └── glm_adapter.py              # GLM 适配器
+│   │
+│   ├── cache/                           # ⭐ 缓存系统
+│   │   ├── __init__.py
+│   │   ├── preference_cache.py          # ⭐ 偏好缓存管理 (L1+L2)
+│   │   ├── redis_client.py              # ⭐ Redis 分布式缓存客户端
+│   │   └── non_vectorized_handler.py    # 动态向量处理 (BM25+Embedding)
+│   │
+│   ├── config/                          # 配置加载
+│   │   ├── __init__.py
+│   │   └── config_loader.py             # YAML 配置加载器
+│   │
+│   ├── database/                        # 数据库
+│   │   ├── __init__.py
+│   │   ├── models.py                    # SQLAlchemy ORM 模型
+│   │   ├── connection.py                # 数据库连接管理
+│   │   └── repository.py               # 数据仓库
+│   │
+│   ├── experiment/                      # 实验系统
+│   │   ├── __init__.py
+│   │   ├── runner.py                    # 实验运行器 (DKI/RAG/Baseline)
+│   │   ├── metrics.py                   # 评估指标 (召回/幻觉/延迟)
+│   │   └── data_generator.py            # 测试数据生成
+│   │
+│   ├── example_app/                     # 示例集成应用
+│   │   ├── __init__.py
+│   │   ├── app.py                       # 示例 FastAPI 应用
+│   │   ├── main.py                      # 示例入口
+│   │   └── service.py                   # 示例业务逻辑
+│   │
+│   └── web/                             # Web 应用
+│       ├── __init__.py
+│       └── app.py                       # FastAPI 主应用
+│
+├── ui/                                  # ⭐ Vue3 示例前端界面
 │   ├── src/
-│   │   ├── views/               # 页面组件
-│   │   ├── components/          # 通用组件
-│   │   ├── stores/              # Pinia 状态管理
-│   │   ├── services/            # API 服务
-│   │   └── types/               # TypeScript 类型
+│   │   ├── App.vue                      # 应用根组件
+│   │   ├── main.ts                      # 入口文件
+│   │   ├── vite-env.d.ts
+│   │   ├── views/                       # 页面组件
+│   │   │   ├── ChatView.vue             # 💬 聊天页面 (Markdown 渲染)
+│   │   │   ├── InjectionVizView.vue     # 📊 注入可视化页面
+│   │   │   ├── PreferencesView.vue      # ⚙️ 偏好管理页面
+│   │   │   ├── SessionsView.vue         # 📋 会话管理页面
+│   │   │   ├── StatsView.vue            # 📈 统计监控页面
+│   │   │   └── LoginView.vue            # 🔐 登录页面
+│   │   ├── components/                  # 通用组件
+│   │   │   ├── ChatInput.vue            # 聊天输入框
+│   │   │   ├── MessageItem.vue          # 消息气泡
+│   │   │   └── SettingsDialog.vue       # 设置弹窗
+│   │   ├── layouts/
+│   │   │   └── MainLayout.vue           # 主布局
+│   │   ├── stores/                      # Pinia 状态管理
+│   │   │   ├── auth.ts                  # 认证状态
+│   │   │   ├── chat.ts                  # 聊天状态
+│   │   │   ├── preferences.ts           # 偏好状态
+│   │   │   ├── settings.ts              # 设置状态
+│   │   │   └── statsAuth.ts             # 统计鉴权状态
+│   │   ├── services/
+│   │   │   └── api.ts                   # API 服务封装
+│   │   ├── router/
+│   │   │   └── index.ts                 # Vue Router 路由
+│   │   ├── config/
+│   │   │   └── index.ts                 # 前端配置
+│   │   ├── types/
+│   │   │   └── index.ts                 # TypeScript 类型定义
+│   │   ├── utils/
+│   │   │   └── markdown.ts              # Markdown 渲染工具
+│   │   └── assets/styles/
+│   │       ├── main.scss                # 主样式
+│   │       └── variables.scss           # 样式变量
+│   ├── index.html
 │   ├── package.json
-│   └── vite.config.ts
-├── docs/
-│   ├── Integration_Guide.md     # 集成指南
-│   └── Dynamic_Vector_Search.md # 动态向量检索说明
-├── tests/
-│   ├── unit/                    # 单元测试
-│   └── integration/             # 集成测试
-├── scripts/
-│   ├── setup.bat/.sh            # 安装脚本
-│   └── start.bat/.sh            # 启动脚本
-├── start_dev.py                 # 开发启动脚本
-├── requirements.txt
-└── README.md
+│   ├── vite.config.ts
+│   ├── tsconfig.json
+│   ├── tsconfig.node.json
+│   ├── env.example
+│   └── README.md
+│
+├── docs/                                # 📚 文档
+│   ├── DKI_Architecture_Diagrams.md     # ⭐ 系统架构图和流程图
+│   ├── DKI_Optimization_Roadmap.md      # ⭐ 后续优化方案与产品化分析
+│   ├── Integration_Guide.md             # 集成指南
+│   ├── Dynamic_Vector_Search.md         # 动态向量检索说明
+│   ├── FlashAttention3_Integration.md   # FlashAttention 集成方案
+│   ├── DKI_用户记忆注入完整系统方案.md    # 记忆注入完整方案
+│   ├── DKI_Plugin_Architecture.md       # 插件架构文档
+│   ├── DKI完整生产级架构设计.md           # 完整生产级架构设计
+│   ├── DKI_Usage_Guide.md              # 使用指南
+│   ├── DKI 定位说明.md                  # DKI 定位说明
+│   ├── DKI演化路径的思考.md              # 演化路径分析
+│   ├── Chat_UI_设计方案.md              # UI 设计方案
+│   ├── 生产系统改造方案.md               # 生产改造方案
+│   └── 系统修正优化建议.md               # 系统修正建议
+│
+├── tests/                               # 🧪 测试
+│   ├── unit/                            # 单元测试
+│   │   ├── test_dki_plugin.py           # DKI 插件测试
+│   │   ├── test_config_driven_adapter.py # 适配器测试
+│   │   ├── test_json_content_extraction.py # JSON 解析测试
+│   │   ├── test_memory_trigger.py       # 记忆触发测试
+│   │   ├── test_reference_resolver.py   # 指代解析测试
+│   │   ├── test_flash_attention.py      # FlashAttention 测试
+│   │   ├── test_redis_cache.py          # Redis 缓存测试
+│   │   ├── components/                  # 组件单元测试
+│   │   │   ├── test_attention_budget.py
+│   │   │   ├── test_dual_factor_gating.py
+│   │   │   ├── test_memory_influence_scaling.py
+│   │   │   ├── test_position_remapper.py
+│   │   │   ├── test_query_conditioned_projection.py
+│   │   │   ├── test_session_kv_cache.py
+│   │   │   └── test_tiered_kv_cache.py
+│   │   ├── core/                        # 核心模块测试
+│   │   │   ├── test_dki_system.py
+│   │   │   ├── test_embedding_service.py
+│   │   │   ├── test_memory_router.py
+│   │   │   └── test_rag_baseline.py
+│   │   └── database/                    # 数据库测试
+│   │       ├── test_connection.py
+│   │       └── test_repository.py
+│   ├── integration/                     # 集成测试
+│   │   ├── test_dki_chat_flow.py
+│   │   ├── test_dki_vs_rag.py
+│   │   ├── test_kv_injection_flow.py
+│   │   └── test_cache_eviction_flow.py
+│   ├── behavior/                        # 行为测试
+│   │   ├── test_budget_enforcement.py
+│   │   ├── test_influence_monotonicity.py
+│   │   └── test_injection_isolation.py
+│   └── fixtures/                        # 测试夹具
+│       ├── fake_attention.py
+│       ├── fake_embeddings.py
+│       ├── fake_model.py
+│       └── sample_memories.py
+│
+├── scripts/                             # 脚本
+│   ├── setup.bat / setup.sh             # 安装脚本
+│   ├── start.bat / start.sh             # 启动脚本
+│   └── init_db.sql                      # 数据库初始化
+│
+├── start_dev.py                         # ⭐ 开发启动脚本 (前后端同时)
+├── main.py                              # ⭐ 主入口 (CLI)
+├── requirements.txt                     # Python 依赖
+├── setup.py                             # 安装配置
+├── QUICKSTART.md                        # 快速开始
+├── README_CN.md                         # 中文文档
+└── README.md                            # 英文文档
 ```
+
+## 📊 项目状态
+
+| 模块                 | 状态      | 说明                              |
+| -------------------- | --------- | --------------------------------- |
+| DKI 核心插件         | ✅ 完成   | K/V 注入、混合策略、门控决策      |
+| Full Attention 策略  | ✅ 完成   | 研究：全 K/V 注入，可配置切换     |
+| 配置驱动适配器       | ✅ 完成   | SQLAlchemy 动态表映射             |
+| JSON 内容提取        | ✅ 完成   | 自动解析 JSON 格式的 content 字段 |
+| Memory Trigger       | ✅ 完成   | 记忆触发检测，可配置规则          |
+| Reference Resolver   | ✅ 完成   | 指代解析，可配置召回轮数          |
+| Redis 分布式缓存     | ✅ 完成   | L1+L2 缓存，多实例部署支持        |
+| FlashAttention 集成  | ✅ 完成   | FA3/FA2 自动检测，优雅降级        |
+| 注入可视化           | ✅ 完成   | 流程图、Token 分布、历史记录      |
+| Vue3 示例 UI         | ✅ 完成   | 聊天、偏好管理、统计、可视化      |
+| 监控 API             | ✅ 完成   | 统计、日志、健康检查              |
+| 架构图文档           | ✅ 完成   | 系统架构图、注入流程图            |
+| 单元测试             | ✅ 完成   | 核心组件测试覆盖                  |
+| 注意力热力图可视化   | 🔄 规划中 | 调试用注意力权重可视化            |
+| LangChain/LlamaIndex | 🔄 规划中 | 生态集成                          |
+| 多模态记忆           | 📋 待定   | 图像/音频记忆支持                 |
 
 ## ⚙️ 配置
 
@@ -627,7 +937,7 @@ results = runner.run_alpha_sensitivity(
 
 > **注意**：DKI 的 token 数量取决于会话复杂度和相关性。偏好注入建议保持短小（50-200 tokens），而历史注入可根据需要扩展至 4000+ tokens。长历史建议启用相关性过滤以优化性能。
 
-这种聚焦的范围是**有意为之**的，它使 DKI 的核心优势得以实现。
+这种聚焦的范围是**刻意设计**的，它使 DKI 的核心优势得以实现。
 
 ### Token 预算分析
 
@@ -1050,31 +1360,36 @@ dki.update_reference_resolver_config(
 
 ### 路线图
 
-**已完成**：
+**已完成** ✅：
 
 -   [x] 核心 DKI 实现 (Attention Hook K/V 注入)
 -   [x] vLLM/LLaMA/DeepSeek/GLM 适配器
 -   [x] 混合注入策略（偏好 K/V + 历史后缀）
+-   [x] Full Attention 策略（研究，全 K/V 注入）
 -   [x] 配置驱动适配器（SQLAlchemy 动态表映射）
+-   [x] JSON 内容解析（支持嵌套 key 提取）
 -   [x] 动态向量处理（BM25 + Embedding 混合搜索）
--   [x] 偏好 K/V 缓存（内存级）
+-   [x] 偏好 K/V 缓存（内存级 L1）
+-   [x] Redis 分布式缓存（L2，可选启用）
+-   [x] FlashAttention-3/2 集成（自动后端检测）
+-   [x] Memory Trigger（记忆触发检测，可配置规则）
+-   [x] Reference Resolver（指代解析器，召回轮数可配置）
+-   [x] 注入可视化（流程图、Token 分布、历史记录）
 -   [x] 监控 API（统计/日志/健康检查）
--   [x] Vue3 示例前端 UI
--   [x] 实验框架
--   [x] Memory Trigger (记忆触发器)
--   [x] Reference Resolver (指代解析器，召回轮数可配置)
+-   [x] Vue3 示例前端 UI（聊天/偏好/统计/可视化）
+-   [x] 实验框架（DKI vs RAG 对比）
+-   [x] 完整单元测试 + 集成测试 + 行为测试
 
-**进行中**：
+**进行中** 🔄：
 
 -   [ ] Stance State Machine (观点状态机)
 -   [ ] 分类器增强 Memory Trigger
 
-**未来工作**：
+**未来工作** 📋：
 
--   [ ] Redis 分布式缓存集成
--   [ ] 注意力可视化工具
+-   [ ] 注意力热力图可视化（调试用注意力权重分布）
 -   [ ] 多模态扩展（图像/音频记忆）
--   [ ] LangChain/LlamaIndex 集成
+-   [ ] LangChain/LlamaIndex 生态集成
 
 ---
 
@@ -1372,6 +1687,8 @@ flash_attention:
 | P2     | 注意力可视化              | 调试和论文展示有价值      |
 | P3     | LangChain/LlamaIndex 集成 | 扩大生态，但非核心功能    |
 | P4     | 多模态扩展                | 技术复杂度高，特定场景    |
+
+> 📋 详细的后续优化方案、产品化价值分析和市场可行性评估，请参阅 [DKI 后续优化方案与产品化分析](docs/DKI_Optimization_Roadmap.md)。
 
 ### Redis 集成的额外价值
 

@@ -93,13 +93,28 @@ DKI operates as an **attention-level plugin** for LLMs, implementing K/V injecti
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Hybrid Injection Strategy
+### Injection Strategy Selection
 
-DKI uses a **layered injection approach** that mirrors human cognition:
+DKI provides two injection strategies, configurable via settings:
+
+| Strategy             | Use Case   | Context Usage | Stability  | Research Value |
+| -------------------- | ---------- | ------------- | ---------- | -------------- |
+| **stable** (default) | Production | Medium        | ⭐⭐⭐⭐⭐ | ⭐⭐           |
+| **full_attention**   | Research   | Minimal       | ⭐⭐⭐     | ⭐⭐⭐⭐⭐     |
+
+```yaml
+# config.yaml
+dki:
+    injection_strategy: "stable" # stable | full_attention
+```
+
+### Hybrid Injection Strategy (Stable)
+
+**Default strategy**, uses a **layered injection approach** that mirrors human cognition:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                    DKI Hybrid Injection Architecture                    │
+│                  DKI Hybrid Injection Architecture (Stable)             │
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                         │
 │  ┌─────────────────────────────────────────────────────────────────┐    │
@@ -126,6 +141,82 @@ DKI uses a **layered injection approach** that mirrors human cognition:
 │  └─────────────────────────────────────────────────────────────────┘    │
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Full Attention Strategy (Research)
+
+**Research strategy**, based on Plan C, both preferences and history injected via K/V:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                   DKI Full Attention Architecture (Research)            │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  Position Layout:                                                       │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │  [History KV]     │  [Preference KV]   │  [Query + Indication] │    │
+│  │  pos: -500~-101   │  pos: -100~-1      │  pos: 0~L             │    │
+│  │  α: 0.3           │  α: 0.4            │  α: 1.0               │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                         │
+│  Characteristics:                                                       │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │  ✅ Minimal context usage (only 3-5 tokens global indication)   │    │
+│  │  ✅ History also via K/V injection, no token budget consumed    │    │
+│  │  ⚠️ Potential OOD risk (requires experimental validation)      │    │
+│  │  ⚠️ History cannot be explicitly cited (implicit influence)    │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                         │
+│  Research Objectives:                                                   │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │  1. Validate feasibility of history K/V injection               │    │
+│  │  2. Compare output quality with Stable strategy                 │    │
+│  │  3. Collect attention pattern data                              │    │
+│  │  4. Explore limits of 0% context usage                          │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**Configuration Example**:
+
+```yaml
+dki:
+    injection_strategy: "full_attention"
+
+    full_attention:
+        enabled: true
+        position_mode: "fixed_negative" # fixed_negative | constant | nope
+
+        preference:
+            position_start: -100
+            alpha: 0.4
+
+        history:
+            position_start: -500
+            alpha: 0.3
+            max_tokens: 400
+
+        global_indication:
+            enabled: true
+            text_en: "[Memory Context Available]"
+            text_cn: "[记忆上下文可用]"
+```
+
+**Runtime Strategy Switching**:
+
+```python
+# Switch to full_attention strategy
+dki.switch_injection_strategy("full_attention")
+
+# Switch back to stable strategy
+dki.switch_injection_strategy("stable")
+
+# Get full_attention statistics
+stats = dki.get_full_attention_stats()
+
+# Get attention pattern logs (for research analysis)
+logs = dki.get_full_attention_logs(limit=50)
 ```
 
 ### Data Flow
@@ -266,12 +357,48 @@ user_adapter:
             content: content
             timestamp: created_at
 
+        # JSON Content Extraction (Important!)
+        # If content field stores JSON strings (e.g., raw AI responses)
+        # specify a JSON key to extract the actual text content
+        #
+        # Scenario: Upstream app stores raw AI response, content might be:
+        #   '{"text": "Restaurant recommendation", "model": "gpt-4", "tokens": 100}'
+        #
+        # With content_json_key: "text", DKI extracts "Restaurant recommendation"
+        # If JSON parsing fails or key not found, uses raw content (safe fallback)
+        content_json_key:
+            null # Set to JSON key name, e.g., "text", "content"
+            # Supports nesting: "data.text", "choices.0.message.content"
+
     # Vector search config (supports dynamic vector processing)
     vector_search:
         type: dynamic # pgvector | faiss | dynamic
         dynamic:
             strategy: hybrid # lazy | batch | hybrid (BM25 + embedding)
 ```
+
+#### JSON Content Extraction
+
+Many applications store raw AI responses in the database, where the `content` field might be a JSON string:
+
+```json
+{
+    "text": "I recommend the Sichuan restaurant",
+    "model": "gpt-4",
+    "tokens": 50,
+    "finish_reason": "stop"
+}
+```
+
+By configuring `content_json_key`, DKI can automatically extract the actual text content:
+
+| Config Value                  | JSON Data                      | Extracted Result     |
+| ----------------------------- | ------------------------------ | -------------------- |
+| `"text"`                      | `{"text": "Hello"}`            | `"Hello"`            |
+| `"data.text"`                 | `{"data": {"text": "Nested"}}` | `"Nested"`           |
+| `"choices.0.message.content"` | OpenAI format response         | Actual reply content |
+
+**Safe Fallback**: If JSON parsing fails or the specified key doesn't exist, DKI uses the raw content without errors.
 
 ### Example Chat UI
 
@@ -326,68 +453,244 @@ REST API endpoints:
 
 ```
 DKI/
-├── config/
-│   ├── config.yaml              # Main configuration
-│   └── adapter_config.example.yaml  # Adapter config example
-├── dki/
-│   ├── core/
-│   │   ├── dki_plugin.py        # ⭐ DKI Plugin Core
-│   │   ├── dki_system.py        # DKI System wrapper
-│   │   ├── memory_router.py     # FAISS-based retrieval
-│   │   ├── embedding_service.py
-│   │   └── components/
-│   │       ├── memory_influence_scaling.py   # MIS component
-│   │       ├── query_conditioned_projection.py  # QCP component
-│   │       ├── dual_factor_gating.py         # Dual-factor gating
-│   │       ├── hybrid_injector.py            # Hybrid injector
-│   │       ├── session_kv_cache.py
-│   │       ├── tiered_kv_cache.py    # L1/L2/L3/L4 memory hierarchy
-│   │       └── position_remapper.py  # Position encoding remapping
-│   ├── adapters/
-│   │   ├── base.py              # Adapter base class
-│   │   └── config_driven_adapter.py  # ⭐ Config-driven adapter
-│   ├── api/
-│   │   └── dki_routes.py        # ⭐ DKI API routes
-│   ├── models/
-│   │   ├── factory.py           # Model factory
-│   │   ├── base.py              # Base adapter
-│   │   ├── vllm_adapter.py
-│   │   ├── llama_adapter.py
-│   │   ├── deepseek_adapter.py
-│   │   └── glm_adapter.py
-│   ├── cache/
-│   │   └── non_vectorized_handler.py  # Dynamic vector processing
-│   ├── database/
-│   │   ├── models.py            # SQLAlchemy models
-│   │   └── connection.py        # DB connection manager
-│   ├── experiment/
-│   │   ├── runner.py            # Experiment runner
-│   │   ├── metrics.py           # Evaluation metrics
-│   │   └── data_generator.py    # Test data generation
-│   └── web/
-│       └── app.py               # FastAPI application
-├── ui/                          # Vue3 Example Frontend UI
+├── config/                              # Configuration files
+│   ├── config.yaml                      # ⭐ Main configuration
+│   ├── adapter_config.example.yaml      # ⭐ Adapter config example
+│   ├── memory_trigger.yaml              # Memory Trigger config
+│   └── reference_resolver.yaml          # Reference Resolver config
+│
+├── dki/                                 # Core code directory
+│   ├── __init__.py
+│   │
+│   ├── core/                            # ⭐ Core modules
+│   │   ├── __init__.py
+│   │   ├── dki_plugin.py                # ⭐ DKI Plugin Core (entry point)
+│   │   ├── dki_system.py                # DKI System wrapper
+│   │   ├── architecture.py              # Architecture definitions
+│   │   ├── plugin_interface.py          # Plugin interface definitions
+│   │   ├── memory_router.py             # FAISS-based vector retrieval
+│   │   ├── embedding_service.py         # Embedding computation service
+│   │   ├── rag_system.py               # RAG baseline (for comparison)
+│   │   │
+│   │   ├── injection/                   # ⭐ Injection strategies
+│   │   │   ├── __init__.py
+│   │   │   └── full_attention_injector.py  # Full Attention strategy (research)
+│   │   │
+│   │   └── components/                  # ⭐ Core algorithm components
+│   │       ├── __init__.py
+│   │       ├── memory_influence_scaling.py    # MIS - Memory Influence Scaling
+│   │       ├── query_conditioned_projection.py  # QCP - Query Conditioned Projection
+│   │       ├── dual_factor_gating.py          # Dual-Factor Gating decision
+│   │       ├── hybrid_injector.py             # Hybrid injector
+│   │       ├── memory_trigger.py              # ⭐ Memory trigger detection
+│   │       ├── reference_resolver.py          # ⭐ Reference resolver
+│   │       ├── attention_budget.py            # Attention budget tracking
+│   │       ├── session_kv_cache.py            # Session-level K/V cache
+│   │       ├── tiered_kv_cache.py             # L1/L2/L3/L4 tiered cache
+│   │       └── position_remapper.py           # Position encoding remapping (RoPE/ALiBi)
+│   │
+│   ├── adapters/                        # ⭐ External data adapters
+│   │   ├── __init__.py
+│   │   ├── base.py                      # Adapter abstract base class
+│   │   ├── config_driven_adapter.py     # ⭐ Config-driven adapter (core)
+│   │   ├── factory.py                   # Adapter factory
+│   │   ├── example_adapter.py           # Example adapter
+│   │   ├── memory_adapter.py            # In-memory adapter
+│   │   ├── postgresql_adapter.py        # PostgreSQL adapter
+│   │   ├── mysql_adapter.py             # MySQL adapter
+│   │   ├── mongodb_adapter.py           # MongoDB adapter
+│   │   ├── redis_adapter.py             # Redis adapter
+│   │   └── rest_adapter.py              # REST API adapter
+│   │
+│   ├── attention/                       # ⭐ FlashAttention integration
+│   │   ├── __init__.py
+│   │   ├── config.py                    # FlashAttention configuration
+│   │   ├── backend.py                   # Backend detection (FA3/FA2/Standard)
+│   │   ├── kv_injection.py              # Optimized K/V injection computation
+│   │   └── profiler.py                  # Performance profiler
+│   │
+│   ├── api/                             # REST API routes
+│   │   ├── __init__.py
+│   │   ├── dki_routes.py                # ⭐ DKI Chat API
+│   │   ├── visualization_routes.py      # ⭐ Injection visualization API
+│   │   ├── stats_routes.py              # Statistics API
+│   │   ├── monitoring_routes.py         # Monitoring API
+│   │   ├── auth_routes.py               # Authentication API
+│   │   ├── session_routes.py            # Session management API
+│   │   ├── preference_routes.py         # Preference management API
+│   │   ├── routes.py                    # Route registration
+│   │   ├── dependencies.py              # Dependency injection
+│   │   └── models.py                    # API data models
+│   │
+│   ├── models/                          # LLM model adapters
+│   │   ├── __init__.py
+│   │   ├── factory.py                   # Model factory
+│   │   ├── base.py                      # Base adapter (with FlashAttention)
+│   │   ├── vllm_adapter.py              # vLLM adapter
+│   │   ├── llama_adapter.py             # LLaMA adapter
+│   │   ├── deepseek_adapter.py          # DeepSeek adapter
+│   │   └── glm_adapter.py              # GLM adapter
+│   │
+│   ├── cache/                           # ⭐ Cache system
+│   │   ├── __init__.py
+│   │   ├── preference_cache.py          # ⭐ Preference cache manager (L1+L2)
+│   │   ├── redis_client.py              # ⭐ Redis distributed cache client
+│   │   └── non_vectorized_handler.py    # Dynamic vector processing (BM25+Embedding)
+│   │
+│   ├── config/                          # Configuration loading
+│   │   ├── __init__.py
+│   │   └── config_loader.py             # YAML config loader
+│   │
+│   ├── database/                        # Database
+│   │   ├── __init__.py
+│   │   ├── models.py                    # SQLAlchemy ORM models
+│   │   ├── connection.py                # Database connection manager
+│   │   └── repository.py               # Data repository
+│   │
+│   ├── experiment/                      # Experiment system
+│   │   ├── __init__.py
+│   │   ├── runner.py                    # Experiment runner (DKI/RAG/Baseline)
+│   │   ├── metrics.py                   # Evaluation metrics (recall/hallucination/latency)
+│   │   └── data_generator.py            # Test data generation
+│   │
+│   ├── example_app/                     # Example integration app
+│   │   ├── __init__.py
+│   │   ├── app.py                       # Example FastAPI app
+│   │   ├── main.py                      # Example entry point
+│   │   └── service.py                   # Example business logic
+│   │
+│   └── web/                             # Web application
+│       ├── __init__.py
+│       └── app.py                       # FastAPI main application
+│
+├── ui/                                  # ⭐ Vue3 Example Frontend UI
 │   ├── src/
-│   │   ├── views/               # Page components
-│   │   ├── components/          # Common components
-│   │   ├── stores/              # Pinia state management
-│   │   ├── services/            # API services
-│   │   └── types/               # TypeScript types
+│   │   ├── App.vue                      # Root component
+│   │   ├── main.ts                      # Entry file
+│   │   ├── vite-env.d.ts
+│   │   ├── views/                       # Page components
+│   │   │   ├── ChatView.vue             # 💬 Chat page (Markdown rendering)
+│   │   │   ├── InjectionVizView.vue     # 📊 Injection visualization
+│   │   │   ├── PreferencesView.vue      # ⚙️ Preferences management
+│   │   │   ├── SessionsView.vue         # 📋 Session management
+│   │   │   ├── StatsView.vue            # 📈 Statistics monitoring
+│   │   │   └── LoginView.vue            # 🔐 Login page
+│   │   ├── components/                  # Common components
+│   │   │   ├── ChatInput.vue            # Chat input box
+│   │   │   ├── MessageItem.vue          # Message bubble
+│   │   │   └── SettingsDialog.vue       # Settings dialog
+│   │   ├── layouts/
+│   │   │   └── MainLayout.vue           # Main layout
+│   │   ├── stores/                      # Pinia state management
+│   │   │   ├── auth.ts                  # Auth state
+│   │   │   ├── chat.ts                  # Chat state
+│   │   │   ├── preferences.ts           # Preferences state
+│   │   │   ├── settings.ts              # Settings state
+│   │   │   └── statsAuth.ts             # Stats auth state
+│   │   ├── services/
+│   │   │   └── api.ts                   # API service wrapper
+│   │   ├── router/
+│   │   │   └── index.ts                 # Vue Router routes
+│   │   ├── config/
+│   │   │   └── index.ts                 # Frontend config
+│   │   ├── types/
+│   │   │   └── index.ts                 # TypeScript type definitions
+│   │   ├── utils/
+│   │   │   └── markdown.ts              # Markdown rendering utility
+│   │   └── assets/styles/
+│   │       ├── main.scss                # Main styles
+│   │       └── variables.scss           # Style variables
+│   ├── index.html
 │   ├── package.json
-│   └── vite.config.ts
-├── docs/
-│   ├── Integration_Guide.md     # Integration guide
-│   └── Dynamic_Vector_Search.md # Dynamic vector search docs
-├── tests/
-│   ├── unit/                    # Unit tests
-│   └── integration/             # Integration tests
-├── scripts/
-│   ├── setup.bat/.sh            # Setup scripts
-│   └── start.bat/.sh            # Start scripts
-├── start_dev.py                 # Development startup script
-├── requirements.txt
-└── README.md
+│   ├── vite.config.ts
+│   ├── tsconfig.json
+│   ├── tsconfig.node.json
+│   ├── env.example
+│   └── README.md
+│
+├── docs/                                # 📚 Documentation
+│   ├── DKI_Architecture_Diagrams.md     # ⭐ Architecture & flow diagrams
+│   ├── DKI_Optimization_Roadmap.md      # ⭐ Optimization plan & productization
+│   ├── Integration_Guide.md             # Integration guide
+│   ├── Dynamic_Vector_Search.md         # Dynamic vector search docs
+│   ├── FlashAttention3_Integration.md   # FlashAttention integration plan
+│   ├── DKI_Plugin_Architecture.md       # Plugin architecture documentation
+│   └── Chat_UI_设计方案.md              # UI design document
+│
+├── tests/                               # 🧪 Tests
+│   ├── unit/                            # Unit tests
+│   │   ├── test_dki_plugin.py           # DKI plugin tests
+│   │   ├── test_config_driven_adapter.py # Adapter tests
+│   │   ├── test_json_content_extraction.py # JSON parsing tests
+│   │   ├── test_memory_trigger.py       # Memory trigger tests
+│   │   ├── test_reference_resolver.py   # Reference resolver tests
+│   │   ├── test_flash_attention.py      # FlashAttention tests
+│   │   ├── test_redis_cache.py          # Redis cache tests
+│   │   ├── components/                  # Component unit tests
+│   │   │   ├── test_attention_budget.py
+│   │   │   ├── test_dual_factor_gating.py
+│   │   │   ├── test_memory_influence_scaling.py
+│   │   │   ├── test_position_remapper.py
+│   │   │   ├── test_query_conditioned_projection.py
+│   │   │   ├── test_session_kv_cache.py
+│   │   │   └── test_tiered_kv_cache.py
+│   │   ├── core/                        # Core module tests
+│   │   │   ├── test_dki_system.py
+│   │   │   ├── test_embedding_service.py
+│   │   │   ├── test_memory_router.py
+│   │   │   └── test_rag_baseline.py
+│   │   └── database/                    # Database tests
+│   │       ├── test_connection.py
+│   │       └── test_repository.py
+│   ├── integration/                     # Integration tests
+│   │   ├── test_dki_chat_flow.py
+│   │   ├── test_dki_vs_rag.py
+│   │   ├── test_kv_injection_flow.py
+│   │   └── test_cache_eviction_flow.py
+│   ├── behavior/                        # Behavior tests
+│   │   ├── test_budget_enforcement.py
+│   │   ├── test_influence_monotonicity.py
+│   │   └── test_injection_isolation.py
+│   └── fixtures/                        # Test fixtures
+│       ├── fake_attention.py
+│       ├── fake_embeddings.py
+│       ├── fake_model.py
+│       └── sample_memories.py
+│
+├── scripts/                             # Scripts
+│   ├── setup.bat / setup.sh             # Setup scripts
+│   ├── start.bat / start.sh             # Start scripts
+│   └── init_db.sql                      # Database initialization
+│
+├── start_dev.py                         # ⭐ Dev startup script (frontend + backend)
+├── main.py                              # ⭐ Main entry point (CLI)
+├── requirements.txt                     # Python dependencies
+├── setup.py                             # Installation config
+├── QUICKSTART.md                        # Quick start guide
+├── README_CN.md                         # Chinese documentation
+└── README.md                            # English documentation
 ```
+
+## 📊 Project Status
+
+| Module                  | Status     | Description                                |
+| ----------------------- | ---------- | ------------------------------------------ |
+| DKI Core Plugin         | ✅ Done    | K/V injection, hybrid strategy, gating     |
+| Full Attention Strategy | ✅ Done    | Research: full K/V injection, configurable |
+| Config-Driven Adapter   | ✅ Done    | SQLAlchemy dynamic table mapping           |
+| JSON Content Extraction | ✅ Done    | Auto-parse JSON content fields             |
+| Memory Trigger          | ✅ Done    | Memory trigger detection, configurable     |
+| Reference Resolver      | ✅ Done    | Reference parsing, configurable recall     |
+| Redis Distributed Cache | ✅ Done    | L1+L2 cache, multi-instance support        |
+| FlashAttention          | ✅ Done    | FA3/FA2 auto-detection, graceful fallback  |
+| Injection Visualization | ✅ Done    | Flow diagram, token distribution, history  |
+| Vue3 Example UI         | ✅ Done    | Chat, preferences, stats, visualization    |
+| Monitoring API          | ✅ Done    | Statistics, logs, health check             |
+| Architecture Diagrams   | ✅ Done    | System architecture & injection flow docs  |
+| Unit Tests              | ✅ Done    | Core component test coverage               |
+| Attention Heatmap       | 🔄 Planned | Debug attention weight visualization       |
+| LangChain/LlamaIndex    | 🔄 Planned | Ecosystem integration                      |
+| Multimodal Memory       | 📋 TBD     | Image/audio memory support                 |
 
 ## ⚙️ Configuration
 
@@ -1290,20 +1593,20 @@ query_engine = index.as_query_engine(
 
 **Core Value**:
 
-| Scenario | Standard | FlashAttention-3 | Improvement |
-| -------- | -------- | ---------------- | ----------- |
-| Preference K/V Compute | ~50ms | ~15ms | **70%↓** |
-| Inference with Injection | ~200ms | ~80ms | **60%↓** |
-| GPU Memory Usage | 24GB | 14GB | **42%↓** |
+| Scenario                 | Standard | FlashAttention-3 | Improvement |
+| ------------------------ | -------- | ---------------- | ----------- |
+| Preference K/V Compute   | ~50ms    | ~15ms            | **70%↓**    |
+| Inference with Injection | ~200ms   | ~80ms            | **60%↓**    |
+| GPU Memory Usage         | 24GB     | 14GB             | **42%↓**    |
 
 **GPU Support Matrix**:
 
-| GPU Type | Backend | Support Status |
-| -------- | ------- | -------------- |
-| H100/H200 | FA3 | ✅ Full support (optimal) |
-| A100 | FA2 | ✅ Supported |
-| RTX 4090 | FA2 | ✅ Supported |
-| V100 | Standard | ⚠️ Fallback to standard |
+| GPU Type  | Backend  | Support Status            |
+| --------- | -------- | ------------------------- |
+| H100/H200 | FA3      | ✅ Full support (optimal) |
+| A100      | FA2      | ✅ Supported              |
+| RTX 4090  | FA2      | ✅ Supported              |
+| V100      | Standard | ⚠️ Fallback to standard   |
 
 **Usage**:
 
@@ -1327,29 +1630,31 @@ stats = model_adapter.get_flash_attn_stats()
 ```yaml
 # config/config.yaml
 flash_attention:
-  enabled: true
-  backend: "auto"  # auto | fa3 | fa2 | standard
-  fa3:
-    use_fp8: false
-    enable_async: true
-  kv_injection:
     enabled: true
-    strategy: "prepend"
-    chunked: true
-    chunk_size: 1024
+    backend: "auto" # auto | fa3 | fa2 | standard
+    fa3:
+        use_fp8: false
+        enable_async: true
+    kv_injection:
+        enabled: true
+        strategy: "prepend"
+        chunked: true
+        chunk_size: 1024
 ```
 
 For detailed documentation, see: [FlashAttention-3 Integration](docs/FlashAttention3_Integration.md)
 
 ### Priority Ranking
 
-| Priority | Optimization Direction           | Reason                                      |
-| -------- | -------------------------------- | ------------------------------------------- |
+| Priority | Optimization Direction           | Reason                                       |
+| -------- | -------------------------------- | -------------------------------------------- |
 | P0       | FlashAttention-3 Integration     | ✅ Implemented, significant performance gain |
 | P1       | Redis Distributed Cache          | ✅ Implemented, essential for multi-instance |
-| P2       | Attention Visualization          | Valuable for debugging and papers           |
-| P3       | LangChain/LlamaIndex Integration | Expand ecosystem, but not core              |
-| P4       | Multi-Modal Extension            | High complexity, specific scenarios         |
+| P2       | Attention Visualization          | Valuable for debugging and papers            |
+| P3       | LangChain/LlamaIndex Integration | Expand ecosystem, but not core               |
+| P4       | Multi-Modal Extension            | High complexity, specific scenarios          |
+
+> 📋 For the detailed optimization roadmap, productization value analysis, and market feasibility assessment, see [DKI Optimization Roadmap & Productization Analysis](docs/DKI_Optimization_Roadmap.md).
 
 ### Additional Value of Redis Integration
 
