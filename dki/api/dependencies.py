@@ -47,10 +47,10 @@ def get_dki_system():
     
     FastAPI dependency for DKI system access.
     """
+    global _dki_system
     if _dki_system is None:
         # Lazy initialization
         from dki.core.dki_system import DKISystem
-        global _dki_system
         _dki_system = DKISystem()
     
     return _dki_system
@@ -62,10 +62,11 @@ def get_user_adapter():
     
     FastAPI dependency for user data access.
     """
+    global _user_adapter
     if _user_adapter is None:
         # Lazy initialization with in-memory adapter
         from dki.adapters import InMemoryUserDataAdapter
-        global _user_adapter
+
         _user_adapter = InMemoryUserDataAdapter()
         logger.warning("Using in-memory adapter (no external adapter configured)")
     
@@ -78,10 +79,11 @@ def get_preference_cache():
     
     FastAPI dependency for preference caching.
     """
+    global _preference_cache
     if _preference_cache is None:
         # Lazy initialization
         from dki.cache import PreferenceCacheManager
-        global _preference_cache
+
         _preference_cache = PreferenceCacheManager()
     
     return _preference_cache
@@ -93,11 +95,12 @@ def get_non_vectorized_handler():
     
     FastAPI dependency for handling non-vectorized data.
     """
+    global _non_vectorized_handler
     if _non_vectorized_handler is None:
         # Lazy initialization
         from dki.cache import NonVectorizedDataHandler
         from dki.core.embedding_service import EmbeddingService
-        global _non_vectorized_handler
+
         embedding_service = EmbeddingService()
         _non_vectorized_handler = NonVectorizedDataHandler(embedding_service)
     
