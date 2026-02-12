@@ -497,19 +497,83 @@ def create_api_router() -> APIRouter:
         tags=["Models"],
         summary="List Available Models",
     )
-    async def list_models():
-        """List available models (OpenAI compatible)."""
+    async def list_models(
+        dki_system=Depends(get_dki_system),
+    ):
+        """
+        List available models (OpenAI compatible).
+        
+        Returns complete model information including:
+        - Model ID and name
+        - Model capabilities
+        - DKI injection support
+        - Context window size
+        """
+        # 获取 DKI 系统信息
+        dki_info = {}
+        model_name = "dki-default"
+        model_description = "DKI Enhanced Model"
+        context_length = 4096
+        
+        if dki_system:
+            try:
+                stats = dki_system.get_stats()
+                dki_info = {
+                    "dki_enabled": True,
+                    "injection_rate": stats.get("injection_rate", 0),
+                    "cache_hit_rate": stats.get("cache_hit_rate", 0),
+                }
+                
+                # 尝试获取底层模型信息
+                if hasattr(dki_system, 'model') and dki_system.model:
+                    model = dki_system.model
+                    if hasattr(model, 'model_name'):
+                        model_name = model.model_name
+                    if hasattr(model, 'config'):
+                        config = model.config
+                        if hasattr(config, 'max_position_embeddings'):
+                            context_length = config.max_position_embeddings
+                        elif hasattr(config, 'max_seq_len'):
+                            context_length = config.max_seq_len
+            except Exception as e:
+                logger.warning(f"Failed to get DKI stats: {e}")
+        
         return {
             "object": "list",
             "data": [
                 {
-                    "id": "dki-default",
+                    "id": model_name,
                     "object": "model",
                     "created": int(time.time()),
-                    "owned_by": "dki",
-                    "permission": [],
-                    "root": "dki-default",
+                    "owned_by": "dki-system",
+                    "permission": [
+                        {
+                            "id": f"modelperm-{model_name}",
+                            "object": "model_permission",
+                            "created": int(time.time()),
+                            "allow_create_engine": False,
+                            "allow_sampling": True,
+                            "allow_logprobs": True,
+                            "allow_search_indices": False,
+                            "allow_view": True,
+                            "allow_fine_tuning": False,
+                            "organization": "*",
+                            "group": None,
+                            "is_blocking": False,
+                        }
+                    ],
+                    "root": model_name,
                     "parent": None,
+                    # 扩展信息
+                    "description": model_description,
+                    "context_length": context_length,
+                    "capabilities": {
+                        "chat_completion": True,
+                        "text_completion": True,
+                        "embeddings": False,
+                        "fine_tuning": False,
+                    },
+                    "dki_info": dki_info,
                 }
             ]
         }

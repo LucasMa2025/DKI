@@ -12,6 +12,8 @@ Author: AGI Demo Project
 Version: 2.0.0
 """
 
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 import uuid
@@ -53,12 +55,13 @@ class DKIChatRequest(BaseModel):
     
     # 高级参数 (可选)
     force_alpha: Optional[float] = Field(None, ge=0, le=1, description="强制 alpha 值")
+    use_hybrid: bool = Field(True, description="是否使用混合注入策略")
 
 
 class DKIMetadataResponse(BaseModel):
     """DKI 元数据响应"""
-    injection_enabled: bool = Field(..., description="是否启用注入")
-    alpha: float = Field(..., description="注入强度")
+    injection_enabled: bool = Field(False, description="是否启用注入")
+    alpha: float = Field(0.0, description="注入强度")
     preference_tokens: int = Field(0, description="偏好 token 数")
     history_tokens: int = Field(0, description="历史 token 数")
     cache_hit: bool = Field(False, description="缓存是否命中")
@@ -76,7 +79,7 @@ class DKIChatResponse(BaseModel):
     output_tokens: int = Field(0, description="输出 token 数")
     
     # DKI 元数据 (用于调试和监控)
-    dki_metadata: DKIMetadataResponse = Field(..., description="DKI 元数据")
+    dki_metadata: DKIMetadataResponse = Field(default_factory=DKIMetadataResponse, description="DKI 元数据")
     
     # 兼容 OpenAI 格式
     choices: List[Dict[str, Any]] = Field(default_factory=list)
@@ -87,16 +90,19 @@ class DKIChatResponse(BaseModel):
 
 # ============ Global State ============
 
-_dki_plugin = None
+_dki_system = None
+_executor = ThreadPoolExecutor(max_workers=4)
 
 
-def set_dki_plugin(plugin):
-    global _dki_plugin
-    _dki_plugin = plugin
+def set_dki_plugin(dki_system):
+    """设置 DKI 系统实例"""
+    global _dki_system
+    _dki_system = dki_system
 
 
 def get_dki_plugin():
-    return _dki_plugin
+    """获取 DKI 系统实例"""
+    return _dki_system
 
 
 # ============ Router ============
@@ -135,47 +141,48 @@ def create_dki_router() -> APIRouter:
         4. DKI 调用 LLM 推理
         5. 返回响应
         """
-        plugin = get_dki_plugin()
+        dki_system = get_dki_plugin()
         
-        if not plugin:
+        if not dki_system:
             raise HTTPException(
                 status_code=503,
-                detail="DKI plugin not initialized. Please check configuration."
+                detail="DKI system not initialized. Please check configuration."
             )
         
         try:
-            # 调用 DKI 插件
-            # 插件会自动:
-            # 1. 通过适配器读取用户偏好
-            # 2. 通过适配器检索相关历史
-            # 3. 执行 K/V 注入
-            # 4. 调用 LLM 推理
-            response = await plugin.chat(
-                query=request.query,  # 原始用户输入
-                user_id=request.user_id,
-                session_id=request.session_id or request.user_id,
-                force_alpha=request.force_alpha,
-                max_new_tokens=request.max_tokens,
-                temperature=request.temperature,
+            # 使用线程池执行同步的 DKI chat 方法
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(
+                _executor,
+                lambda: dki_system.chat(
+                    query=request.query,  # 原始用户输入
+                    session_id=request.session_id or request.user_id,
+                    user_id=request.user_id,
+                    force_alpha=request.force_alpha,
+                    use_hybrid=request.use_hybrid,
+                    max_new_tokens=request.max_tokens,
+                    temperature=request.temperature,
+                )
             )
             
             # 构造响应
-            metadata = response.metadata
+            # 从 DKIResponse 中提取元数据
+            dki_metadata = DKIMetadataResponse(
+                injection_enabled=response.gating_decision.should_inject if response.gating_decision else False,
+                alpha=response.gating_decision.alpha if response.gating_decision else 0.0,
+                preference_tokens=response.metadata.get("hybrid_injection", {}).get("preference_tokens", 0),
+                history_tokens=response.metadata.get("hybrid_injection", {}).get("history_tokens", 0),
+                cache_hit=response.cache_hit,
+                cache_tier=response.cache_tier or "none",
+                latency_ms=response.latency_ms,
+            )
             
             return DKIChatResponse(
                 id=f"dki-{uuid.uuid4().hex[:8]}",
                 text=response.text,
                 input_tokens=response.input_tokens,
                 output_tokens=response.output_tokens,
-                dki_metadata=DKIMetadataResponse(
-                    injection_enabled=metadata.injection_enabled,
-                    alpha=metadata.alpha,
-                    preference_tokens=metadata.preference_tokens,
-                    history_tokens=metadata.history_tokens,
-                    cache_hit=metadata.preference_cache_hit,
-                    cache_tier=metadata.preference_cache_tier,
-                    latency_ms=metadata.latency_ms,
-                ),
+                dki_metadata=dki_metadata,
                 choices=[{
                     "index": 0,
                     "message": {"role": "assistant", "content": response.text},
@@ -195,20 +202,31 @@ def create_dki_router() -> APIRouter:
     )
     async def dki_info():
         """获取 DKI 插件信息"""
-        plugin = get_dki_plugin()
+        dki_system = get_dki_plugin()
         
-        if not plugin:
+        if not dki_system:
             return {
                 "status": "not_initialized",
-                "message": "DKI plugin not initialized",
+                "message": "DKI system not initialized",
             }
         
-        return {
-            "status": "ready",
-            "language": plugin.language,
-            "adapter_type": type(plugin.data_adapter).__name__,
-            "adapter_connected": plugin.data_adapter.is_connected,
-            "stats": plugin.get_stats(),
-        }
+        try:
+            stats = dki_system.get_stats()
+            return {
+                "status": "ready",
+                "version": "2.0.0",
+                "stats": stats,
+                "config": {
+                    "hybrid_injection_enabled": True,
+                    "preference_kv_injection": True,
+                    "history_suffix_injection": True,
+                },
+            }
+        except Exception as e:
+            logger.error(f"DKI info error: {e}")
+            return {
+                "status": "error",
+                "message": str(e),
+            }
     
     return router
