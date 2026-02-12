@@ -35,6 +35,7 @@ from dki.api.session_routes import create_session_router
 from dki.api.preference_routes import create_preference_router
 from dki.api.stats_routes import create_stats_router
 from dki.api.visualization_routes import create_visualization_router
+from dki.api.dki_routes import create_dki_router, set_dki_plugin
 from dki.api.dependencies import init_dependencies, cleanup_dependencies
 from dki.adapters import AdapterFactory, AdapterConfig, AdapterType
 
@@ -147,6 +148,9 @@ def create_app() -> FastAPI:
             user_adapter=adapter,
         )
         
+        # 设置 DKI 插件 (用于 /v1/dki/chat 端点)
+        set_dki_plugin(dki)
+        
         logger.info("DKI System started")
     
     @app.on_event("shutdown")
@@ -178,6 +182,10 @@ def create_app() -> FastAPI:
     # Include visualization routes
     visualization_router = create_visualization_router()
     app.include_router(visualization_router)
+    
+    # Include DKI plugin routes (核心 DKI 聊天 API)
+    dki_router = create_dki_router()
+    app.include_router(dki_router)
     
     # API Routes
     @app.get("/api/health")
