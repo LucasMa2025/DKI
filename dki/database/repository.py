@@ -255,13 +255,27 @@ class ConversationRepository(BaseRepository):
         self,
         session_id: str,
         n_turns: int = 10,
+        limit: Optional[int] = None,
     ) -> List[Conversation]:
-        """Get recent conversation turns."""
+        """
+        Get recent conversation turns.
+        
+        Args:
+            session_id: Session ID
+            n_turns: Number of conversation turns (each turn = user + assistant)
+            limit: Alternative parameter name for n_turns (for compatibility)
+        
+        Returns:
+            List of recent conversations in chronological order
+        """
+        # Support both parameter names for compatibility
+        actual_limit = limit if limit is not None else n_turns * 2
+        
         return (
             self.db.query(Conversation)
             .filter(Conversation.session_id == session_id)
             .order_by(desc(Conversation.created_at))
-            .limit(n_turns * 2)  # Each turn has user + assistant
+            .limit(actual_limit)
             .all()[::-1]  # Reverse to get chronological order
         )
 
