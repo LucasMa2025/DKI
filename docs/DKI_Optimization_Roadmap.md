@@ -60,22 +60,22 @@
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│              Memory Trigger Enhancement                   │
+│              Memory Trigger Enhancement                 │
 ├─────────────────────────────────────────────────────────┤
-│                                                           │
-│  Current (Rule-Based)      Target (Hybrid)                │
-│  ┌───────────────┐         ┌───────────────┐             │
-│  │ Keyword Match │         │ Rule Engine   │──→ Fast     │
-│  │ ↓             │         │ (unchanged)   │   Path      │
-│  │ Trigger Type  │         ├───────────────┤             │
-│  └───────────────┘         │ ML Classifier │──→ Precise  │
-│                            │ (fallback)    │   Path      │
-│  Precision: ~70%           ├───────────────┤             │
-│  Recall: ~60%              │ Confidence    │──→ Final    │
-│                            │ Merger        │   Decision  │
-│                            └───────────────┘             │
-│                            Precision: ~90%               │
-│                            Recall: ~85%                  │
+│                                                         │
+│  Current (Rule-Based)      Target (Hybrid)              │
+│  ┌───────────────┐         ┌───────────────┐            │
+│  │ Keyword Match │         │ Rule Engine   │──→ Fast    │
+│  │ ↓             │         │ (unchanged)   │   Path     │
+│  │ Trigger Type  │         ├───────────────┤            │
+│  └───────────────┘         │ ML Classifier │──→ Precise │
+│                            │ (fallback)    │   Path     │
+│  Precision: ~70%           ├───────────────┤            │
+│  Recall: ~60%              │ Confidence    │──→ Final   │
+│                            │ Merger        │   Decision │
+│                            └───────────────┘            │
+│                            Precision: ~90%              │
+│                            Recall: ~85%                 │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -148,30 +148,30 @@ class DKIPlugin:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                  Stance State Machine                         │
+│                  Stance State Machine                       │
 ├─────────────────────────────────────────────────────────────┤
-│                                                               │
-│  User: "我喜欢辛辣食物"                                       │
-│         ↓ v1.0                                                │
-│  ┌──────────────────────────────────────┐                    │
-│  │ Stance: food_preference              │                    │
-│  │ Value: "spicy"                       │                    │
-│  │ Confidence: 0.8                      │                    │
-│  │ History: [v1.0: "spicy"]             │                    │
-│  └──────────────────────────────────────┘                    │
-│                                                               │
-│  User: "最近在尝试清淡饮食"                                    │
-│         ↓ v2.0 (state change detected)                       │
-│  ┌──────────────────────────────────────┐                    │
-│  │ Stance: food_preference              │                    │
-│  │ Value: "light/mild"                  │                    │
-│  │ Confidence: 0.6 (transitioning)      │                    │
-│  │ History: [v1.0: "spicy",             │                    │
-│  │           v2.0: "light/mild"]        │                    │
-│  └──────────────────────────────────────┘                    │
-│                                                               │
-│  → DKI 注入时考虑演变: "用户原先偏好辛辣，但最近倾向清淡"      │
-│                                                               │
+│                                                             │
+│  User: "我喜欢辛辣食物"                                      │
+│         ↓ v1.0                                              │
+│  ┌──────────────────────────────────────┐                   │
+│  │ Stance: food_preference              │                   │
+│  │ Value: "spicy"                       │                   │
+│  │ Confidence: 0.8                      │                   │
+│  │ History: [v1.0: "spicy"]             │                   │
+│  └──────────────────────────────────────┘                   │
+│                                                             │
+│  User: "最近在尝试清淡饮食"                                   │
+│         ↓ v2.0 (state change detected)                      │
+│  ┌──────────────────────────────────────┐                   │
+│  │ Stance: food_preference              │                   │
+│  │ Value: "light/mild"                  │                   │
+│  │ Confidence: 0.6 (transitioning)      │                   │
+│  │ History: [v1.0: "spicy",             │                   │
+│  │           v2.0: "light/mild"]        │                   │
+│  └──────────────────────────────────────┘                   │
+│                                                             │
+│  → DKI 注入时考虑演变: "用户原先偏好辛辣，但最近倾向清淡"       │
+│                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -296,21 +296,21 @@ query_engine = index.as_query_engine(node_postprocessors=[postprocessor])
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                    DKI Evolution Path                             │
+│                    DKI Evolution Path                           │
 ├─────────────────────────────────────────────────────────────────┤
-│                                                                   │
-│  Stage 1 (Current)          Stage 2                Stage 3        │
+│                                                                 │
+│  Stage 1 (Current)          Stage 2                Stage 3      │
 │  ┌─────────────────┐       ┌─────────────────┐   ┌──────────┐   │
 │  │ Memory Injector │       │ Memory Manager  │   │ Memory   │   │
 │  │                 │       │                 │   │ System   │   │
 │  │ - Read external │  →    │ - Read + Write  │ → │          │   │
-│  │ - Inject only   │       │ - State mgmt   │   │ - Own DB │   │
+│  │ - Inject only   │       │ - State mgmt   │    │ - Own DB │   │
 │  │ - Passive       │       │ - Active recall │   │ - Smart  │   │
 │  └─────────────────┘       └─────────────────┘   │   decay  │   │
-│                                                   │ - Cross  │   │
-│  Plugin for LLM            Enhanced Plugin        │   model  │   │
-│                                                   └──────────┘   │
-│                                                   LLM Component  │
+│                                                  │ - Cross  │   │
+│  Plugin for LLM            Enhanced Plugin       │   model  │   │
+│                                                  └──────────┘   │
+│                                                  LLM Component  │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -335,23 +335,23 @@ query_engine = index.as_query_engine(node_postprocessors=[postprocessor])
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                  DKI vs Existing Solutions                        │
+│                  DKI vs Existing Solutions                      │
 ├─────────────────────────────────────────────────────────────────┤
-│                                                                   │
+│                                                                 │
 │  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐  │
-│  │  RAG + Prompt    │  │  Fine-Tuning     │  │  DKI             │  │
-│  │  (ChatGPT etc.) │  │  (LoRA etc.)     │  │  (This Project) │  │
+│  │  RAG + Prompt   │  │  Fine-Tuning    │  │  DKI            │  │
+│  │  (ChatGPT etc.) │  │  (LoRA etc.)    │  │  (This Project) │  │
 │  ├─────────────────┤  ├─────────────────┤  ├─────────────────┤  │
 │  │ Context: Occupy │  │ Context: None   │  │ Context: Hybrid │  │
 │  │ Latency: +50ms  │  │ Latency: None   │  │ Latency: +15ms* │  │
 │  │ Cost: Token $$  │  │ Cost: Train $$$ │  │ Cost: Cache $   │  │
-│  │ Dynamic: ✅     │  │ Dynamic: ❌     │  │ Dynamic: ✅     │  │
-│  │ Per-user: ❌    │  │ Per-user: ❌    │  │ Per-user: ✅    │  │
+│  │ Dynamic: ✅     │  │ Dynamic: ❌     │  │ Dynamic: ✅    │  │
+│  │ Per-user: ❌    │  │ Per-user: ❌    │  │ Per-user: ✅   │  │
 │  │ Hallucin: High  │  │ Hallucin: Low   │  │ Hallucin: Med   │  │
 │  └─────────────────┘  └─────────────────┘  └─────────────────┘  │
-│                                                                   │
-│  * With FlashAttention + Redis cache                             │
-│                                                                   │
+│                                                                 │
+│  * With FlashAttention + Redis cache                            │
+│                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -408,28 +408,28 @@ DKI 方案:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│              LLM Personalization Market (2024-2028)               │
+│              LLM Personalization Market (2024-2028)             │
 ├─────────────────────────────────────────────────────────────────┤
-│                                                                   │
-│  TAM (Total Addressable Market)                                   │
-│  ├── LLM 应用市场: $150B+ (2028 预测)                             │
-│  │   ├── 需要个性化: ~40% = $60B                                  │
-│  │   │   ├── 个人助手: $15B                                       │
-│  │   │   ├── 客服系统: $12B                                       │
-│  │   │   ├── 教育: $10B                                           │
-│  │   │   ├── 医疗: $8B                                            │
-│  │   │   └── 其他: $15B                                           │
-│  │   │                                                            │
-│  SAM (Serviceable Available Market)                               │
+│                                                                 │
+│  TAM (Total Addressable Market)                                 │
+│  ├── LLM 应用市场: $150B+ (2028 预测)                            │
+│  │   ├── 需要个性化: ~40% = $60B                                 │
+│  │   │   ├── 个人助手: $15B                                      │
+│  │   │   ├── 客服系统: $12B                                      │
+│  │   │   ├── 教育: $10B                                         │
+│  │   │   ├── 医疗: $8B                                          │
+│  │   │   └── 其他: $15B                                         │
+│  │   │                                                          │
+│  SAM (Serviceable Available Market)                             │
 │  ├── 使用 Transformer 架构: ~95% of $60B = $57B                  │
-│  │   ├── 需要用户级记忆: ~30% = $17B                              │
-│  │   │                                                            │
-│  SOM (Serviceable Obtainable Market)                              │
+│  │   ├── 需要用户级记忆: ~30% = $17B                             │
+│  │   │                                                          │
+│  SOM (Serviceable Obtainable Market)                            │
 │  ├── 开源 / 自部署场景: ~20% of $17B = $3.4B                     │
-│  │   ├── 愿意尝试新方案: ~10% = $340M                             │
-│  │                                                                │
+│  │   ├── 愿意尝试新方案: ~10% = $340M                            │
+│  │                                                              │
 │  DKI 早期目标市场: $340M (开源自部署 + 新方案采纳者)               │
-│                                                                   │
+│                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -463,21 +463,21 @@ DKI 方案:
 
 ```
 ┌─────────────────────────────┬─────────────────────────────┐
-│        Strengths (S)        │        Weaknesses (W)        │
+│        Strengths (S)        │        Weaknesses (W)       │
 ├─────────────────────────────┼─────────────────────────────┤
 │ • Attention-level injection │ • Research-stage maturity   │
-│ • Zero context cost (pref) │ • Limited real-world testing│
-│ • Plugin architecture      │ • Small community           │
-│ • Config-driven, no code   │ • Documentation in progress │
-│ • Multi-model compatible   │ • No production deployment  │
+│ • Zero context cost (pref)  │ • Limited real-world testing│
+│ • Plugin architecture       │ • Small community           │
+│ • Config-driven, no code    │ • Documentation in progress │
+│ • Multi-model compatible    │ • No production deployment  │
 ├─────────────────────────────┼─────────────────────────────┤
-│       Opportunities (O)     │         Threats (T)          │
+│       Opportunities (O)     │        Threats (T)          │
 ├─────────────────────────────┼─────────────────────────────┤
-│ • LLM personalization boom │ • Model architecture shift  │
-│ • Privacy regulation trend │ • Big tech competition      │
-│ • Open-source LLM growth   │ • RAG ecosystem maturity    │
-│ • Enterprise customization │ • Insufficient evidence     │
-│   demand                   │ • Changing attention impl.  │
+│ • LLM personalization boom  │ • Model architecture shift  │
+│ • Privacy regulation trend  │ • Big tech competition      │
+│ • Open-source LLM growth    │ • RAG ecosystem maturity    │
+│ • Enterprise customization  │ • Insufficient evidence     │
+│   demand                    │ • Changing attention impl.  │
 └─────────────────────────────┴─────────────────────────────┘
 ```
 
@@ -492,7 +492,7 @@ Phase 1 (0-6月): 开源建设
   - 完善文档和教程
   - 发布标准 Benchmark
   - 建立 GitHub 社区
-  - 发布论文 (arXiv)
+  - 发布论文 (arXiv/techRxiv)
   
 Phase 2 (6-12月): 生态集成
   - LangChain/LlamaIndex 插件
@@ -531,27 +531,6 @@ DKI SDK 产品线:
     ├── 安全审计
     └── 专属技术顾问
 ```
-
-### 路径 3: 被集成/收购
-
-**目标客户**: 
-- LLM 平台 (如 Together AI, Anyscale)
-- AI 应用框架 (如 LangChain, LlamaIndex)
-- 大型科技公司的 AI 团队
-
-**核心价值**: DKI 的 Attention Hook K/V 注入技术可作为差异化特性被集成到更大的平台中。
-
-### 定价参考
-
-| 层级 | 月费 | 包含 | 目标用户 |
-|------|------|------|----------|
-| Free | $0 | 核心引擎 + 社区支持 | 个人开发者 |
-| Pro | $99/月 | Redis + FA3 + 可视化 | 小团队 |
-| Team | $499/月 | 多模型 + 高级适配器 | 中型团队 |
-| Enterprise | 定制 | 全功能 + SLA + 定制 | 大型企业 |
-
----
-
 ## 总结与建议
 
 ### 产品化就绪度评估
@@ -562,13 +541,3 @@ DKI SDK 产品线:
 | 实现完成度 | ⭐⭐⭐ | 核心功能完成，需要实证验证 |
 | 市场需求 | ⭐⭐⭐⭐ | LLM 个性化是明确的市场趋势 |
 | 竞争壁垒 | ⭐⭐⭐ | 技术壁垒存在但需要持续投入 |
-| 商业化路径 | ⭐⭐⭐ | 多路径可选，但需要市场验证 |
-
-### 关键下一步
-
-1. **最高优先级**: 完成多模型实证测试，建立可信的 Benchmark
-2. **高优先级**: 在真实场景中部署验证（至少一个客户案例）
-3. **中优先级**: 发布论文，建立学术影响力
-4. **推荐路径**: 开源社区 + LangChain 生态集成，快速获取用户反馈
-
-**核心判断**: DKI 作为一个 Attention-level 记忆注入系统，技术路径独特且有价值。当前阶段的关键不是功能堆砌，而是**实证验证**——证明 K/V 注入确实比 Prompt 注入带来更好的推理质量和更低的成本。一旦实证数据支持，产品化和商业化路径会变得非常清晰。
