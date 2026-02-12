@@ -154,15 +154,15 @@ dki:
 │                                                                         │
 │  Position Layout:                                                       │
 │  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  [History KV]     │  [Preference KV]   │  [Query + Indication] │    │
-│  │  pos: -500~-101   │  pos: -100~-1      │  pos: 0~L             │    │
-│  │  α: 0.3           │  α: 0.4            │  α: 1.0               │    │
+│  │  [History KV]     │  [Preference KV]   │  [Query + Indication]  │    │
+│  │  pos: -500~-101   │  pos: -100~-1      │  pos: 0~L              │    │
+│  │  α: 0.3           │  α: 0.4            │  α: 1.0                │    │
 │  └─────────────────────────────────────────────────────────────────┘    │
 │                                                                         │
 │  Characteristics:                                                       │
 │  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  ✅ Minimal context usage (only 3-5 tokens global indication)   │    │
-│  │  ✅ History also via K/V injection, no token budget consumed    │    │
+│  │  ✅ Minimal context usage (only 3-5 tokens global indication)  │    │
+│  │  ✅ History also via K/V injection, no token budget consumed   │    │
 │  │  ⚠️ Potential OOD risk (requires experimental validation)      │    │
 │  │  ⚠️ History cannot be explicitly cited (implicit influence)    │    │
 │  └─────────────────────────────────────────────────────────────────┘    │
