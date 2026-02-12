@@ -9,8 +9,11 @@ Usage:
     python start_dev.py              # Start both servers
     python start_dev.py backend      # Start only backend
     python start_dev.py frontend     # Start only frontend
-    python start_dev.py --redis      # Start with Redis enabled
     python start_dev.py --check-redis # Check Redis connection
+
+Note:
+    Redis is automatically enabled/disabled based on config/config.yaml
+    Set redis.enabled: true in config to enable Redis caching.
 
 Architecture:
     ┌─────────────────────────────────────────────────────────┐
@@ -31,12 +34,12 @@ Architecture:
     │  ├── Config-driven adapter reads Chat UI's database    │
     │  ├── Preferences → K/V injection (Attention Hook)      │
     │  ├── History → Suffix prompt                           │
-    │  └── L2 Cache → Redis (optional, for multi-instance)   │
+    │  └── L2 Cache → Redis (auto-enabled via config.yaml)   │
     └─────────────────────────────────────────────────────────┘
 
 Redis Integration:
     - L1 (Memory): Per-instance hot cache, < 1ms
-    - L2 (Redis): Distributed warm cache, 1-5ms
+    - L2 (Redis): Distributed warm cache, 1-5ms (if enabled in config)
     - Without Redis: cache hit rate = 70%/N (N = instances)
     - With Redis: cache hit rate = 70% (constant)
 """
@@ -152,34 +155,32 @@ async def check_redis():
         return False
 
 
-def enable_redis_in_config():
-    """Enable Redis in config.yaml."""
+def get_redis_status():
+    """Get Redis status from config.yaml."""
     import yaml
     
     config_path = ROOT_DIR / "config" / "config.yaml"
     
     if not config_path.exists():
-        print("❌ config.yaml not found")
-        return
+        return "disabled (config not found)"
     
-    with open(config_path, 'r', encoding='utf-8') as f:
-        config_data = yaml.safe_load(f)
-    
-    # Enable Redis
-    if 'redis' not in config_data:
-        config_data['redis'] = {}
-    config_data['redis']['enabled'] = True
-    
-    if 'preference_cache' not in config_data:
-        config_data['preference_cache'] = {}
-    config_data['preference_cache']['l2_enabled'] = True
-    
-    with open(config_path, 'w', encoding='utf-8') as f:
-        yaml.dump(config_data, f, default_flow_style=False, allow_unicode=True)
-    
-    print("✅ Redis enabled in config.yaml")
-    print("   - redis.enabled: true")
-    print("   - preference_cache.l2_enabled: true")
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config_data = yaml.safe_load(f)
+        
+        redis_enabled = config_data.get('redis', {}).get('enabled', False)
+        l2_enabled = config_data.get('preference_cache', {}).get('l2_enabled', False)
+        
+        if redis_enabled and l2_enabled:
+            host = config_data.get('redis', {}).get('host', 'localhost')
+            port = config_data.get('redis', {}).get('port', 6379)
+            return f"enabled ({host}:{port})"
+        elif redis_enabled:
+            return "enabled (L2 cache disabled)"
+        else:
+            return "disabled"
+    except Exception as e:
+        return f"disabled (error: {e})"
 
 
 def main():
@@ -195,9 +196,20 @@ def main():
         asyncio.run(check_redis())
         return
     
-    if "--redis" in args:
-        enable_redis_in_config()
-        args.remove("--redis")
+    if "--help" in args or "-h" in args:
+        print("DKI Development Server")
+        print("")
+        print("Usage:")
+        print("  python start_dev.py              # Start both servers")
+        print("  python start_dev.py backend      # Start only backend")
+        print("  python start_dev.py frontend     # Start only frontend")
+        print("  python start_dev.py --check-redis # Check Redis connection")
+        print("")
+        print("Redis Configuration:")
+        print("  Redis is automatically enabled based on config/config.yaml")
+        print("  Set redis.enabled: true in config to enable Redis caching")
+        print("")
+        return
     
     if args:
         mode = args[0]
@@ -207,18 +219,8 @@ def main():
     print("  Attention-Level User Memory Plugin for LLMs")
     print("=" * 60 + "\n")
     
-    # Check Redis status
-    redis_status = "disabled"
-    try:
-        import yaml
-        config_path = ROOT_DIR / "config" / "config.yaml"
-        if config_path.exists():
-            with open(config_path, 'r', encoding='utf-8') as f:
-                config_data = yaml.safe_load(f)
-            if config_data.get('redis', {}).get('enabled', False):
-                redis_status = "enabled"
-    except Exception:
-        pass
+    # Get Redis status from config
+    redis_status = get_redis_status()
     
     try:
         if mode in ("all", "backend"):
@@ -246,8 +248,8 @@ def main():
         print(f"\n📦 Cache Status:")
         print(f"   - L1 (Memory): enabled")
         print(f"   - L2 (Redis):  {redis_status}")
-        if redis_status == "disabled":
-            print(f"   💡 Enable Redis for multi-instance: python start_dev.py --redis")
+        if "disabled" in redis_status:
+            print(f"   💡 Enable Redis: set redis.enabled: true in config/config.yaml")
         
         print("\n📝 Integration Notes:")
         print("   - Chat UI is an EXAMPLE app demonstrating DKI integration")
