@@ -34,6 +34,7 @@ from dki.api.auth_routes import create_auth_router
 from dki.api.session_routes import create_session_router
 from dki.api.preference_routes import create_preference_router
 from dki.api.stats_routes import create_stats_router
+from dki.api.visualization_routes import create_visualization_router
 from dki.api.dependencies import init_dependencies, cleanup_dependencies
 from dki.adapters import AdapterFactory, AdapterConfig, AdapterType
 
@@ -173,6 +174,10 @@ def create_app() -> FastAPI:
     # Include stats routes
     stats_router = create_stats_router()
     app.include_router(stats_router)
+    
+    # Include visualization routes
+    visualization_router = create_visualization_router()
+    app.include_router(visualization_router)
     
     # API Routes
     @app.get("/api/health")

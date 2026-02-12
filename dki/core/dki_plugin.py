@@ -58,6 +58,12 @@ from dki.cache import (
     RedisConfig,
     REDIS_AVAILABLE,
 )
+from dki.api.visualization_routes import record_visualization
+from dki.core.injection import (
+    FullAttentionInjector,
+    FullAttentionConfig,
+    InjectionResult as FullAttentionResult,
+)
 
 
 @dataclass
@@ -66,6 +72,9 @@ class InjectionMetadata:
     # 注入状态
     injection_enabled: bool = False
     alpha: float = 0.0
+    
+    # 注入策略 (stable | full_attention)
+    injection_strategy: str = "stable"
     
     # Token 统计
     preference_tokens: int = 0
@@ -100,6 +109,10 @@ class InjectionMetadata:
     reference_type: Optional[str] = None
     reference_scope: Optional[str] = None
     
+    # Full Attention 策略特有信息
+    full_attention_fallback: bool = False
+    history_kv_tokens: int = 0
+    
     # 时间戳
     timestamp: datetime = field(default_factory=datetime.utcnow)
     request_id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
@@ -109,10 +122,12 @@ class InjectionMetadata:
             "request_id": self.request_id,
             "timestamp": self.timestamp.isoformat(),
             "injection_enabled": self.injection_enabled,
+            "injection_strategy": self.injection_strategy,
             "alpha": self.alpha,
             "tokens": {
                 "preference": self.preference_tokens,
                 "history": self.history_tokens,
+                "history_kv": self.history_kv_tokens,  # Full Attention 特有
                 "query": self.query_tokens,
                 "total": self.total_tokens,
             },
@@ -140,6 +155,9 @@ class InjectionMetadata:
                 "resolved": self.reference_resolved,
                 "type": self.reference_type,
                 "scope": self.reference_scope,
+            },
+            "full_attention": {
+                "fallback_triggered": self.full_attention_fallback,
             },
         }
 
@@ -286,6 +304,20 @@ Please respond based on the above history and the user's current question.
         self._short_term_history: Dict[str, List[ResolverMessage]] = {}
         self._max_history_per_session = 50
         
+        # ============ 注入策略选择 ============
+        # stable: 偏好 K/V + 历史 Suffix Prompt (默认，生产推荐)
+        # full_attention: 偏好 K/V + 历史 K/V (研究，方案 C)
+        self._injection_strategy = self._get_injection_strategy(config)
+        
+        # Full Attention 注入器 (仅在 full_attention 策略时使用)
+        self._full_attention_injector: Optional[FullAttentionInjector] = None
+        if self._injection_strategy == "full_attention":
+            fa_config = self._get_full_attention_config(config)
+            self._full_attention_injector = FullAttentionInjector(
+                config=fa_config,
+                language=language,
+            )
+        
         # ============ 偏好 K/V 缓存 (支持 Redis 分布式) ============
         # 重要: 多实例部署时启用 Redis 可保持缓存命中率
         # - 没有 Redis: 缓存命中率 = 70%/N (N = 实例数)
@@ -296,6 +328,9 @@ Please respond based on the above history and the user's current question.
             redis_client=redis_client,
             config=self._cache_config,
         )
+        
+        # 偏好 K/V 本地缓存 (用于 _get_preference_kv 的快速查找)
+        self._preference_kv_cache: Dict[str, Tuple[Any, str]] = {}
         
         # 工作日志 (用于监控 API)
         self._injection_logs: List[InjectionMetadata] = []
@@ -319,7 +354,31 @@ Please respond based on the above history and the user's current question.
         elif self._cache_config.l2_enabled:
             cache_status = "L1 + L2 (Redis not connected)"
         
-        logger.info(f"DKI Plugin initialized (language={language}, cache={cache_status})")
+        logger.info(
+            f"DKI Plugin initialized "
+            f"(strategy={self._injection_strategy}, language={language}, cache={cache_status})"
+        )
+    
+    def _get_injection_strategy(self, config: Any) -> str:
+        """获取注入策略"""
+        if config and hasattr(config, 'dki'):
+            return getattr(config.dki, 'injection_strategy', 'stable')
+        if config and isinstance(config, dict):
+            return config.get('dki', {}).get('injection_strategy', 'stable')
+        return 'stable'
+    
+    def _get_full_attention_config(self, config: Any) -> FullAttentionConfig:
+        """获取 Full Attention 配置"""
+        fa_dict = {}
+        
+        if config and hasattr(config, 'dki') and hasattr(config.dki, 'full_attention'):
+            fa_dict = config.dki.full_attention
+        elif config and isinstance(config, dict):
+            fa_dict = config.get('dki', {}).get('full_attention', {})
+        
+        if fa_dict:
+            return FullAttentionConfig.from_dict(fa_dict)
+        return FullAttentionConfig()
     
     @classmethod
     async def from_config(
@@ -386,10 +445,18 @@ Please respond based on the above history and the user's current question.
             ```
         """
         from dki.adapters.config_driven_adapter import ConfigDrivenAdapter
+        import yaml
         
-        # 加载全局配置
+        # 加载全局配置 (原始 YAML dict，用于访问非 pydantic 模型的扩展配置节)
         config_loader = ConfigLoader()
         global_config = config_loader.config
+        
+        # 加载原始配置字典 (memory_trigger, redis 等扩展配置不在 pydantic Config 中)
+        try:
+            with open(config_loader._config_path, 'r', encoding='utf-8') as f:
+                _raw_config = yaml.safe_load(f) or {}
+        except Exception:
+            _raw_config = {}
         
         # 创建配置驱动的适配器
         if adapter_config_path:
@@ -427,8 +494,8 @@ Please respond based on the above history and the user's current question.
                 mt_config = MemoryTriggerConfig(**memory_trigger_config)
             else:
                 mt_config = memory_trigger_config
-        elif global_config.get('memory_trigger'):
-            mt_config = MemoryTriggerConfig.from_dict(global_config['memory_trigger'])
+        elif _raw_config.get('memory_trigger'):
+            mt_config = MemoryTriggerConfig.from_dict(_raw_config['memory_trigger'])
         
         # 处理 Reference Resolver 配置 (支持外置召回轮数)
         rr_config = None
@@ -437,22 +504,22 @@ Please respond based on the above history and the user's current question.
                 rr_config = ReferenceResolverConfig(**reference_resolver_config)
             else:
                 rr_config = reference_resolver_config
-        elif global_config.get('reference_resolver'):
-            rr_config = ReferenceResolverConfig.from_dict(global_config['reference_resolver'])
+        elif _raw_config.get('reference_resolver'):
+            rr_config = ReferenceResolverConfig.from_dict(_raw_config['reference_resolver'])
         
         # ============ 处理 Redis 配置 ============
         redis_client = None
         cache_config = CacheConfig()
         
         # 从全局配置加载缓存配置
-        if global_config.get('preference_cache'):
-            cache_config = CacheConfig.from_dict(global_config['preference_cache'])
+        if _raw_config.get('preference_cache'):
+            cache_config = CacheConfig.from_dict(_raw_config['preference_cache'])
         
         # 确定是否启用 Redis
         should_enable_redis = enable_redis
         if should_enable_redis is None:
             # 从配置文件读取
-            should_enable_redis = global_config.get('redis', {}).get('enabled', False)
+            should_enable_redis = _raw_config.get('redis', {}).get('enabled', False)
         
         if should_enable_redis and REDIS_AVAILABLE:
             # 创建 Redis 配置
@@ -461,8 +528,8 @@ Please respond based on the above history and the user's current question.
                     r_config = RedisConfig.from_dict(redis_config)
                 else:
                     r_config = redis_config
-            elif global_config.get('redis'):
-                r_config = RedisConfig.from_dict(global_config['redis'])
+            elif _raw_config.get('redis'):
+                r_config = RedisConfig.from_dict(_raw_config['redis'])
             else:
                 r_config = RedisConfig(enabled=True)
             
@@ -604,91 +671,51 @@ Please respond based on the above history and the user's current question.
                 f"{len(relevant_history)} relevant history messages"
             )
             
-            # ============ Step 2: DKI 注入处理 ============
+            # ============ Step 2: DKI 注入处理 (策略分支) ============
             injection_start = time.time()
+            metadata.injection_strategy = self._injection_strategy
             
-            # 2.1 处理用户偏好 (K/V 注入，负位置)
-            preference_kv = None
-            preference_alpha = 0.0
-            
-            if preferences:
-                preference_text = self._format_preferences(preferences)
-                preference_kv, cache_hit, cache_tier = await self._get_preference_kv(
+            # 根据策略选择注入方式
+            if self._injection_strategy == "full_attention" and self._full_attention_injector:
+                # ============ Full Attention 策略 (方案 C) ============
+                # 偏好 + 历史均通过 K/V 注入
+                output, metadata = await self._inject_full_attention(
+                    query=query,
                     user_id=user_id,
-                    preference_text=preference_text,
+                    preferences=preferences,
+                    relevant_history=relevant_history,
+                    metadata=metadata,
+                    force_alpha=force_alpha,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    **kwargs,
                 )
-                metadata.preference_cache_hit = cache_hit
-                metadata.preference_cache_tier = cache_tier
-                metadata.preference_tokens = self._estimate_tokens(preference_text)
-                
-                # 偏好使用较低的 alpha (0.3-0.5)
-                preference_alpha = self.config.dki.hybrid_injection.preference.alpha \
-                    if hasattr(self.config.dki, 'hybrid_injection') else 0.4
-            
-            # 2.2 处理历史消息 (后缀提示词，正位置)
-            history_suffix = ""
-            if relevant_history:
-                history_suffix = self._format_history_suffix(relevant_history)
-                metadata.history_tokens = self._estimate_tokens(history_suffix)
-            
-            # 2.3 构造最终输入
-            # 输入 = 用户查询 + 历史后缀 (正位置)
-            # 注入 = 偏好 K/V (负位置)
-            final_input = query
-            if history_suffix:
-                final_input = query + "\n\n" + history_suffix
-            
-            metadata.query_tokens = self._estimate_tokens(query)
-            metadata.total_tokens = metadata.query_tokens + metadata.history_tokens
-            
-            # 2.4 门控决策
-            if force_alpha is not None:
-                alpha = force_alpha
-                metadata.injection_enabled = alpha > 0.1
             else:
-                # 基于偏好和历史决定是否注入
-                should_inject = len(preferences) > 0 or len(relevant_history) > 0
-                alpha = preference_alpha if should_inject else 0.0
-                metadata.injection_enabled = should_inject
-            
-            metadata.alpha = alpha
-            metadata.gating_decision = {
-                "should_inject": metadata.injection_enabled,
-                "alpha": alpha,
-                "preference_alpha": preference_alpha,
-                "has_preferences": len(preferences) > 0,
-                "has_history": len(relevant_history) > 0,
-            }
+                # ============ Stable 策略 (默认) ============
+                # 偏好 K/V + 历史 Suffix Prompt
+                output, metadata = await self._inject_stable(
+                    query=query,
+                    user_id=user_id,
+                    preferences=preferences,
+                    relevant_history=relevant_history,
+                    metadata=metadata,
+                    force_alpha=force_alpha,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    **kwargs,
+                )
             
             metadata.injection_latency_ms = (time.time() - injection_start) * 1000
             
-            # ============ Step 3: LLM 推理 ============
-            inference_start = time.time()
-            
-            if metadata.injection_enabled and preference_kv:
-                # 带 K/V 注入的推理
-                output = self.model.forward_with_kv_injection(
-                    prompt=final_input,
-                    injected_kv=preference_kv,
-                    alpha=alpha,
-                    max_new_tokens=max_new_tokens,
-                    temperature=temperature,
-                    **kwargs,
-                )
-            else:
-                # 普通推理 (无注入或 alpha 太低)
-                output = self.model.generate(
-                    prompt=final_input,
-                    max_new_tokens=max_new_tokens,
-                    temperature=temperature,
-                    **kwargs,
-                )
-            
-            metadata.inference_latency_ms = (time.time() - inference_start) * 1000
-            
-            # ============ Step 4: 记录工作数据 ============
+            # ============ Step 3: 记录工作数据 ============
             metadata.latency_ms = (time.time() - start_time) * 1000
-            self._record_injection_log(metadata)
+            self._record_injection_log(
+                metadata=metadata,
+                query=query,
+                user_id=user_id,
+                session_id=session_id,
+                final_input=query,  # 记录原始查询
+            )
             
             return DKIPluginResponse(
                 text=output.text,
@@ -719,6 +746,223 @@ Please respond based on the above history and the user's current question.
             except Exception as fallback_error:
                 logger.error(f"Fallback generation failed: {fallback_error}")
                 raise
+    
+    async def _inject_stable(
+        self,
+        query: str,
+        user_id: str,
+        preferences: List[AdapterUserPreference],
+        relevant_history: List[AdapterChatMessage],
+        metadata: InjectionMetadata,
+        force_alpha: Optional[float],
+        max_new_tokens: int,
+        temperature: float,
+        **kwargs,
+    ) -> Tuple[ModelOutput, InjectionMetadata]:
+        """
+        Stable 策略注入 (默认)
+        
+        偏好: K/V 注入 (负位置)
+        历史: Suffix Prompt (正位置，占用 Context)
+        """
+        # 2.1 处理用户偏好 (K/V 注入，负位置)
+        preference_kv = None
+        preference_alpha = 0.0
+        
+        if preferences:
+            preference_text = self._format_preferences(preferences)
+            preference_kv, cache_hit, cache_tier = await self._get_preference_kv(
+                user_id=user_id,
+                preference_text=preference_text,
+            )
+            metadata.preference_cache_hit = cache_hit
+            metadata.preference_cache_tier = cache_tier
+            metadata.preference_tokens = self._estimate_tokens(preference_text)
+            
+            # 偏好使用较低的 alpha (0.3-0.5)
+            preference_alpha = self.config.dki.hybrid_injection.preference.alpha \
+                if hasattr(self.config.dki, 'hybrid_injection') else 0.4
+        
+        # 2.2 处理历史消息 (后缀提示词，正位置)
+        history_suffix = ""
+        if relevant_history:
+            history_suffix = self._format_history_suffix(relevant_history)
+            metadata.history_tokens = self._estimate_tokens(history_suffix)
+        
+        # 2.3 构造最终输入
+        # 输入 = 用户查询 + 历史后缀 (正位置)
+        # 注入 = 偏好 K/V (负位置)
+        final_input = query
+        if history_suffix:
+            final_input = query + "\n\n" + history_suffix
+        
+        metadata.query_tokens = self._estimate_tokens(query)
+        metadata.total_tokens = metadata.query_tokens + metadata.history_tokens
+        
+        # 2.4 门控决策
+        if force_alpha is not None:
+            alpha = force_alpha
+            metadata.injection_enabled = alpha > 0.1
+        else:
+            # 基于偏好和历史决定是否注入
+            should_inject = len(preferences) > 0 or len(relevant_history) > 0
+            alpha = preference_alpha if should_inject else 0.0
+            metadata.injection_enabled = should_inject
+        
+        metadata.alpha = alpha
+        metadata.gating_decision = {
+            "should_inject": metadata.injection_enabled,
+            "alpha": alpha,
+            "preference_alpha": preference_alpha,
+            "has_preferences": len(preferences) > 0,
+            "has_history": len(relevant_history) > 0,
+            "strategy": "stable",
+        }
+        
+        # 2.5 LLM 推理
+        inference_start = time.time()
+        
+        if metadata.injection_enabled and preference_kv:
+            # 带 K/V 注入的推理
+            output = self.model.forward_with_kv_injection(
+                prompt=final_input,
+                injected_kv=preference_kv,
+                alpha=alpha,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                **kwargs,
+            )
+        else:
+            # 普通推理 (无注入或 alpha 太低)
+            output = self.model.generate(
+                prompt=final_input,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                **kwargs,
+            )
+        
+        metadata.inference_latency_ms = (time.time() - inference_start) * 1000
+        
+        return output, metadata
+    
+    async def _inject_full_attention(
+        self,
+        query: str,
+        user_id: str,
+        preferences: List[AdapterUserPreference],
+        relevant_history: List[AdapterChatMessage],
+        metadata: InjectionMetadata,
+        force_alpha: Optional[float],
+        max_new_tokens: int,
+        temperature: float,
+        **kwargs,
+    ) -> Tuple[ModelOutput, InjectionMetadata]:
+        """
+        Full Attention 策略注入 (研究 - 方案 C)
+        
+        偏好: K/V 注入 (负位置)
+        历史: K/V 注入 (负位置，NEW!)
+        全局指示: 极简提示 (约 3-5 tokens)
+        
+        目标: 0% Context 占用
+        """
+        # 准备数据
+        preference_text = self._format_preferences(preferences) if preferences else ""
+        history_messages = [
+            {"role": msg.role, "content": msg.content}
+            for msg in relevant_history
+        ] if relevant_history else []
+        
+        # 调用 Full Attention 注入器
+        fa_result = self._full_attention_injector.inject(
+            model_adapter=self.model,
+            preference_text=preference_text,
+            history_messages=history_messages,
+            query=query,
+        )
+        
+        # 检查是否需要 fallback 到 Stable 策略
+        if not fa_result.success or fa_result.fallback_triggered:
+            metadata.full_attention_fallback = True
+            logger.info(
+                f"Full attention fallback to stable: {fa_result.error_message}"
+            )
+            # 回退到 Stable 策略
+            return await self._inject_stable(
+                query=query,
+                user_id=user_id,
+                preferences=preferences,
+                relevant_history=relevant_history,
+                metadata=metadata,
+                force_alpha=force_alpha,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                **kwargs,
+            )
+        
+        # 更新元数据
+        metadata.preference_tokens = fa_result.preference_tokens
+        metadata.history_kv_tokens = fa_result.history_tokens
+        metadata.history_tokens = 0  # Full Attention 不使用 suffix prompt
+        metadata.query_tokens = self._estimate_tokens(query)
+        metadata.total_tokens = metadata.query_tokens + len(fa_result.global_indication.split())
+        
+        # 构造最终输入 (仅包含全局指示 + 查询)
+        final_input = query
+        if fa_result.global_indication:
+            final_input = fa_result.global_indication + "\n" + query
+        
+        # 门控决策
+        if force_alpha is not None:
+            alpha = force_alpha
+        else:
+            # Full Attention 使用配置的 alpha
+            alpha = self._full_attention_injector.config.preference_alpha
+        
+        metadata.injection_enabled = fa_result.merged_kv is not None
+        metadata.alpha = alpha
+        metadata.gating_decision = {
+            "should_inject": metadata.injection_enabled,
+            "alpha": alpha,
+            "preference_alpha": self._full_attention_injector.config.preference_alpha,
+            "history_alpha": self._full_attention_injector.config.history_alpha,
+            "has_preferences": fa_result.preference_tokens > 0,
+            "has_history": fa_result.history_tokens > 0,
+            "strategy": "full_attention",
+            "position_mode": fa_result.position_mode,
+        }
+        
+        # LLM 推理
+        inference_start = time.time()
+        
+        if metadata.injection_enabled and fa_result.merged_kv:
+            # 带合并 K/V 注入的推理
+            output = self.model.forward_with_kv_injection(
+                prompt=final_input,
+                injected_kv=fa_result.merged_kv,
+                alpha=alpha,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                **kwargs,
+            )
+        else:
+            # 普通推理
+            output = self.model.generate(
+                prompt=final_input,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                **kwargs,
+            )
+        
+        metadata.inference_latency_ms = (time.time() - inference_start) * 1000
+        
+        logger.debug(
+            f"Full attention injection completed: "
+            f"pref_kv={fa_result.preference_tokens}, hist_kv={fa_result.history_tokens}, "
+            f"context={metadata.total_tokens} tokens"
+        )
+        
+        return output, metadata
     
     def _format_preferences(self, preferences: List[AdapterUserPreference]) -> str:
         """格式化用户偏好为文本"""
@@ -792,8 +1036,15 @@ Please respond based on the above history and the user's current question.
         # 粗略估算: 1.3 tokens per word
         return int(len(text.split()) * 1.3)
     
-    def _record_injection_log(self, metadata: InjectionMetadata):
-        """记录注入日志 (用于监控)"""
+    def _record_injection_log(
+        self,
+        metadata: InjectionMetadata,
+        query: str = "",
+        user_id: str = "",
+        session_id: str = "",
+        final_input: str = "",
+    ):
+        """记录注入日志 (用于监控和可视化)"""
         self._injection_logs.append(metadata)
         
         # 限制日志数量
@@ -815,6 +1066,37 @@ Please respond based on the above history and the user's current question.
                 if log.injection_enabled
             )
             self._stats["avg_alpha"] = total_alpha / self._stats["injection_enabled_count"]
+        
+        # 记录可视化数据
+        try:
+            record_visualization({
+                "request_id": metadata.request_id,
+                "timestamp": metadata.timestamp.isoformat(),
+                "query": query,
+                "user_id": user_id,
+                "session_id": session_id,
+                "injection_enabled": metadata.injection_enabled,
+                "alpha": metadata.alpha,
+                "preference_tokens": metadata.preference_tokens,
+                "history_tokens": metadata.history_tokens,
+                "query_tokens": metadata.query_tokens,
+                "total_tokens": metadata.total_tokens,
+                "cache_hit": metadata.preference_cache_hit,
+                "cache_tier": metadata.preference_cache_tier,
+                "latency_ms": metadata.latency_ms,
+                "adapter_latency_ms": metadata.adapter_latency_ms,
+                "injection_latency_ms": metadata.injection_latency_ms,
+                "inference_latency_ms": metadata.inference_latency_ms,
+                "preferences_count": metadata.preferences_count,
+                "relevant_history_count": metadata.relevant_history_count,
+                "memory_triggered": metadata.memory_triggered,
+                "trigger_type": metadata.trigger_type,
+                "reference_resolved": metadata.reference_resolved,
+                "reference_type": metadata.reference_type,
+                "final_input": final_input,
+            })
+        except Exception as e:
+            logger.debug(f"Failed to record visualization: {e}")
     
     def get_stats(self) -> Dict[str, Any]:
         """获取统计数据 (用于监控 API)"""
@@ -928,10 +1210,90 @@ Please respond based on the above history and the user's current question.
     
     def get_component_configs(self) -> Dict[str, Any]:
         """获取所有组件的当前配置"""
-        return {
+        configs = {
             "memory_trigger": self._memory_trigger.get_stats(),
             "reference_resolver": self._reference_resolver.get_stats(),
+            "injection_strategy": self._injection_strategy,
         }
+        
+        # 添加 Full Attention 配置 (如果启用)
+        if self._full_attention_injector:
+            configs["full_attention"] = self._full_attention_injector.get_stats()
+        
+        return configs
+    
+    def switch_injection_strategy(self, strategy: str) -> bool:
+        """
+        运行时切换注入策略
+        
+        Args:
+            strategy: "stable" | "full_attention"
+            
+        Returns:
+            是否切换成功
+        """
+        if strategy not in ("stable", "full_attention"):
+            logger.error(f"Invalid injection strategy: {strategy}")
+            return False
+        
+        old_strategy = self._injection_strategy
+        self._injection_strategy = strategy
+        
+        # 如果切换到 full_attention 但注入器未初始化，则初始化
+        if strategy == "full_attention" and not self._full_attention_injector:
+            fa_config = self._get_full_attention_config(self.config)
+            self._full_attention_injector = FullAttentionInjector(
+                config=fa_config,
+                language=self.language,
+            )
+        
+        logger.info(f"Injection strategy switched: {old_strategy} -> {strategy}")
+        return True
+    
+    def get_full_attention_stats(self) -> Optional[Dict[str, Any]]:
+        """
+        获取 Full Attention 注入器统计
+        
+        Returns:
+            统计数据，如果未启用则返回 None
+        """
+        if self._full_attention_injector:
+            return self._full_attention_injector.get_stats()
+        return None
+    
+    def get_full_attention_logs(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """
+        获取 Full Attention attention pattern 日志
+        
+        用于研究分析
+        """
+        if self._full_attention_injector:
+            return self._full_attention_injector.get_attention_logs(limit)
+        return []
+    
+    def update_full_attention_config(
+        self,
+        position_mode: Optional[str] = None,
+        preference_alpha: Optional[float] = None,
+        history_alpha: Optional[float] = None,
+        history_position_start: Optional[int] = None,
+        max_total_kv_tokens: Optional[int] = None,
+    ):
+        """
+        运行时更新 Full Attention 配置
+        
+        用于研究实验调参
+        """
+        if self._full_attention_injector:
+            self._full_attention_injector.update_config(
+                position_mode=position_mode,
+                preference_alpha=preference_alpha,
+                history_alpha=history_alpha,
+                history_position_start=history_position_start,
+                max_total_kv_tokens=max_total_kv_tokens,
+            )
+        else:
+            logger.warning("Full attention injector not initialized")
     
     async def close(self):
         """

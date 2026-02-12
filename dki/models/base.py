@@ -1,15 +1,20 @@
 """
 Base Model Adapter for DKI System
 Abstract base class for all model adapters
+
+Supports FlashAttention-3/2 integration for optimized K/V injection
 """
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union, TYPE_CHECKING
 
 import torch
 import numpy as np
 from loguru import logger
+
+if TYPE_CHECKING:
+    from dki.attention import FlashAttentionConfig, KVInjectionOptimizer
 
 
 @dataclass
@@ -79,6 +84,8 @@ class BaseModelAdapter(ABC):
     Abstract base class for model adapters.
     
     All model engines (vLLM, LLaMA, DeepSeek, GLM) must implement this interface.
+    
+    Supports FlashAttention-3/2 integration for optimized K/V injection.
     """
     
     def __init__(
@@ -100,6 +107,11 @@ class BaseModelAdapter(ABC):
         self.num_layers: int = 0
         self.num_heads: int = 0
         self.head_dim: int = 0
+        
+        # FlashAttention support
+        self._flash_attn_config: Optional["FlashAttentionConfig"] = None
+        self._flash_attn_backend: Optional[str] = None
+        self._kv_injection_optimizer: Optional["KVInjectionOptimizer"] = None
         
         logger.info(f"Initializing {self.__class__.__name__} with {model_name}")
     
@@ -231,7 +243,82 @@ class BaseModelAdapter(ABC):
             'num_heads': self.num_heads,
             'head_dim': self.head_dim,
             'is_loaded': self._is_loaded,
+            'flash_attn_enabled': self._flash_attn_backend is not None,
+            'flash_attn_backend': self._flash_attn_backend,
+        }
+    
+    # ============ FlashAttention Support ============
+    
+    def enable_flash_attention(
+        self,
+        config: Optional["FlashAttentionConfig"] = None,
+    ) -> str:
+        """
+        Enable FlashAttention optimization.
+        
+        Args:
+            config: FlashAttention configuration (optional)
+            
+        Returns:
+            Selected backend name ("fa3" | "fa2" | "standard")
+        """
+        from dki.attention import (
+            FlashAttentionConfig,
+            FlashAttentionBackend,
+            KVInjectionOptimizer,
+        )
+        
+        self._flash_attn_config = config or FlashAttentionConfig()
+        
+        # Detect best backend
+        if self._flash_attn_config.backend == "auto":
+            self._flash_attn_backend = FlashAttentionBackend.detect_best_backend()
+        else:
+            self._flash_attn_backend = FlashAttentionBackend.validate_backend(
+                self._flash_attn_config.backend
+            )
+        
+        # Create K/V injection optimizer
+        self._kv_injection_optimizer = KVInjectionOptimizer(
+            config=self._flash_attn_config,
+            backend=self._flash_attn_backend,
+        )
+        
+        logger.info(
+            f"FlashAttention enabled: backend={self._flash_attn_backend}, "
+            f"model={self.model_name}"
+        )
+        
+        return self._flash_attn_backend
+    
+    def disable_flash_attention(self):
+        """Disable FlashAttention optimization."""
+        self._flash_attn_config = None
+        self._flash_attn_backend = None
+        self._kv_injection_optimizer = None
+        logger.info(f"FlashAttention disabled for {self.model_name}")
+    
+    @property
+    def flash_attn_enabled(self) -> bool:
+        """Check if FlashAttention is enabled."""
+        return self._flash_attn_backend is not None
+    
+    @property
+    def flash_attn_backend(self) -> Optional[str]:
+        """Get current FlashAttention backend."""
+        return self._flash_attn_backend
+    
+    def get_flash_attn_stats(self) -> Dict[str, Any]:
+        """Get FlashAttention statistics."""
+        if self._kv_injection_optimizer is None:
+            return {"enabled": False}
+        
+        return {
+            "enabled": True,
+            "backend": self._flash_attn_backend,
+            **self._kv_injection_optimizer.get_stats(),
         }
     
     def __repr__(self) -> str:
-        return f"{self.__class__.__name__}(model={self.model_name}, device={self.device})"
+        fa_info = f", flash_attn={self._flash_attn_backend}" if self._flash_attn_backend else ""
+        return f"{self.__class__.__name__}(model={self.model_name}, device={self.device}{fa_info})"

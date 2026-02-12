@@ -171,6 +171,9 @@ class TableMapping:
     # 排序字段
     order_by: Optional[str] = None
     order_desc: bool = True
+    # JSON 内容解析 key (用于从 JSON 字符串中提取实际内容)
+    # 支持嵌套 key，如 "text", "data.text", "choices.0.text"
+    content_json_key: Optional[str] = None
 
 
 @dataclass
@@ -225,9 +228,75 @@ class ConfigDrivenAdapterConfig:
     
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ConfigDrivenAdapterConfig":
-        """从字典创建配置"""
+        """
+        从字典创建配置
+        
+        支持两种格式:
+        1. 完整格式 (adapter_config.yaml): 包含 database, preferences, messages 等嵌套结构
+        2. 简化格式 (config.yaml 中的 user_adapter): 扁平化结构
+        """
         config = cls()
         
+        # 检测配置格式
+        is_simplified = "type" in data and "database" not in data
+        
+        if is_simplified:
+            # 简化格式 (从主配置文件 config.yaml)
+            db_type = data.get("type", "postgresql")
+            if db_type == "memory":
+                # 内存模式，不需要数据库连接
+                logger.info("Using memory adapter mode")
+                return config
+            
+            config.database = DatabaseConfig(
+                type=DatabaseType(db_type),
+                host=data.get("host", "localhost"),
+                port=data.get("port", 5432),
+                database=data.get("database", ""),
+                username=data.get("username", ""),
+                password=data.get("password", ""),
+                pool_size=data.get("pool_size", 5),
+            )
+            
+            # 简化格式的表映射
+            config.preferences = TableMapping(
+                table=data.get("preferences_table", "user_preferences"),
+                fields={
+                    "user_id": "user_id",
+                    "preference_id": "id",
+                    "preference_text": "content",
+                    "preference_type": "type",
+                },
+                content_json_key=data.get("preferences_content_json_key"),
+            )
+            
+            config.messages = TableMapping(
+                table=data.get("messages_table", "messages"),
+                fields={
+                    "message_id": "id",
+                    "session_id": "session_id",
+                    "user_id": "user_id",
+                    "role": "role",
+                    "content": "content",
+                    "timestamp": "created_at",
+                },
+                content_json_key=data.get("messages_content_json_key"),
+            )
+            
+            config.users = TableMapping(
+                table=data.get("users_table", "users"),
+                fields={
+                    "user_id": "id",
+                    "username": "username",
+                },
+            )
+            
+            config.cache_enabled = data.get("enable_cache", True)
+            config.cache_ttl = data.get("cache_ttl", 300)
+            
+            return config
+        
+        # 完整格式 (adapter_config.yaml)
         # 数据库配置
         if "database" in data:
             db_data = data["database"]
@@ -251,6 +320,7 @@ class ConfigDrivenAdapterConfig:
                 filters=pref_data.get("filters", {}),
                 order_by=pref_data.get("order_by"),
                 order_desc=pref_data.get("order_desc", True),
+                content_json_key=pref_data.get("content_json_key"),
             )
         
         # 消息表映射
@@ -262,6 +332,7 @@ class ConfigDrivenAdapterConfig:
                 filters=msg_data.get("filters", {}),
                 order_by=msg_data.get("order_by", "timestamp"),
                 order_desc=msg_data.get("order_desc", True),
+                content_json_key=msg_data.get("content_json_key"),
             )
         
         # 用户表映射
@@ -916,16 +987,91 @@ class ConfigDrivenAdapter(IUserDataAdapter):
             logger.error(f"Health check failed: {e}")
             return False
     
+    # ============ JSON 解析方法 ============
+    
+    def _extract_json_content(self, raw_content: str, json_key: Optional[str]) -> str:
+        """
+        从 JSON 字符串中提取实际内容
+        
+        场景: 上层应用直接存储 AI 原始响应，content 字段可能是 JSON 字符串
+        例如: '{"text": "推荐川菜馆", "model": "gpt-4", "tokens": 100}'
+        
+        Args:
+            raw_content: 原始内容 (可能是 JSON 字符串，也可能是普通文本)
+            json_key: JSON key 路径，支持嵌套 (如 "text", "data.text", "choices.0.text")
+            
+        Returns:
+            提取后的文本内容，如果解析失败则返回原始内容
+        """
+        if not json_key:
+            return raw_content
+        
+        if not raw_content:
+            return raw_content
+        
+        # 尝试解析 JSON
+        try:
+            import json
+            data = json.loads(raw_content)
+            
+            # 支持嵌套 key，如 "data.text" 或 "choices.0.text"
+            keys = json_key.split(".")
+            value = data
+            
+            for key in keys:
+                if isinstance(value, dict):
+                    value = value.get(key)
+                elif isinstance(value, list):
+                    # 支持数组索引，如 "choices.0.text"
+                    try:
+                        index = int(key)
+                        value = value[index] if 0 <= index < len(value) else None
+                    except ValueError:
+                        value = None
+                else:
+                    value = None
+                
+                if value is None:
+                    # key 不存在，返回原始内容
+                    logger.debug(
+                        f"JSON key '{json_key}' not found in content, using raw content"
+                    )
+                    return raw_content
+            
+            # 确保返回字符串
+            if isinstance(value, str):
+                return value
+            elif value is not None:
+                # 如果提取的值不是字符串，转换为字符串
+                return str(value)
+            else:
+                return raw_content
+                
+        except json.JSONDecodeError:
+            # 不是有效的 JSON，返回原始内容
+            # 这是正常情况，不需要警告
+            return raw_content
+        except Exception as e:
+            # 其他错误，返回原始内容
+            logger.debug(f"Failed to extract JSON content: {e}, using raw content")
+            return raw_content
+    
     # ============ 数据转换方法 ============
     
     def _row_to_preference(self, row, mapping: TableMapping) -> UserPreference:
         """将数据库行转换为 UserPreference"""
         row_dict = dict(row._mapping) if hasattr(row, '_mapping') else dict(row)
         
+        # 获取原始 preference_text
+        raw_text = row_dict.get(self._get_field(mapping, "preference_text"), "")
+        
+        # 如果配置了 content_json_key，尝试从 JSON 中提取实际内容
+        preference_text = self._extract_json_content(raw_text, mapping.content_json_key)
+        
         return UserPreference(
             user_id=row_dict.get(self._get_field(mapping, "user_id"), ""),
             preference_id=str(row_dict.get(self._get_field(mapping, "preference_id"), "")),
-            preference_text=row_dict.get(self._get_field(mapping, "preference_text"), ""),
+            preference_text=preference_text,
             preference_type=row_dict.get(self._get_field(mapping, "preference_type"), "general"),
             priority=row_dict.get(self._get_field(mapping, "priority"), 0),
             created_at=row_dict.get(self._get_field(mapping, "created_at")),
@@ -936,12 +1082,19 @@ class ConfigDrivenAdapter(IUserDataAdapter):
         """将数据库行转换为 ChatMessage"""
         row_dict = dict(row._mapping) if hasattr(row, '_mapping') else dict(row)
         
+        # 获取原始 content
+        raw_content = row_dict.get(self._get_field(mapping, "content"), "")
+        
+        # 如果配置了 content_json_key，尝试从 JSON 中提取实际内容
+        # 这处理了上层应用直接存储 AI 原始响应的场景
+        content = self._extract_json_content(raw_content, mapping.content_json_key)
+        
         return ChatMessage(
             message_id=str(row_dict.get(self._get_field(mapping, "message_id"), "")),
             session_id=str(row_dict.get(self._get_field(mapping, "session_id"), "")),
             user_id=row_dict.get(self._get_field(mapping, "user_id"), ""),
             role=row_dict.get(self._get_field(mapping, "role"), "user"),
-            content=row_dict.get(self._get_field(mapping, "content"), ""),
+            content=content,
             timestamp=row_dict.get(self._get_field(mapping, "timestamp"), datetime.utcnow()),
             embedding=row_dict.get(self._get_field(mapping, "embedding")),
         )
