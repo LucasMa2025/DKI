@@ -18,12 +18,12 @@
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                    DKI System Completeness                       │
+│                    DKI System Completeness                      │
 ├──────────────────────────┬──────────┬───────────────────────────┤
 │ Module                   │ Status   │ Maturity                  │
 ├──────────────────────────┼──────────┼───────────────────────────┤
-│ Core K/V Injection       │ ✅ Done  │ ████████░░ 80%  (Research)│
-│ Hybrid Injection         │ ✅ Done  │ ████████░░ 80%  (Research)│
+│ Core K/V Injection       │ ✅ Done  │ ████████░░ 80% (Research)│
+│ Hybrid Injection         │ ✅ Done  │ ████████░░ 80% (Research)│
 │ Full Attention Strategy  │ ✅ Done  │ ██████░░░░ 60%  (PoC)    │
 │ Config-Driven Adapter    │ ✅ Done  │ ████████░░ 80%  (Beta)   │
 │ Memory Trigger           │ ✅ Done  │ ██████░░░░ 60%  (Basic)  │
@@ -541,3 +541,4 @@ DKI SDK 产品线:
 | 实现完成度 | ⭐⭐⭐ | 核心功能完成，需要实证验证 |
 | 市场需求 | ⭐⭐⭐⭐ | LLM 个性化是明确的市场趋势 |
 | 竞争壁垒 | ⭐⭐⭐ | 技术壁垒存在但需要持续投入 |
+
