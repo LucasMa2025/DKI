@@ -321,9 +321,18 @@ class PreferenceCacheManager:
         preference_hash = self._compute_preference_hash(preference_text)
         cache_key = self._make_cache_key(user_id, preference_hash)
         
-        # Skip cache if forced
+        # Recompute if forced (also updates cache with fresh data)
         if force_recompute:
             kv_entries = await self._compute_kv(preference_text, model)
+            
+            # Store recomputed data in caches so subsequent requests get fresh data
+            await self._store_in_caches(
+                cache_key=cache_key,
+                kv_entries=kv_entries,
+                preference_hash=preference_hash,
+            )
+            
+            self._stats["l3_computes"] += 1
             latency_ms = (time.time() - start_time) * 1000
             
             return kv_entries, CacheTierInfo(
@@ -523,15 +532,21 @@ class PreferenceCacheManager:
         """Serialize K/V entries for storage."""
         try:
             import zlib
+            import numpy as np
             
             # Convert to CPU and serialize
             serializable = []
             for entry in kv_entries:
+                key_np = entry.key.cpu().numpy()
+                value_np = entry.value.cpu().numpy()
                 serializable.append({
-                    'key': entry.key.cpu().numpy().tobytes(),
-                    'value': entry.value.cpu().numpy().tobytes(),
+                    'key': key_np.tobytes(),
+                    'value': value_np.tobytes(),
                     'layer_idx': entry.layer_idx,
-                    'shape': list(entry.key.shape),
+                    'key_shape': list(key_np.shape),
+                    'value_shape': list(value_np.shape),
+                    'key_dtype': str(key_np.dtype),
+                    'value_dtype': str(value_np.dtype),
                 })
             
             data = pickle.dumps(serializable)
@@ -559,12 +574,18 @@ class PreferenceCacheManager:
             
             kv_entries = []
             for item in serializable:
-                shape = tuple(item['shape'])
+                # Support both old format (single 'shape'+'dtype') and
+                # new format (separate key_shape/value_shape/key_dtype/value_dtype)
+                key_shape = tuple(item.get('key_shape', item.get('shape', ())))
+                value_shape = tuple(item.get('value_shape', item.get('shape', ())))
+                key_dtype = np.dtype(item.get('key_dtype', 'float16'))
+                value_dtype = np.dtype(item.get('value_dtype', 'float16'))
+                
                 key = torch.from_numpy(
-                    np.frombuffer(item['key'], dtype=np.float16).reshape(shape)
+                    np.frombuffer(item['key'], dtype=key_dtype).reshape(key_shape).copy()
                 )
                 value = torch.from_numpy(
-                    np.frombuffer(item['value'], dtype=np.float16).reshape(shape)
+                    np.frombuffer(item['value'], dtype=value_dtype).reshape(value_shape).copy()
                 )
                 
                 kv_entries.append(KVCacheEntry(

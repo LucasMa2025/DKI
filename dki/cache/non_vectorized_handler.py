@@ -12,6 +12,7 @@ Version: 1.0.0
 """
 
 import asyncio
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -63,7 +64,7 @@ class SearchResult:
 
 class EmbeddingCache:
     """
-    Simple embedding cache with LRU eviction.
+    Embedding cache with LRU eviction using OrderedDict for O(1) operations.
     
     Key: message_id or content_hash
     Value: embedding vector
@@ -71,17 +72,15 @@ class EmbeddingCache:
     
     def __init__(self, max_size: int = 100000):
         self.max_size = max_size
-        self._cache: Dict[str, List[float]] = {}
-        self._access_order: List[str] = []
+        self._cache: OrderedDict[str, List[float]] = OrderedDict()
         self._lock = asyncio.Lock()
     
     async def get(self, key: str) -> Optional[List[float]]:
         """Get embedding from cache."""
         async with self._lock:
             if key in self._cache:
-                # Update access order
-                self._access_order.remove(key)
-                self._access_order.append(key)
+                # Move to end (most recently used) - O(1)
+                self._cache.move_to_end(key)
                 return self._cache[key]
             return None
     
@@ -89,17 +88,13 @@ class EmbeddingCache:
         """Put embedding in cache."""
         async with self._lock:
             if key in self._cache:
-                # Update existing
-                self._access_order.remove(key)
-                self._access_order.append(key)
+                # Update existing, move to end - O(1)
+                self._cache.move_to_end(key)
             else:
                 # Add new
                 if len(self._cache) >= self.max_size:
-                    # Evict oldest
-                    oldest_key = self._access_order.pop(0)
-                    del self._cache[oldest_key]
-                
-                self._access_order.append(key)
+                    # Evict oldest (first item) - O(1)
+                    self._cache.popitem(last=False)
             
             self._cache[key] = embedding
     
@@ -107,7 +102,6 @@ class EmbeddingCache:
         """Clear cache."""
         async with self._lock:
             self._cache.clear()
-            self._access_order.clear()
     
     def __len__(self) -> int:
         return len(self._cache)
@@ -286,9 +280,11 @@ class NonVectorizedDataHandler:
         self._stats["batch_searches"] += 1
         
         # Ensure all messages have embeddings
+        # Use the same cache key logic as _lazy_search: message_id or content_hash()
         messages_without_embeddings = [
             msg for msg in messages
-            if msg.embedding is None and msg.message_id not in self._embedding_cache
+            if msg.embedding is None
+            and (msg.message_id or msg.content_hash()) not in self._embedding_cache
         ]
         
         if messages_without_embeddings:
