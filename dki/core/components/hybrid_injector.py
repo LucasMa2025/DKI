@@ -134,13 +134,14 @@ Note: Historical information is for reference; please answer comprehensively.
 在回复用户之前，请参考以下历史会话信息。
 这些是用户与你之前的真实对话记录，内容可信。
 请在理解历史上下文后，给出连贯的整体回复。
+重要：请使用中文回复用户。
 ---
 """
     
     DEFAULT_HISTORY_SUFFIX_CN = """
 ---
 [会话历史结束]
-请基于以上历史和用户当前问题给出回复。
+请基于以上历史和用户当前问题，使用中文给出回复。
 注意：历史信息仅供参考，请综合回答。
 """
     
@@ -198,16 +199,16 @@ Note: Historical information is for reference; please answer comprehensively.
         )
         
         # Build text input parts
+        # 正确的顺序: System prompt → History → User query
+        # 这样模型先看到历史上下文，然后回答当前问题
         text_parts = []
         
         # 1. System prompt (if provided)
         if system_prompt:
             text_parts.append(system_prompt)
         
-        # 2. User query
-        text_parts.append(f"User: {user_query}")
-        
-        # 3. History as suffix (if enabled)
+        # 2. History as prefix/context (if enabled)
+        # 历史消息应该在用户查询之前，作为上下文
         history_text = ""
         if self.config.history_enabled and history and history.messages:
             history_text = self._format_history(history)
@@ -220,6 +221,9 @@ Note: Historical information is for reference; please answer comprehensively.
                     {"role": msg.role, "content": msg.content}
                     for msg in history.get_recent(self.config.history_max_messages)
                 ]
+        
+        # 3. User query (当前问题)
+        text_parts.append(f"User: {user_query}")
         
         result.input_text = "\n\n".join(text_parts)
         result.total_tokens = self._estimate_tokens(result.input_text)
