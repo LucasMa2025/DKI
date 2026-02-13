@@ -190,6 +190,28 @@ class RAGSystem:
         logger.info(f"Loaded {count} memories for session {session_id}")
         return count
     
+    def _estimate_tokens(self, text: str) -> int:
+        """估算 token 数 (使用 tokenizer 或字符数近似)"""
+        if self.model and hasattr(self.model, 'tokenizer') and self.model.tokenizer:
+            try:
+                return len(self.model.tokenizer.encode(text))
+            except Exception:
+                pass
+        # 粗略估算: 中文约 1.5 字/token, 英文约 4 字符/token, 取平均 2.5
+        return max(1, len(text) // 2)
+    
+    def _get_max_context_length(self) -> int:
+        """获取模型最大上下文长度"""
+        if self.model:
+            if hasattr(self.model, 'max_model_len'):
+                return self.model.max_model_len
+            if hasattr(self.model, 'tokenizer') and self.model.tokenizer:
+                try:
+                    return self.model.tokenizer.model_max_length
+                except Exception:
+                    pass
+        return 4096  # 默认安全长度
+    
     def _build_prompt(
         self,
         query: str,
@@ -200,6 +222,8 @@ class RAGSystem:
         """
         Build prompt with retrieved memories and conversation history.
         
+        Includes automatic truncation to prevent exceeding model context length.
+        
         Args:
             query: User query
             memories: Retrieved memories
@@ -209,7 +233,9 @@ class RAGSystem:
         Returns:
             Tuple of (formatted_prompt, RAGPromptInfo)
         """
-        parts = []
+        # 获取模型最大上下文长度, 预留 generation 空间
+        max_context = self._get_max_context_length()
+        max_prompt_tokens = max_context - 512  # 预留 512 tokens 给生成
         
         # 用于记录的信息
         prompt_info = RAGPromptInfo(
@@ -218,38 +244,97 @@ class RAGSystem:
             history_messages=history or [],
         )
         
-        # System prompt
+        # === 1. 构建必须保留的部分 (system prompt + query + footer) ===
+        fixed_parts = []
         if system_prompt:
-            parts.append(f"System: {system_prompt}\n")
+            fixed_parts.append(f"System: {system_prompt}\n")
+        fixed_parts.append(f"User: {query}")
+        fixed_parts.append("\nAssistant:")
+        fixed_text = "\n".join(fixed_parts)
+        fixed_tokens = self._estimate_tokens(fixed_text)
         
-        # Retrieved context
+        remaining_tokens = max_prompt_tokens - fixed_tokens
+        
+        # === 2. 构建 retrieved context (优先保留) ===
         context_parts = []
-        if memories:
-            parts.append("Relevant information:")
+        context_text = ""
+        if memories and remaining_tokens > 50:
+            context_header = "Relevant information:\n"
+            context_tokens = self._estimate_tokens(context_header)
+            
             for i, mem in enumerate(memories, 1):
-                parts.append(f"[{i}] {mem.content}")
-                context_parts.append(f"[{i}] {mem.content}")
-            parts.append("")
+                line = f"[{i}] {mem.content}"
+                line_tokens = self._estimate_tokens(line)
+                if context_tokens + line_tokens > remaining_tokens * 0.5:
+                    # 最多使用剩余空间的 50% 给 context
+                    break
+                context_parts.append(line)
+                context_tokens += line_tokens
+            
+            if context_parts:
+                context_text = context_header + "\n".join(context_parts) + "\n"
+                remaining_tokens -= self._estimate_tokens(context_text)
+        
         prompt_info.retrieved_context = "\n".join(context_parts)
         
-        # Conversation history
+        # === 3. 构建 conversation history (截断最旧的) ===
         history_parts = []
-        if history:
-            parts.append("Previous conversation:")
-            for msg in history:
+        history_text = ""
+        if history and remaining_tokens > 50:
+            history_header = "Previous conversation:\n"
+            header_tokens = self._estimate_tokens(history_header)
+            
+            # 从最新开始，保留尽可能多的历史
+            selected_history = []
+            used_tokens = header_tokens
+            
+            for msg in reversed(history):
                 role = "User" if msg["role"] == "user" else "Assistant"
                 line = f"{role}: {msg['content']}"
-                parts.append(line)
-                history_parts.append(line)
-            parts.append("")
+                line_tokens = self._estimate_tokens(line)
+                if used_tokens + line_tokens > remaining_tokens:
+                    break
+                selected_history.insert(0, line)
+                used_tokens += line_tokens
+            
+            if selected_history:
+                history_parts = selected_history
+                history_text = history_header + "\n".join(selected_history) + "\n"
+            
+            if len(selected_history) < len(history):
+                logger.info(
+                    f"RAG prompt truncated: kept {len(selected_history)}/{len(history)} "
+                    f"history messages to fit model context ({max_context} tokens)"
+                )
+        
         prompt_info.history_text = "\n".join(history_parts)
         
-        # User query
+        # === 4. 组装最终 prompt ===
+        parts = []
+        if system_prompt:
+            parts.append(f"System: {system_prompt}\n")
+        if context_text:
+            parts.append(context_text)
+        if history_text:
+            parts.append(history_text)
         parts.append(f"User: {query}")
         parts.append("\nAssistant:")
         
         final_prompt = "\n".join(parts)
         prompt_info.final_prompt = final_prompt
+        
+        # 最终安全检查
+        final_tokens = self._estimate_tokens(final_prompt)
+        if final_tokens > max_prompt_tokens:
+            logger.warning(
+                f"RAG prompt still too long ({final_tokens} > {max_prompt_tokens}), "
+                f"forcefully truncating"
+            )
+            # 强制截断: 只保留 query
+            final_prompt = f"User: {query}\nAssistant:"
+            prompt_info.final_prompt = final_prompt
+            prompt_info.history_text = ""
+            prompt_info.retrieved_context = ""
         
         return final_prompt, prompt_info
     

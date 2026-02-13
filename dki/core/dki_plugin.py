@@ -705,7 +705,9 @@ Please respond based on the above history and the user's current question.
                     **kwargs,
                 )
             
-            metadata.injection_latency_ms = (time.time() - injection_start) * 1000
+            # injection_latency_ms 应排除 inference 时间
+            total_inject_ms = (time.time() - injection_start) * 1000
+            metadata.injection_latency_ms = total_inject_ms - metadata.inference_latency_ms
             
             # ============ Step 3: 记录工作数据 ============
             metadata.latency_ms = (time.time() - start_time) * 1000
@@ -790,11 +792,12 @@ Please respond based on the above history and the user's current question.
             metadata.history_tokens = self._estimate_tokens(history_suffix)
         
         # 2.3 构造最终输入
-        # 输入 = 用户查询 + 历史后缀 (正位置)
+        # 正确的顺序: 历史后缀 → 用户查询
+        # 这样模型先看到历史上下文，再处理当前问题
         # 注入 = 偏好 K/V (负位置)
         final_input = query
         if history_suffix:
-            final_input = query + "\n\n" + history_suffix
+            final_input = history_suffix + "\n\n" + query
         
         metadata.query_tokens = self._estimate_tokens(query)
         metadata.total_tokens = metadata.query_tokens + metadata.history_tokens
@@ -1075,6 +1078,7 @@ Please respond based on the above history and the user's current question.
                 "query": query,
                 "user_id": user_id,
                 "session_id": session_id,
+                "mode": "dki",
                 "injection_enabled": metadata.injection_enabled,
                 "alpha": metadata.alpha,
                 "preference_tokens": metadata.preference_tokens,
