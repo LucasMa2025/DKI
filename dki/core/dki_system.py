@@ -299,28 +299,37 @@ class DKISystem:
         """Get or create hybrid injector."""
         if self._hybrid_injector is None:
             # Get config from dki.hybrid_injection if available
-            hybrid_config_data = getattr(
-                getattr(self.config.dki, 'hybrid_injection', None),
-                '__dict__',
-                {}
-            )
+            hybrid_config_obj = getattr(self.config.dki, 'hybrid_injection', None)
             
-            # Build HybridInjectionConfig
-            pref_config = hybrid_config_data.get('preference', {})
-            hist_config = hybrid_config_data.get('history', {})
+            # 安全地获取配置值
+            def safe_get(obj, attr, default):
+                if obj is None:
+                    return default
+                if hasattr(obj, attr):
+                    return getattr(obj, attr)
+                if isinstance(obj, dict):
+                    return obj.get(attr, default)
+                return default
+            
+            # 获取偏好和历史配置
+            pref_config = safe_get(hybrid_config_obj, 'preference', None)
+            hist_config = safe_get(hybrid_config_obj, 'history', None)
             
             config = HybridInjectionConfig(
-                preference_enabled=pref_config.get('enabled', True),
-                preference_alpha=pref_config.get('alpha', 0.4),
-                preference_max_tokens=pref_config.get('max_tokens', 100),
-                preference_position_strategy=pref_config.get('position_strategy', 'negative'),
-                history_enabled=hist_config.get('enabled', True),
-                history_max_tokens=hist_config.get('max_tokens', 500),
-                history_max_messages=hist_config.get('max_messages', 10),
-                history_method=hist_config.get('method', 'suffix_prompt'),
+                preference_enabled=safe_get(pref_config, 'enabled', True),
+                preference_alpha=safe_get(pref_config, 'alpha', 0.4),
+                preference_max_tokens=safe_get(pref_config, 'max_tokens', 100),
+                preference_position_strategy=safe_get(pref_config, 'position_strategy', 'negative'),
+                history_enabled=safe_get(hist_config, 'enabled', True),
+                history_max_tokens=safe_get(hist_config, 'max_tokens', 500),
+                history_max_messages=safe_get(hist_config, 'max_messages', 10),
+                history_method=safe_get(hist_config, 'method', 'suffix_prompt'),
             )
             
-            language = hybrid_config_data.get('language', 'en')
+            # 获取语言设置，默认使用中文
+            language = safe_get(hybrid_config_obj, 'language', 'cn')
+            
+            logger.info(f"Creating HybridDKIInjector with language={language}")
             
             self._hybrid_injector = HybridDKIInjector(
                 config=config,
