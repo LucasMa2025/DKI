@@ -24,6 +24,8 @@ from loguru import logger
 
 # 导入可视化记录函数
 from dki.api.visualization_routes import record_visualization
+# 导入统计记录函数
+from dki.api.stats_routes import record_dki_request
 
 
 # ============ Request/Response Models ============
@@ -188,9 +190,13 @@ def create_dki_router() -> APIRouter:
             
             # 记录可视化数据
             try:
+                # LatencyBreakdown 属性: router_ms, gating_ms, kv_compute_ms,
+                # kv_load_ms, projection_ms, prefill_ms, decode_ms, total_ms
+                lb = response.latency_breakdown
                 viz_data = {
                     "request_id": request_id,
                     "timestamp": datetime.utcnow().isoformat(),
+                    "mode": "dki",
                     "query": request.query,
                     "user_id": request.user_id,
                     "session_id": request.session_id or request.user_id,
@@ -198,7 +204,7 @@ def create_dki_router() -> APIRouter:
                     "alpha": response.gating_decision.alpha if response.gating_decision else 0.0,
                     "preference_tokens": preference_tokens,
                     "history_tokens": history_tokens,
-                    "query_tokens": response.input_tokens - preference_tokens - history_tokens,
+                    "query_tokens": max(0, response.input_tokens - preference_tokens - history_tokens),
                     "total_tokens": response.input_tokens,
                     "cache_hit": response.cache_hit,
                     "cache_tier": response.cache_tier or "none",
@@ -208,15 +214,29 @@ def create_dki_router() -> APIRouter:
                     "history_suffix_text": hybrid_info.get("history_suffix_text", ""),
                     "history_messages": hybrid_info.get("history_messages", []),
                     "final_input": hybrid_info.get("final_input", request.query),
-                    # 延迟分解
-                    "adapter_latency_ms": response.latency_breakdown.adapter_ms if response.latency_breakdown else 0,
-                    "injection_latency_ms": response.latency_breakdown.projection_ms if response.latency_breakdown else 0,
-                    "inference_latency_ms": response.latency_breakdown.prefill_ms if response.latency_breakdown else 0,
+                    "rag_prompt_text": "",
+                    "rag_context_text": "",
+                    # 延迟分解 (使用 LatencyBreakdown 正确属性)
+                    "adapter_latency_ms": (lb.router_ms if lb else 0),
+                    "injection_latency_ms": ((lb.kv_compute_ms + lb.projection_ms) if lb else 0),
+                    "inference_latency_ms": ((lb.prefill_ms + lb.decode_ms) if lb else 0),
                 }
                 record_visualization(viz_data)
                 logger.debug(f"Recorded visualization data for request {request_id}")
             except Exception as viz_error:
                 logger.warning(f"Failed to record visualization: {viz_error}")
+            
+            # 记录 DKI 统计数据
+            try:
+                _alpha = response.gating_decision.alpha if response.gating_decision else 0.0
+                _injected = response.gating_decision.should_inject if response.gating_decision else False
+                record_dki_request(
+                    cache_tier=response.cache_tier or "L3",
+                    alpha=_alpha,
+                    injected=_injected,
+                )
+            except Exception as stats_error:
+                logger.warning(f"Failed to record stats: {stats_error}")
             
             return DKIChatResponse(
                 id=request_id,
