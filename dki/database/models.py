@@ -33,22 +33,12 @@ class Session(Base):
     memories = relationship("Memory", back_populates="session", cascade="all, delete-orphan")
     conversations = relationship("Conversation", back_populates="session", cascade="all, delete-orphan")
     
-    @hybrid_property
-    def metadata(self) -> Dict[str, Any]:
-        """Get metadata as dict (alias for extra_metadata)."""
+    def get_metadata(self) -> Dict[str, Any]:
+        """Get metadata as dict."""
         return json.loads(self._metadata) if self._metadata else {}
     
-    @metadata.setter
-    def metadata(self, value: Dict[str, Any]):
+    def set_metadata(self, value: Dict[str, Any]) -> None:
         """Set metadata from dict."""
-        self._metadata = json.dumps(value, ensure_ascii=False)
-    
-    @hybrid_property
-    def extra_metadata(self) -> Dict[str, Any]:
-        return json.loads(self._metadata) if self._metadata else {}
-    
-    @extra_metadata.setter
-    def extra_metadata(self, value: Dict[str, Any]):
         self._metadata = json.dumps(value, ensure_ascii=False)
     
     def to_dict(self) -> Dict[str, Any]:
@@ -57,7 +47,7 @@ class Session(Base):
             'user_id': self.user_id,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,
-            'metadata': self.extra_metadata,
+            'metadata': self.get_metadata(),
             'is_active': self.is_active,
             'memory_count': len(self.memories) if self.memories else 0,
         }
@@ -81,12 +71,12 @@ class Memory(Base):
     session = relationship("Session", back_populates="memories")
     kv_caches = relationship("KVCache", back_populates="memory", cascade="all, delete-orphan")
     
-    @hybrid_property
-    def extra_metadata(self) -> Dict[str, Any]:
+    def get_metadata(self) -> Dict[str, Any]:
+        """Get metadata as dict."""
         return json.loads(self._metadata) if self._metadata else {}
     
-    @extra_metadata.setter
-    def extra_metadata(self, value: Dict[str, Any]):
+    def set_metadata(self, value: Dict[str, Any]) -> None:
+        """Set metadata from dict."""
         self._metadata = json.dumps(value, ensure_ascii=False)
     
     def to_dict(self) -> Dict[str, Any]:
@@ -96,7 +86,7 @@ class Memory(Base):
             'content': self.content,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,
-            'metadata': self.extra_metadata,
+            'metadata': self.get_metadata(),
             'is_active': self.is_active,
         }
 
@@ -128,12 +118,12 @@ class Conversation(Base):
     def memory_ids(self, value: List[str]):
         self._memory_ids = json.dumps(value)
     
-    @hybrid_property
-    def extra_metadata(self) -> Dict[str, Any]:
+    def get_metadata(self) -> Dict[str, Any]:
+        """Get metadata as dict."""
         return json.loads(self._metadata) if self._metadata else {}
     
-    @extra_metadata.setter
-    def extra_metadata(self, value: Dict[str, Any]):
+    def set_metadata(self, value: Dict[str, Any]) -> None:
+        """Set metadata from dict."""
         self._metadata = json.dumps(value, ensure_ascii=False)
     
     def to_dict(self) -> Dict[str, Any]:
@@ -147,7 +137,7 @@ class Conversation(Base):
             'injection_alpha': self.injection_alpha,
             'memory_ids': self.memory_ids,
             'latency_ms': self.latency_ms,
-            'metadata': self.extra_metadata,
+            'metadata': self.get_metadata(),
         }
 
 
@@ -175,12 +165,12 @@ class KVCache(Base):
         Index('ix_kv_cache_unique', 'memory_id', 'model_name', 'layer_idx', unique=True),
     )
     
-    @hybrid_property
-    def extra_metadata(self) -> Dict[str, Any]:
+    def get_metadata(self) -> Dict[str, Any]:
+        """Get metadata as dict."""
         return json.loads(self._metadata) if self._metadata else {}
     
-    @extra_metadata.setter
-    def extra_metadata(self, value: Dict[str, Any]):
+    def set_metadata(self, value: Dict[str, Any]) -> None:
+        """Set metadata from dict."""
         self._metadata = json.dumps(value, ensure_ascii=False)
 
 
@@ -210,12 +200,12 @@ class Experiment(Base):
     def config(self, value: Dict[str, Any]):
         self._config = json.dumps(value, ensure_ascii=False)
     
-    @hybrid_property
-    def extra_metadata(self) -> Dict[str, Any]:
+    def get_extra_metadata(self) -> Dict[str, Any]:
+        """Get metadata as dict."""
         return json.loads(self._metadata) if self._metadata else {}
     
-    @extra_metadata.setter
-    def extra_metadata(self, value: Dict[str, Any]):
+    def set_extra_metadata(self, value: Dict[str, Any]) -> None:
+        """Set metadata from dict."""
         self._metadata = json.dumps(value, ensure_ascii=False)
     
     def to_dict(self) -> Dict[str, Any]:
@@ -228,7 +218,7 @@ class Experiment(Base):
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'started_at': self.started_at.isoformat() if self.started_at else None,
             'completed_at': self.completed_at.isoformat() if self.completed_at else None,
-            'metadata': self.extra_metadata,
+            'metadata': self.get_extra_metadata(),
         }
 
 
@@ -257,12 +247,12 @@ class ExperimentResult(Base):
     def metrics(self, value: Dict[str, Any]):
         self._metrics = json.dumps(value, ensure_ascii=False)
     
-    @hybrid_property
-    def extra_metadata(self) -> Dict[str, Any]:
+    def get_extra_metadata(self) -> Dict[str, Any]:
+        """Get metadata as dict."""
         return json.loads(self._metadata) if self._metadata else {}
     
-    @extra_metadata.setter
-    def extra_metadata(self, value: Dict[str, Any]):
+    def set_extra_metadata(self, value: Dict[str, Any]) -> None:
+        """Set metadata from dict."""
         self._metadata = json.dumps(value, ensure_ascii=False)
     
     def to_dict(self) -> Dict[str, Any]:
@@ -274,7 +264,7 @@ class ExperimentResult(Base):
             'metrics': self.metrics,
             'sample_count': self.sample_count,
             'created_at': self.created_at.isoformat() if self.created_at else None,
-            'metadata': self.extra_metadata,
+            'metadata': self.get_extra_metadata(),
         }
 
 
@@ -300,12 +290,12 @@ class AuditLog(Base):
     def memory_ids(self, value: List[str]):
         self._memory_ids = json.dumps(value)
     
-    @hybrid_property
-    def extra_metadata(self) -> Dict[str, Any]:
+    def get_extra_metadata(self) -> Dict[str, Any]:
+        """Get metadata as dict."""
         return json.loads(self._metadata) if self._metadata else {}
     
-    @extra_metadata.setter
-    def extra_metadata(self, value: Dict[str, Any]):
+    def set_extra_metadata(self, value: Dict[str, Any]) -> None:
+        """Set metadata from dict."""
         self._metadata = json.dumps(value, ensure_ascii=False)
 
 
@@ -330,13 +320,57 @@ class ModelRegistry(Base):
     def config(self, value: Dict[str, Any]):
         self._config = json.dumps(value, ensure_ascii=False)
     
-    @hybrid_property
-    def extra_metadata(self) -> Dict[str, Any]:
+    def get_extra_metadata(self) -> Dict[str, Any]:
+        """Get metadata as dict."""
         return json.loads(self._metadata) if self._metadata else {}
     
-    @extra_metadata.setter
-    def extra_metadata(self, value: Dict[str, Any]):
+    def set_extra_metadata(self, value: Dict[str, Any]) -> None:
+        """Set metadata from dict."""
         self._metadata = json.dumps(value, ensure_ascii=False)
+
+
+class DemoUser(Base):
+    """
+    Demo user model for the demonstration system.
+    
+    简化的用户模型，用于演示系统:
+    - 只查询用户账号，不验证密码
+    - 确保测试过程中的偏好及会话历史可管理
+    - 登录时查询用户，如不存在则创建
+    """
+    
+    __tablename__ = 'demo_users'
+    
+    id = Column(String(64), primary_key=True)
+    username = Column(String(64), nullable=False, unique=True, index=True)
+    display_name = Column(String(128))
+    email = Column(String(128))
+    avatar = Column(String(256))
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    last_login_at = Column(DateTime)
+    _metadata = Column('metadata', Text, default='{}')
+    
+    def get_metadata(self) -> Dict[str, Any]:
+        """Get metadata as dict."""
+        return json.loads(self._metadata) if self._metadata else {}
+    
+    def set_metadata(self, value: Dict[str, Any]) -> None:
+        """Set metadata from dict."""
+        self._metadata = json.dumps(value, ensure_ascii=False)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'id': self.id,
+            'username': self.username,
+            'displayName': self.display_name,
+            'email': self.email,
+            'avatar': self.avatar,
+            'isActive': self.is_active,
+            'createdAt': self.created_at.isoformat() if self.created_at else None,
+            'lastLoginAt': self.last_login_at.isoformat() if self.last_login_at else None,
+            'metadata': self.get_metadata(),
+        }
 
 
 class UserPreference(Base):
@@ -345,7 +379,7 @@ class UserPreference(Base):
     __tablename__ = 'user_preferences'
     
     id = Column(String(64), primary_key=True)
-    user_id = Column(String(64), nullable=False, index=True)
+    user_id = Column(String(64), nullable=False, index=True)  # References DemoUser.id
     preference_text = Column(Text, nullable=False)
     preference_type = Column(String(32), default='general')  # general, style, technical, format, domain, other
     priority = Column(Integer, default=5)  # 0-10, higher = more important
@@ -355,12 +389,12 @@ class UserPreference(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     _metadata = Column('metadata', Text, default='{}')
     
-    @hybrid_property
-    def extra_metadata(self) -> Dict[str, Any]:
+    def get_extra_metadata(self) -> Dict[str, Any]:
+        """Get metadata as dict."""
         return json.loads(self._metadata) if self._metadata else {}
     
-    @extra_metadata.setter
-    def extra_metadata(self, value: Dict[str, Any]):
+    def set_extra_metadata(self, value: Dict[str, Any]) -> None:
+        """Set metadata from dict."""
         self._metadata = json.dumps(value, ensure_ascii=False)
     
     def to_dict(self) -> Dict[str, Any]:
@@ -374,5 +408,5 @@ class UserPreference(Base):
             'is_active': self.is_active,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,
-            'metadata': self.extra_metadata,
+            'metadata': self.get_extra_metadata(),
         }

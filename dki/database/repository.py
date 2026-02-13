@@ -14,7 +14,7 @@ from loguru import logger
 
 from dki.database.models import (
     Session, Memory, Conversation, KVCache, 
-    Experiment, ExperimentResult, AuditLog
+    Experiment, ExperimentResult, AuditLog, DemoUser, UserPreference
 )
 
 
@@ -45,7 +45,7 @@ class SessionRepository(BaseRepository):
             user_id=user_id,
         )
         if metadata:
-            session.metadata = metadata
+            session.set_metadata(metadata)
         
         self.db.add(session)
         self.db.flush()
@@ -120,7 +120,7 @@ class MemoryRepository(BaseRepository):
             memory.embedding = embedding.tobytes()
         
         if metadata:
-            memory.metadata = metadata
+            memory.set_metadata(metadata)
         
         self.db.add(memory)
         self.db.flush()
@@ -231,7 +231,7 @@ class ConversationRepository(BaseRepository):
             conversation.memory_ids = memory_ids
         
         if metadata:
-            conversation.metadata = metadata
+            conversation.set_metadata(metadata)
         
         self.db.add(conversation)
         self.db.flush()
@@ -271,13 +271,18 @@ class ConversationRepository(BaseRepository):
         # Support both parameter names for compatibility
         actual_limit = limit if limit is not None else n_turns * 2
         
-        return (
+        # 使用 id 作为次要排序键，确保同一秒内的消息顺序正确
+        # 因为 id 是按时间顺序生成的 (conv_xxxx)
+        conversations = (
             self.db.query(Conversation)
             .filter(Conversation.session_id == session_id)
-            .order_by(desc(Conversation.created_at))
+            .order_by(desc(Conversation.created_at), desc(Conversation.id))
             .limit(actual_limit)
-            .all()[::-1]  # Reverse to get chronological order
+            .all()
         )
+        
+        # 反转以获得时间顺序 (从旧到新)
+        return list(reversed(conversations))
 
 
 class ExperimentRepository(BaseRepository):
@@ -352,7 +357,7 @@ class ExperimentRepository(BaseRepository):
         result.metrics = metrics
         
         if metadata:
-            result.metadata = metadata
+            result.set_extra_metadata(metadata)
         
         self.db.add(result)
         self.db.flush()
@@ -391,7 +396,7 @@ class AuditLogRepository(BaseRepository):
             log_entry.memory_ids = memory_ids
         
         if metadata:
-            log_entry.metadata = metadata
+            log_entry.set_extra_metadata(metadata)
         
         self.db.add(log_entry)
         self.db.flush()
@@ -407,6 +412,177 @@ class AuditLogRepository(BaseRepository):
             self.db.query(AuditLog)
             .filter(AuditLog.session_id == session_id)
             .order_by(desc(AuditLog.created_at))
+            .limit(limit)
+            .all()
+        )
+
+
+class DemoUserRepository(BaseRepository):
+    """
+    Repository for DemoUser operations.
+    
+    演示系统用户管理:
+    - 只查询用户账号，不验证密码
+    - 登录时查询用户，如不存在则创建
+    - 确保测试过程中的偏好及会话历史可管理
+    """
+    
+    def create(
+        self,
+        username: str,
+        user_id: Optional[str] = None,
+        display_name: Optional[str] = None,
+        email: Optional[str] = None,
+    ) -> DemoUser:
+        """Create a new demo user."""
+        user = DemoUser(
+            id=user_id or self.generate_id("user_"),
+            username=username,
+            display_name=display_name or username,
+            email=email,
+        )
+        
+        self.db.add(user)
+        self.db.flush()
+        logger.info(f"Created demo user: {username} (id={user.id})")
+        return user
+    
+    def get(self, user_id: str) -> Optional[DemoUser]:
+        """Get user by ID."""
+        return self.db.query(DemoUser).filter(DemoUser.id == user_id).first()
+    
+    def get_by_username(self, username: str) -> Optional[DemoUser]:
+        """Get user by username."""
+        return self.db.query(DemoUser).filter(DemoUser.username == username).first()
+    
+    def get_or_create(
+        self,
+        username: str,
+        display_name: Optional[str] = None,
+        email: Optional[str] = None,
+    ) -> Tuple[DemoUser, bool]:
+        """
+        Get existing user by username or create new one.
+        
+        Returns:
+            Tuple of (user, created) where created is True if user was newly created
+        """
+        user = self.get_by_username(username)
+        if user:
+            # Update last login time
+            user.last_login_at = datetime.utcnow()
+            self.db.flush()
+            return user, False
+        return self.create(username=username, display_name=display_name, email=email), True
+    
+    def list_all(self, limit: int = 100) -> List[DemoUser]:
+        """List all demo users."""
+        return (
+            self.db.query(DemoUser)
+            .filter(DemoUser.is_active == True)
+            .order_by(desc(DemoUser.last_login_at))
+            .limit(limit)
+            .all()
+        )
+    
+    def update(self, user_id: str, **kwargs) -> Optional[DemoUser]:
+        """Update user attributes."""
+        user = self.get(user_id)
+        if user:
+            for key, value in kwargs.items():
+                if hasattr(user, key):
+                    setattr(user, key, value)
+            self.db.flush()
+        return user
+    
+    def delete(self, user_id: str) -> bool:
+        """Soft delete user."""
+        user = self.get(user_id)
+        if user:
+            user.is_active = False
+            self.db.flush()
+            return True
+        return False
+
+
+class UserPreferenceRepository(BaseRepository):
+    """Repository for UserPreference operations."""
+    
+    def create(
+        self,
+        user_id: str,
+        preference_text: str,
+        preference_type: str = 'general',
+        priority: int = 5,
+        category: Optional[str] = None,
+        preference_id: Optional[str] = None,
+    ) -> UserPreference:
+        """Create a new user preference."""
+        preference = UserPreference(
+            id=preference_id or self.generate_id("pref_"),
+            user_id=user_id,
+            preference_text=preference_text,
+            preference_type=preference_type,
+            priority=priority,
+            category=category,
+        )
+        
+        self.db.add(preference)
+        self.db.flush()
+        logger.debug(f"Created preference: {preference.id} for user {user_id}")
+        return preference
+    
+    def get(self, preference_id: str) -> Optional[UserPreference]:
+        """Get preference by ID."""
+        return self.db.query(UserPreference).filter(UserPreference.id == preference_id).first()
+    
+    def get_by_user(
+        self,
+        user_id: str,
+        preference_type: Optional[str] = None,
+        active_only: bool = True,
+    ) -> List[UserPreference]:
+        """Get all preferences for a user."""
+        query = self.db.query(UserPreference).filter(UserPreference.user_id == user_id)
+        
+        if preference_type:
+            query = query.filter(UserPreference.preference_type == preference_type)
+        
+        if active_only:
+            query = query.filter(UserPreference.is_active == True)
+        
+        return query.order_by(desc(UserPreference.priority), desc(UserPreference.created_at)).all()
+    
+    def update(
+        self,
+        preference_id: str,
+        **kwargs,
+    ) -> Optional[UserPreference]:
+        """Update preference attributes."""
+        preference = self.get(preference_id)
+        if preference:
+            for key, value in kwargs.items():
+                if hasattr(preference, key):
+                    setattr(preference, key, value)
+            preference.updated_at = datetime.utcnow()
+            self.db.flush()
+        return preference
+    
+    def delete(self, preference_id: str) -> bool:
+        """Soft delete preference."""
+        preference = self.get(preference_id)
+        if preference:
+            preference.is_active = False
+            self.db.flush()
+            return True
+        return False
+    
+    def list_all(self, limit: int = 100) -> List[UserPreference]:
+        """List all active preferences."""
+        return (
+            self.db.query(UserPreference)
+            .filter(UserPreference.is_active == True)
+            .order_by(desc(UserPreference.created_at))
             .limit(limit)
             .all()
         )
