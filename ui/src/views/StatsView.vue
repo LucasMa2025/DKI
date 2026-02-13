@@ -60,6 +60,18 @@
         </div>
       </header>
       
+      <!-- Stats Error -->
+      <el-alert
+        v-if="statsError"
+        type="warning"
+        :title="'统计数据获取失败: ' + statsError"
+        description="请确认 DKI 服务正在运行并可访问。下方数据为当前会话的实时统计。"
+        show-icon
+        closable
+        style="margin-bottom: 16px;"
+        @close="statsError = ''"
+      />
+
       <!-- Overview Cards -->
       <div class="overview-cards">
         <div class="overview-card">
@@ -82,7 +94,7 @@
           <div class="card-value">{{ cacheHitRate }}%</div>
           <div class="card-trend positive">
             <el-icon><TrendCharts /></el-icon>
-            <span>L1: {{ stats?.cacheStats?.l1HitRate || 0 }}%</span>
+            <span>L1: {{ ((stats?.cacheStats?.l1HitRate || 0) * 100).toFixed(1) }}%</span>
           </div>
         </div>
         
@@ -238,14 +250,17 @@ const authLoading = ref(false)
 const authError = ref('')
 const loading = ref(false)
 const stats = ref<SystemStats | null>(null)
+const statsError = ref('')
 let refreshInterval: ReturnType<typeof setInterval> | null = null
 
 const isAuthenticated = computed(() => statsAuthStore.isAuthenticated)
 
 const cacheHitRate = computed(() => {
-  if (!stats.value?.cacheStats) return 0
-  const { l1HitRate, l2HitRate } = stats.value.cacheStats
-  return ((l1HitRate + l2HitRate) * 50).toFixed(1)
+  if (!stats.value?.dkiStats) return '0.0'
+  const { l1Hits, l2Hits, l3Computes } = stats.value.dkiStats
+  const total = l1Hits + l2Hits + l3Computes
+  if (total === 0) return '0.0'
+  return (((l1Hits + l2Hits) / total) * 100).toFixed(1)
 })
 
 const injectionRate = computed(() => {
@@ -426,28 +441,30 @@ async function refreshStats() {
   
   try {
     stats.value = await api.stats.getSystemStats()
-  } catch (error) {
-    // Use mock data for demo
+    statsError.value = ''
+  } catch (error: any) {
+    statsError.value = error?.message || '获取统计数据失败'
+    // Show zero-state instead of mock data
     stats.value = {
       dkiStats: {
-        totalRequests: 1234,
-        l1Hits: 856,
-        l2Hits: 234,
-        l3Computes: 144,
-        avgAlpha: 0.312,
-        injectionRate: 0.87,
+        totalRequests: 0,
+        l1Hits: 0,
+        l2Hits: 0,
+        l3Computes: 0,
+        avgAlpha: 0,
+        injectionRate: 0,
       },
       cacheStats: {
-        l1Size: 456,
+        l1Size: 0,
         l1MaxSize: 1000,
-        l1HitRate: 0.69,
-        l2HitRate: 0.19,
+        l1HitRate: 0,
+        l2HitRate: 0,
       },
       adapterStats: {
-        type: 'postgresql',
-        connected: true,
+        type: 'N/A',
+        connected: false,
       },
-      uptimeSeconds: 86400 * 3 + 3600 * 5 + 60 * 23,
+      uptimeSeconds: 0,
     }
   } finally {
     loading.value = false

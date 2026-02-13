@@ -13,6 +13,17 @@
       </div>
     </header>
 
+    <!-- Empty State Notice -->
+    <div v-if="!hasRealData && !loading" class="empty-notice">
+      <el-alert
+        type="info"
+        title="暂无注入数据"
+        description="请先通过聊天界面发送消息，系统会自动记录每次注入的详细过程。下方流程图为 DKI 系统的标准注入流程说明。"
+        show-icon
+        :closable="false"
+      />
+    </div>
+
     <!-- Main Content -->
     <div class="viz-content">
       <!-- Flow Diagram Section -->
@@ -283,6 +294,9 @@
         <h2>
           <el-icon><Document /></el-icon>
           注入内容显示
+          <el-tag v-if="latestData?.mode" :type="latestData?.mode === 'dki' ? 'success' : latestData?.mode === 'rag' ? 'warning' : 'info'" size="small" style="margin-left: 12px;">
+            {{ latestData?.mode === 'dki' ? 'DKI 模式' : latestData?.mode === 'rag' ? 'RAG 模式' : '基线模式' }}
+          </el-tag>
           <el-button-group style="margin-left: auto;">
             <el-button size="small" @click="toggleInjectionExpand">
               {{ injectionExpanded ? '收起' : '展开' }}
@@ -295,61 +309,109 @@
         </h2>
         
         <div class="injection-text-grid" :class="{ expanded: injectionExpanded }">
-          <!-- DKI 偏好注入 -->
-          <div class="injection-text-card preference-card">
-            <div class="card-header">
-              <span class="card-title">
-                <el-icon><User /></el-icon>
-                DKI 偏好注入 (K/V)
-              </span>
-              <el-tag type="success" size="small">
-                {{ latestData?.token_distribution?.preference || 0 }} tokens
-              </el-tag>
-            </div>
-            <div class="card-body">
-              <div class="text-label">偏好原文 (不显示实际 K/V):</div>
-              <el-input
-                type="textarea"
-                :value="latestData?.preference_text || '(无偏好注入)'"
-                :rows="injectionExpanded ? 8 : 3"
-                readonly
-                resize="none"
-              />
-              <div class="text-meta">
-                <span>Alpha: {{ latestData?.injection_layers?.[0]?.alpha?.toFixed(2) || '0.00' }}</span>
-                <span>位置: 负位置 (不占用 Context)</span>
+          <!-- ==================== DKI 模式 ==================== -->
+          <template v-if="!latestData?.mode || latestData?.mode === 'dki'">
+            <!-- DKI 偏好注入 -->
+            <div class="injection-text-card preference-card">
+              <div class="card-header">
+                <span class="card-title">
+                  <el-icon><User /></el-icon>
+                  DKI 偏好注入 (K/V)
+                </span>
+                <el-tag type="success" size="small">
+                  {{ latestData?.token_distribution?.preference || 0 }} tokens
+                </el-tag>
+              </div>
+              <div class="card-body">
+                <div class="text-label">偏好原文 (不显示实际 K/V):</div>
+                <el-input
+                  type="textarea"
+                  :value="latestData?.preference_text || '(无偏好注入)'"
+                  :rows="injectionExpanded ? 8 : 3"
+                  readonly
+                  resize="none"
+                />
+                <div class="text-meta">
+                  <span>Alpha: {{ latestData?.injection_layers?.[0]?.alpha?.toFixed(2) || '0.00' }}</span>
+                  <span>位置: 负位置 (不占用 Context)</span>
+                </div>
               </div>
             </div>
-          </div>
-          
-          <!-- DKI 历史后缀 -->
-          <div class="injection-text-card history-card">
-            <div class="card-header">
-              <span class="card-title">
-                <el-icon><ChatDotRound /></el-icon>
-                DKI 历史后缀 (Suffix)
-              </span>
-              <el-tag type="warning" size="small">
-                {{ latestData?.token_distribution?.history || 0 }} tokens
-              </el-tag>
-            </div>
-            <div class="card-body">
-              <div class="text-label">历史后缀原文:</div>
-              <el-input
-                type="textarea"
-                :value="latestData?.history_suffix_text || '(无历史后缀)'"
-                :rows="injectionExpanded ? 8 : 3"
-                readonly
-                resize="none"
-              />
-              <div class="text-meta">
-                <span>消息数: {{ latestData?.history_messages?.length || 0 }}</span>
-                <span>位置: 正位置 (占用 Context)</span>
+            
+            <!-- DKI 历史后缀 -->
+            <div class="injection-text-card history-card">
+              <div class="card-header">
+                <span class="card-title">
+                  <el-icon><ChatDotRound /></el-icon>
+                  DKI 历史后缀 (Suffix)
+                </span>
+                <el-tag type="warning" size="small">
+                  {{ latestData?.token_distribution?.history || 0 }} tokens
+                </el-tag>
+              </div>
+              <div class="card-body">
+                <div class="text-label">历史后缀原文:</div>
+                <el-input
+                  type="textarea"
+                  :value="latestData?.history_suffix_text || '(无历史后缀)'"
+                  :rows="injectionExpanded ? 8 : 3"
+                  readonly
+                  resize="none"
+                />
+                <div class="text-meta">
+                  <span>消息数: {{ latestData?.history_messages?.length || 0 }}</span>
+                  <span>位置: 正位置 (占用 Context)</span>
+                </div>
               </div>
             </div>
-          </div>
+          </template>
           
-          <!-- 历史消息列表 -->
+          <!-- ==================== RAG 模式 ==================== -->
+          <template v-if="latestData?.mode === 'rag'">
+            <!-- RAG 检索上下文 -->
+            <div class="injection-text-card rag-context-card">
+              <div class="card-header">
+                <span class="card-title">
+                  <el-icon><DataLine /></el-icon>
+                  RAG 检索上下文
+                </span>
+                <el-tag type="warning" size="small">Context</el-tag>
+              </div>
+              <div class="card-body">
+                <div class="text-label">检索到的上下文:</div>
+                <el-input
+                  type="textarea"
+                  :value="latestData?.rag_context_text || '(无检索上下文)'"
+                  :rows="injectionExpanded ? 8 : 3"
+                  readonly
+                  resize="none"
+                />
+              </div>
+            </div>
+            
+            <!-- RAG 完整提示词 -->
+            <div class="injection-text-card rag-prompt-card">
+              <div class="card-header">
+                <span class="card-title">
+                  <el-icon><Document /></el-icon>
+                  RAG 完整提示词
+                </span>
+                <el-tag type="warning" size="small">Prompt</el-tag>
+              </div>
+              <div class="card-body">
+                <div class="text-label">发送到 LLM 的完整提示词:</div>
+                <el-input
+                  type="textarea"
+                  :value="latestData?.rag_prompt_text || '(无完整提示词)'"
+                  :rows="injectionExpanded ? 12 : 5"
+                  readonly
+                  resize="none"
+                />
+              </div>
+            </div>
+          </template>
+          
+          <!-- ==================== 通用: 历史消息列表 ==================== -->
           <div class="injection-text-card messages-card" v-if="latestData?.history_messages?.length > 0">
             <div class="card-header">
               <span class="card-title">
@@ -374,7 +436,7 @@
             </div>
           </div>
           
-          <!-- 最终输入预览 -->
+          <!-- ==================== 通用: 最终输入预览 ==================== -->
           <div class="injection-text-card final-card">
             <div class="card-header">
               <span class="card-title">
@@ -515,6 +577,7 @@ const historyItems = ref<any[]>([])
 const showDetailDialog = ref(false)
 const detailData = ref<any>(null)
 const injectionExpanded = ref(false)
+const hasRealData = ref(false)
 
 // Computed
 const flowSteps = computed(() => latestData.value?.flow_steps || defaultFlowSteps)
@@ -550,17 +613,17 @@ const tokenPieOption = computed(() => ({
       },
       data: [
         {
-          value: latestData.value?.token_distribution?.query || 10,
+          value: latestData.value?.token_distribution?.query ?? 0,
           name: '查询',
           itemStyle: { color: '#3b82f6' },
         },
         {
-          value: latestData.value?.token_distribution?.preference || 30,
+          value: latestData.value?.token_distribution?.preference ?? 0,
           name: '偏好 (K/V)',
           itemStyle: { color: '#10b981' },
         },
         {
-          value: latestData.value?.token_distribution?.history || 50,
+          value: latestData.value?.token_distribution?.history ?? 0,
           name: '历史 (后缀)',
           itemStyle: { color: '#f59e0b' },
         },
@@ -584,7 +647,7 @@ const defaultFlowSteps = [
 async function refreshData() {
   loading.value = true
   try {
-    // Try to fetch real data
+    // Try to fetch real data from backend
     const [latestRes, historyRes] = await Promise.all([
       api.visualization.getLatest().catch(() => null),
       api.visualization.getHistory().catch(() => ({ items: [] })),
@@ -592,30 +655,15 @@ async function refreshData() {
     
     if (latestRes) {
       latestData.value = latestRes
+      hasRealData.value = true
     } else {
-      // Use demo data
-      latestData.value = {
-        request_id: 'demo-001',
-        timestamp: new Date().toISOString(),
-        original_query: '推荐一家适合约会的餐厅',
-        user_id: 'user_123',
-        session_id: 'session_456',
-        injection_layers: [
-          { layer_name: 'L1 - 用户偏好', layer_type: 'preference_kv', token_count: 45, position_range: [-45, 0], alpha: 0.4, cache_status: 'L1' },
-          { layer_name: 'L2 - 会话历史', layer_type: 'history_suffix', token_count: 120, position_range: [10, 130], alpha: 1.0, cache_status: 'none' },
-        ],
-        flow_steps: defaultFlowSteps,
-        token_distribution: { query: 10, preference: 45, history: 120, total: 175 },
-        total_latency_ms: 166.5,
-        injection_overhead_ms: 8.6,
-      }
+      // No visualization data yet - show empty state instead of fake demo data
+      latestData.value = null
+      hasRealData.value = false
     }
     
-    historyItems.value = historyRes.items.length > 0 ? historyRes.items : [
-      { request_id: 'demo-001', timestamp: new Date().toISOString(), user_id: 'user_123', query_preview: '推荐一家适合约会的餐厅', injection_enabled: true, alpha: 0.4, preference_tokens: 45, history_tokens: 120, latency_ms: 166.5 },
-      { request_id: 'demo-002', timestamp: new Date(Date.now() - 60000).toISOString(), user_id: 'user_123', query_preview: '最近我们聊了什么？', injection_enabled: true, alpha: 0.4, preference_tokens: 45, history_tokens: 200, latency_ms: 189.2 },
-      { request_id: 'demo-003', timestamp: new Date(Date.now() - 120000).toISOString(), user_id: 'user_456', query_preview: '帮我写一段 Python 代码', injection_enabled: false, alpha: 0.0, preference_tokens: 0, history_tokens: 0, latency_ms: 98.5 },
-    ]
+    // Only show real history items (no fake demo data)
+    historyItems.value = historyRes.items || []
   } finally {
     loading.value = false
   }
@@ -664,7 +712,8 @@ function getStepStatusText(status: string) {
   }
 }
 
-function formatDetailKey(key: string) {
+function formatDetailKey(key: string | number) {
+  const k = String(key)
   const keyMap: Record<string, string> = {
     query_length: '查询长度',
     triggered: '已触发',
@@ -679,7 +728,7 @@ function formatDetailKey(key: string) {
     messages_count: '消息数',
     input_tokens: '输入 Tokens',
   }
-  return keyMap[key] || key
+  return keyMap[k] || k
 }
 
 function formatDetailValue(value: any) {
@@ -702,27 +751,44 @@ function copyInjectionText() {
     return
   }
   
+  const mode = latestData.value.mode || 'dki'
   const lines = []
   lines.push('═══════════════════════════════════════════════════════')
-  lines.push('  DKI 注入信息')
+  lines.push(`  ${mode === 'dki' ? 'DKI 注入信息' : mode === 'rag' ? 'RAG 提示词信息' : '基线模式信息'}`)
   lines.push('═══════════════════════════════════════════════════════')
   lines.push('')
   lines.push(`【原始查询】`)
   lines.push(latestData.value.original_query || '(无)')
   lines.push('')
   
-  if (latestData.value.preference_text) {
-    lines.push(`【偏好注入】(K/V 注入, α=${latestData.value.injection_layers?.[0]?.alpha?.toFixed(2) || '0.00'})`)
-    lines.push('───────────────────────────────────────────────────────')
-    lines.push(latestData.value.preference_text)
-    lines.push('')
-  }
-  
-  if (latestData.value.history_suffix_text) {
-    lines.push(`【历史后缀】(${latestData.value.token_distribution?.history || 0} tokens)`)
-    lines.push('───────────────────────────────────────────────────────')
-    lines.push(latestData.value.history_suffix_text)
-    lines.push('')
+  if (mode === 'dki') {
+    if (latestData.value.preference_text) {
+      lines.push(`【偏好注入】(K/V 注入, α=${latestData.value.injection_layers?.[0]?.alpha?.toFixed(2) || '0.00'})`)
+      lines.push('───────────────────────────────────────────────────────')
+      lines.push(latestData.value.preference_text)
+      lines.push('')
+    }
+    
+    if (latestData.value.history_suffix_text) {
+      lines.push(`【历史后缀】(${latestData.value.token_distribution?.history || 0} tokens)`)
+      lines.push('───────────────────────────────────────────────────────')
+      lines.push(latestData.value.history_suffix_text)
+      lines.push('')
+    }
+  } else if (mode === 'rag') {
+    if (latestData.value.rag_context_text) {
+      lines.push(`【RAG 检索上下文】`)
+      lines.push('───────────────────────────────────────────────────────')
+      lines.push(latestData.value.rag_context_text)
+      lines.push('')
+    }
+    
+    if (latestData.value.rag_prompt_text) {
+      lines.push(`【RAG 完整提示词】`)
+      lines.push('───────────────────────────────────────────────────────')
+      lines.push(latestData.value.rag_prompt_text)
+      lines.push('')
+    }
   }
   
   if (latestData.value.history_messages?.length > 0) {
@@ -760,6 +826,10 @@ onMounted(() => {
   height: 100%;
   overflow-y: auto;
   padding: 24px;
+}
+
+.empty-notice {
+  margin-bottom: 16px;
 }
 
 .page-header {
@@ -1185,6 +1255,14 @@ section {
   
   &.messages-card .card-header {
     background: linear-gradient(135deg, #6366f1 0%, #4f46e5 100%);
+  }
+  
+  &.rag-context-card .card-header {
+    background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
+  }
+  
+  &.rag-prompt-card .card-header {
+    background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
   }
   
   &.final-card .card-header {
