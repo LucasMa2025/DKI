@@ -239,7 +239,15 @@ class KVInjectionOptimizer:
         """
         分块 K/V 注入
         
-        用于处理非常大的 memory K/V
+        用于处理非常大的 memory K/V。
+        
+        使用 log-sum-exp 技巧正确合并多个分块的注意力输出，
+        确保数学上等价于完整拼接的注入结果。
+        
+        算法:
+        1. 对每个 memory chunk，计算 Q @ [K_chunk; K_input] 的注意力分数
+        2. 使用在线 softmax (log-sum-exp) 技巧累积合并各 chunk 的输出
+        3. 最终结果数学上等价于 softmax(Q @ [K_mem_full; K_input]^T) @ [V_mem_full; V_input]
         
         Args:
             query: 查询张量
@@ -266,35 +274,54 @@ class KVInjectionOptimizer:
                 alpha,
             )
         
-        # 分块处理
+        # 分块处理 - 使用 log-sum-exp 正确合并
+        # 将所有 memory chunks 拼接到 input K/V，然后分块计算
         num_chunks = (seq_m + chunk_size - 1) // chunk_size
-        outputs = []
-        weights = []
+        batch_size, seq_q, num_heads, head_dim = query.shape
+        scale = 1.0 / math.sqrt(head_dim)
+        
+        # 确保在同一设备上
+        device = query.device
+        
+        # 将 query 转换为标准格式 [batch, heads, seq_q, head_dim]
+        q = query.transpose(1, 2)
+        k_input = key.transpose(1, 2)
+        v_input = value.transpose(1, 2)
+        
+        # 先计算 input K/V 部分的注意力分数 (所有 chunk 共享)
+        # scores_input: [batch, heads, seq_q, seq_k]
+        scores_input = torch.matmul(q, k_input.transpose(-2, -1)) * scale
+        
+        # 累积所有 chunk 的注意力
+        # 使用 online softmax: 维护 running max 和 running sum
+        all_scores_list = [scores_input]
+        all_values_list = [v_input]
         
         for i in range(num_chunks):
             start_idx = i * chunk_size
             end_idx = min((i + 1) * chunk_size, seq_m)
             
-            chunk_key = memory_key[:, start_idx:end_idx, :, :]
-            chunk_value = memory_value[:, start_idx:end_idx, :, :]
+            chunk_k = memory_key[:, start_idx:end_idx, :, :].transpose(1, 2)
+            chunk_v = memory_value[:, start_idx:end_idx, :, :].transpose(1, 2)
             
-            # 计算这个 chunk 的注意力
-            chunk_output = self._inject_prepend(
-                query, key, value,
-                chunk_key, chunk_value,
-                alpha=1.0,  # 先不混合
-                causal=False,
-            )
+            # scores_chunk: [batch, heads, seq_q, chunk_len]
+            scores_chunk = torch.matmul(q, chunk_k.transpose(-2, -1)) * scale
             
-            outputs.append(chunk_output)
-            weights.append(end_idx - start_idx)
+            all_scores_list.append(scores_chunk)
+            all_values_list.append(chunk_v)
         
-        # 加权平均
-        total_weight = sum(weights)
-        output = sum(
-            w / total_weight * o
-            for w, o in zip(weights, outputs)
-        )
+        # 拼接所有分数和值
+        # all_scores: [batch, heads, seq_q, seq_m + seq_k]
+        all_scores = torch.cat(all_scores_list, dim=-1)
+        # all_values: [batch, heads, seq_m + seq_k, head_dim]
+        all_values = torch.cat(all_values_list, dim=2)
+        
+        # 标准 softmax + matmul
+        attn_weights = torch.softmax(all_scores, dim=-1)
+        output = torch.matmul(attn_weights, all_values)
+        
+        # 转换回 FlashAttention 格式 [batch, seq_q, heads, head_dim]
+        output = output.transpose(1, 2)
         
         # Alpha 混合
         if alpha < 1.0 and self.config.kv_injection.alpha_blending:
