@@ -59,6 +59,7 @@ class MemoryRouter:
         self._memories: Dict[str, Dict[str, Any]] = {}
         self._id_to_idx: Dict[str, int] = {}
         self._idx_to_id: Dict[int, str] = {}
+        self._needs_rebuild: bool = False
     
     def _init_index(self) -> None:
         """Initialize FAISS index."""
@@ -182,6 +183,10 @@ class MemoryRouter:
         if self.index is None or len(self._memories) == 0:
             return []
         
+        # Auto-rebuild index if needed (after remove_memory)
+        if self._needs_rebuild:
+            self.rebuild_index()
+        
         top_k = top_k or self.top_k
         threshold = threshold or self.similarity_threshold
         
@@ -258,6 +263,7 @@ class MemoryRouter:
                 metadata=memory.get('metadata'),
             )
         
+        self._needs_rebuild = False
         logger.info(f"Rebuilt index with {len(self._memories)} memories")
     
     def get_stats(self) -> Dict[str, Any]:
