@@ -123,11 +123,11 @@
     <!-- Session Detail Drawer -->
     <el-drawer
       v-model="showDetail"
-      :title="selectedSession?.title"
+      :title="selectedSession?.title || '会话详情'"
       direction="rtl"
       size="500px"
     >
-      <template v-if="selectedSession">
+      <div v-if="selectedSession">
         <el-descriptions :column="1" border>
           <el-descriptions-item label="会话 ID">
             {{ selectedSession.id }}
@@ -157,13 +157,14 @@
           </div>
           <el-empty v-if="previewMessages.length === 0" description="暂无消息" />
         </div>
-        
-        <template #footer>
-          <el-button @click="showDetail = false">关闭</el-button>
-          <el-button type="primary" @click="handleOpenFromDetail">
-            打开会话
-          </el-button>
-        </template>
+      </div>
+      <el-empty v-else description="请选择一个会话" />
+      
+      <template #footer>
+        <el-button @click="showDetail = false">关闭</el-button>
+        <el-button type="primary" @click="handleOpenFromDetail" :disabled="!selectedSession">
+          打开会话
+        </el-button>
       </template>
     </el-drawer>
   </div>

@@ -278,6 +278,126 @@
         </div>
       </section>
 
+      <!-- Injection Text Display Section -->
+      <section class="injection-text-section">
+        <h2>
+          <el-icon><Document /></el-icon>
+          注入内容显示
+          <el-button-group style="margin-left: auto;">
+            <el-button size="small" @click="toggleInjectionExpand">
+              {{ injectionExpanded ? '收起' : '展开' }}
+            </el-button>
+            <el-button size="small" @click="copyInjectionText">
+              <el-icon><CopyDocument /></el-icon>
+              复制
+            </el-button>
+          </el-button-group>
+        </h2>
+        
+        <div class="injection-text-grid" :class="{ expanded: injectionExpanded }">
+          <!-- DKI 偏好注入 -->
+          <div class="injection-text-card preference-card">
+            <div class="card-header">
+              <span class="card-title">
+                <el-icon><User /></el-icon>
+                DKI 偏好注入 (K/V)
+              </span>
+              <el-tag type="success" size="small">
+                {{ latestData?.token_distribution?.preference || 0 }} tokens
+              </el-tag>
+            </div>
+            <div class="card-body">
+              <div class="text-label">偏好原文 (不显示实际 K/V):</div>
+              <el-input
+                type="textarea"
+                :value="latestData?.preference_text || '(无偏好注入)'"
+                :rows="injectionExpanded ? 8 : 3"
+                readonly
+                resize="none"
+              />
+              <div class="text-meta">
+                <span>Alpha: {{ latestData?.injection_layers?.[0]?.alpha?.toFixed(2) || '0.00' }}</span>
+                <span>位置: 负位置 (不占用 Context)</span>
+              </div>
+            </div>
+          </div>
+          
+          <!-- DKI 历史后缀 -->
+          <div class="injection-text-card history-card">
+            <div class="card-header">
+              <span class="card-title">
+                <el-icon><ChatDotRound /></el-icon>
+                DKI 历史后缀 (Suffix)
+              </span>
+              <el-tag type="warning" size="small">
+                {{ latestData?.token_distribution?.history || 0 }} tokens
+              </el-tag>
+            </div>
+            <div class="card-body">
+              <div class="text-label">历史后缀原文:</div>
+              <el-input
+                type="textarea"
+                :value="latestData?.history_suffix_text || '(无历史后缀)'"
+                :rows="injectionExpanded ? 8 : 3"
+                readonly
+                resize="none"
+              />
+              <div class="text-meta">
+                <span>消息数: {{ latestData?.history_messages?.length || 0 }}</span>
+                <span>位置: 正位置 (占用 Context)</span>
+              </div>
+            </div>
+          </div>
+          
+          <!-- 历史消息列表 -->
+          <div class="injection-text-card messages-card" v-if="latestData?.history_messages?.length > 0">
+            <div class="card-header">
+              <span class="card-title">
+                <el-icon><List /></el-icon>
+                历史消息详情
+              </span>
+              <el-tag type="info" size="small">
+                {{ latestData?.history_messages?.length || 0 }} 条
+              </el-tag>
+            </div>
+            <div class="card-body messages-list">
+              <div
+                v-for="(msg, idx) in latestData?.history_messages || []"
+                :key="idx"
+                class="message-item"
+                :class="[`message-${msg.role}`]"
+              >
+                <span class="message-role">{{ msg.role === 'user' ? '用户' : '助手' }}:</span>
+                <span class="message-content">{{ msg.content }}</span>
+              </div>
+              <el-empty v-if="!latestData?.history_messages?.length" description="无历史消息" />
+            </div>
+          </div>
+          
+          <!-- 最终输入预览 -->
+          <div class="injection-text-card final-card">
+            <div class="card-header">
+              <span class="card-title">
+                <el-icon><View /></el-icon>
+                最终输入预览
+              </span>
+              <el-tag type="primary" size="small">
+                {{ latestData?.token_distribution?.total || 0 }} tokens
+              </el-tag>
+            </div>
+            <div class="card-body">
+              <el-input
+                type="textarea"
+                :value="latestData?.final_input_preview || latestData?.original_query || '(无数据)'"
+                :rows="injectionExpanded ? 10 : 4"
+                readonly
+                resize="none"
+              />
+            </div>
+          </div>
+        </div>
+      </section>
+
       <!-- History Section -->
       <section class="history-section">
         <h2>
@@ -372,7 +492,11 @@ import {
   Grid,
   List,
   Clock,
+  Document,
+  CopyDocument,
+  View,
 } from '@element-plus/icons-vue'
+import { ElMessage } from 'element-plus'
 import VChart from 'vue-echarts'
 import { use } from 'echarts/core'
 import { CanvasRenderer } from 'echarts/renderers'
@@ -390,6 +514,7 @@ const latestData = ref<any>(null)
 const historyItems = ref<any[]>([])
 const showDetailDialog = ref(false)
 const detailData = ref<any>(null)
+const injectionExpanded = ref(false)
 
 // Computed
 const flowSteps = computed(() => latestData.value?.flow_steps || defaultFlowSteps)
@@ -565,6 +690,63 @@ function formatDetailValue(value: any) {
 
 function formatTimestamp(ts: string) {
   return dayjs(ts).format('YYYY-MM-DD HH:mm:ss')
+}
+
+function toggleInjectionExpand() {
+  injectionExpanded.value = !injectionExpanded.value
+}
+
+function copyInjectionText() {
+  if (!latestData.value) {
+    ElMessage.warning('没有可复制的数据')
+    return
+  }
+  
+  const lines = []
+  lines.push('═══════════════════════════════════════════════════════')
+  lines.push('  DKI 注入信息')
+  lines.push('═══════════════════════════════════════════════════════')
+  lines.push('')
+  lines.push(`【原始查询】`)
+  lines.push(latestData.value.original_query || '(无)')
+  lines.push('')
+  
+  if (latestData.value.preference_text) {
+    lines.push(`【偏好注入】(K/V 注入, α=${latestData.value.injection_layers?.[0]?.alpha?.toFixed(2) || '0.00'})`)
+    lines.push('───────────────────────────────────────────────────────')
+    lines.push(latestData.value.preference_text)
+    lines.push('')
+  }
+  
+  if (latestData.value.history_suffix_text) {
+    lines.push(`【历史后缀】(${latestData.value.token_distribution?.history || 0} tokens)`)
+    lines.push('───────────────────────────────────────────────────────')
+    lines.push(latestData.value.history_suffix_text)
+    lines.push('')
+  }
+  
+  if (latestData.value.history_messages?.length > 0) {
+    lines.push(`【历史消息】(${latestData.value.history_messages.length} 条)`)
+    lines.push('───────────────────────────────────────────────────────')
+    for (const msg of latestData.value.history_messages) {
+      const role = msg.role === 'user' ? '用户' : '助手'
+      lines.push(`  [${role}] ${msg.content}`)
+    }
+    lines.push('')
+  }
+  
+  lines.push(`【最终输入预览】`)
+  lines.push('───────────────────────────────────────────────────────')
+  lines.push(latestData.value.final_input_preview || latestData.value.original_query || '(无)')
+  lines.push('')
+  lines.push('═══════════════════════════════════════════════════════')
+  
+  const text = lines.join('\n')
+  navigator.clipboard.writeText(text).then(() => {
+    ElMessage.success('已复制到剪贴板')
+  }).catch(() => {
+    ElMessage.error('复制失败')
+  })
 }
 
 // Lifecycle
@@ -921,6 +1103,123 @@ section {
 
   .step-details {
     margin-top: 8px;
+  }
+}
+
+// Injection Text Section
+.injection-text-section {
+  h2 {
+    display: flex;
+    align-items: center;
+  }
+}
+
+.injection-text-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 16px;
+  
+  &.expanded {
+    grid-template-columns: 1fr;
+  }
+  
+  @media (max-width: 1024px) {
+    grid-template-columns: 1fr;
+  }
+}
+
+.injection-text-card {
+  background: var(--bg-hover);
+  border-radius: 8px;
+  overflow: hidden;
+  
+  .card-header {
+    padding: 12px 16px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    
+    .card-title {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 14px;
+      font-weight: 600;
+      color: white;
+    }
+  }
+  
+  .card-body {
+    padding: 16px;
+    
+    .text-label {
+      font-size: 12px;
+      color: var(--text-muted);
+      margin-bottom: 8px;
+    }
+    
+    .text-meta {
+      display: flex;
+      gap: 16px;
+      margin-top: 8px;
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
+    
+    :deep(.el-textarea__inner) {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-color);
+      font-family: 'Fira Code', 'Consolas', monospace;
+      font-size: 12px;
+      line-height: 1.5;
+    }
+  }
+  
+  &.preference-card .card-header {
+    background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+  }
+  
+  &.history-card .card-header {
+    background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
+  }
+  
+  &.messages-card .card-header {
+    background: linear-gradient(135deg, #6366f1 0%, #4f46e5 100%);
+  }
+  
+  &.final-card .card-header {
+    background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%);
+  }
+}
+
+.messages-list {
+  max-height: 200px;
+  overflow-y: auto;
+  
+  .message-item {
+    padding: 8px 12px;
+    border-radius: 6px;
+    margin-bottom: 8px;
+    font-size: 13px;
+    
+    &.message-user {
+      background: var(--bg-surface);
+    }
+    
+    &.message-assistant {
+      background: rgba(16, 185, 129, 0.1);
+      border: 1px solid rgba(16, 185, 129, 0.2);
+    }
+    
+    .message-role {
+      font-weight: 600;
+      color: var(--text-secondary);
+      margin-right: 8px;
+    }
+    
+    .message-content {
+      color: var(--text-primary);
+    }
   }
 }
 
