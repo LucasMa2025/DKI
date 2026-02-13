@@ -61,6 +61,9 @@ class InjectionVisualizationResponse(BaseModel):
     request_id: str = Field(..., description="请求 ID")
     timestamp: str = Field(..., description="时间戳")
     
+    # 模式
+    mode: str = Field("dki", description="模式: dki/rag/baseline")
+    
     # 输入信息
     original_query: str = Field(..., description="原始查询")
     user_id: str = Field(..., description="用户 ID")
@@ -85,6 +88,10 @@ class InjectionVisualizationResponse(BaseModel):
     preference_text: str = Field("", description="偏好原文")
     history_suffix_text: str = Field("", description="历史后缀原文")
     history_messages: List[Dict[str, str]] = Field(default_factory=list, description="历史消息列表")
+    
+    # RAG 专用字段
+    rag_prompt_text: str = Field("", description="RAG 完整提示词")
+    rag_context_text: str = Field("", description="RAG 检索上下文")
     
     # 性能指标
     total_latency_ms: float = Field(0.0, description="总延迟 (ms)")
@@ -399,13 +406,24 @@ def build_visualization_response(data: Dict[str, Any]) -> InjectionVisualization
         "total": data.get("total_tokens", 0),
     }
     
-    # 最终输入预览
+    # 最终输入预览 (保留更多内容以便调试分析)
     final_input = data.get("final_input", data.get("query", ""))
-    final_input_preview = final_input[:200] + "..." if len(final_input) > 200 else final_input
+    final_input_preview = final_input[:2000] + "..." if len(final_input) > 2000 else final_input
+    
+    # 判断模式
+    request_id = data.get("request_id", "")
+    mode = "dki"
+    if request_id.startswith("chat-rag-") or request_id.startswith("rag-"):
+        mode = "rag"
+    elif request_id.startswith("chat-baseline-") or request_id.startswith("baseline-"):
+        mode = "baseline"
+    # 允许显式设置
+    mode = data.get("mode", mode)
     
     return InjectionVisualizationResponse(
-        request_id=data.get("request_id", ""),
+        request_id=request_id,
         timestamp=data.get("timestamp", datetime.utcnow().isoformat()),
+        mode=mode,
         original_query=data.get("query", ""),
         user_id=data.get("user_id", ""),
         session_id=data.get("session_id", ""),
@@ -418,6 +436,9 @@ def build_visualization_response(data: Dict[str, Any]) -> InjectionVisualization
         preference_text=data.get("preference_text", ""),
         history_suffix_text=data.get("history_suffix_text", ""),
         history_messages=data.get("history_messages", []),
+        # RAG 专用
+        rag_prompt_text=data.get("rag_prompt_text", data.get("final_input", "")),
+        rag_context_text=data.get("rag_context_text", ""),
         # 性能指标
         total_latency_ms=data.get("latency_ms", 0),
         injection_overhead_ms=data.get("adapter_latency_ms", 0) + data.get("injection_latency_ms", 0),

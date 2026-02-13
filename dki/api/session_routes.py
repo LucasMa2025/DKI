@@ -178,8 +178,9 @@ def create_session_router() -> APIRouter:
             
             # Get title from metadata
             title = session_id
-            if hasattr(session, 'metadata') and session.metadata:
-                title = session.metadata.get('title', session_id)
+            session_meta = session.get_metadata()
+            if session_meta:
+                title = session_meta.get('title', session_id)
             
             return SessionResponse(
                 id=session.id,
@@ -215,15 +216,17 @@ def create_session_router() -> APIRouter:
             
             # Update title in metadata
             if request.title is not None:
-                metadata = session.metadata or {}
-                metadata['title'] = request.title
-                session_repo.update(session_id, metadata=metadata)
+                session_meta = session.get_metadata()
+                session_meta['title'] = request.title
+                session.set_metadata(session_meta)
+                db.flush()
             
             # Get updated session
             session = session_repo.get(session_id)
             title = session_id
-            if hasattr(session, 'metadata') and session.metadata:
-                title = session.metadata.get('title', session_id)
+            session_meta = session.get_metadata()
+            if session_meta:
+                title = session_meta.get('title', session_id)
             
             return SessionResponse(
                 id=session.id,
