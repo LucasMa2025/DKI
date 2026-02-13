@@ -91,6 +91,11 @@ class HybridInjectionResult:
     history_tokens: int = 0
     total_tokens: int = 0
     metadata: Dict[str, Any] = field(default_factory=dict)
+    
+    # 新增: 用于显示的明文信息
+    preference_text: str = ""  # 偏好原文
+    history_suffix_text: str = ""  # 历史后缀原文
+    history_messages: List[Dict[str, str]] = field(default_factory=list)  # 历史消息列表
 
 
 class HybridDKIInjector:
@@ -203,11 +208,18 @@ Note: Historical information is for reference; please answer comprehensively.
         text_parts.append(f"User: {user_query}")
         
         # 3. History as suffix (if enabled)
+        history_text = ""
         if self.config.history_enabled and history and history.messages:
             history_text = self._format_history(history)
             if history_text:
                 text_parts.append(history_text)
                 result.history_tokens = self._estimate_tokens(history_text)
+                # 保存用于显示的历史信息
+                result.history_suffix_text = history_text
+                result.history_messages = [
+                    {"role": msg.role, "content": msg.content}
+                    for msg in history.get_recent(self.config.history_max_messages)
+                ]
         
         result.input_text = "\n\n".join(text_parts)
         result.total_tokens = self._estimate_tokens(result.input_text)
@@ -220,6 +232,8 @@ Note: Historical information is for reference; please answer comprehensively.
                 result.preference_alpha = self.config.preference_alpha
                 result.preference_tokens = preference.token_count
                 result.metadata["preference_cached"] = preference.kv_cache is not None
+            # 保存用于显示的偏好文本 (无论 K/V 是否成功计算)
+            result.preference_text = preference.content
         
         logger.debug(
             f"Hybrid input prepared: "
