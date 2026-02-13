@@ -47,6 +47,111 @@ class ExperimentConfig:
 
 
 @dataclass
+class InjectionInfo:
+    """
+    注入信息记录 - 用于显示 DKI/RAG 的实际注入内容
+    
+    DKI: 显示偏好文本 + 历史后缀提示词 (不显示实际 K/V)
+    RAG: 显示完整的构造提示词
+    """
+    mode: str  # 'dki' or 'rag'
+    
+    # 原始用户查询
+    original_query: str = ""
+    
+    # DKI 偏好注入 (明文)
+    preference_text: Optional[str] = None
+    preference_tokens: int = 0
+    
+    # DKI 历史后缀 (明文)
+    history_suffix: Optional[str] = None
+    history_tokens: int = 0
+    history_messages: List[Dict[str, str]] = field(default_factory=list)
+    
+    # RAG 完整提示词
+    rag_prompt: Optional[str] = None
+    rag_context: Optional[str] = None  # 检索到的上下文
+    
+    # 最终发送给模型的输入
+    final_input: str = ""
+    
+    # 注入参数
+    alpha: float = 0.0
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'mode': self.mode,
+            'original_query': self.original_query,
+            'preference_text': self.preference_text,
+            'preference_tokens': self.preference_tokens,
+            'history_suffix': self.history_suffix,
+            'history_tokens': self.history_tokens,
+            'history_messages': self.history_messages,
+            'rag_prompt': self.rag_prompt,
+            'rag_context': self.rag_context,
+            'final_input': self.final_input,
+            'alpha': self.alpha,
+        }
+    
+    def get_display_text(self) -> str:
+        """获取用于显示的格式化文本"""
+        lines = []
+        lines.append(f"═══════════════════════════════════════════════════════")
+        lines.append(f"  模式: {self.mode.upper()}")
+        lines.append(f"═══════════════════════════════════════════════════════")
+        lines.append(f"")
+        lines.append(f"【原始查询】")
+        lines.append(f"{self.original_query}")
+        lines.append(f"")
+        
+        if self.mode == 'dki':
+            if self.preference_text:
+                lines.append(f"【偏好注入】(K/V 注入, α={self.alpha:.2f}, {self.preference_tokens} tokens)")
+                lines.append(f"───────────────────────────────────────────────────────")
+                lines.append(self.preference_text)
+                lines.append(f"")
+            
+            if self.history_suffix:
+                lines.append(f"【历史后缀】(Suffix Prompt, {self.history_tokens} tokens)")
+                lines.append(f"───────────────────────────────────────────────────────")
+                lines.append(self.history_suffix)
+                lines.append(f"")
+            
+            if self.history_messages:
+                lines.append(f"【历史消息】({len(self.history_messages)} 条)")
+                lines.append(f"───────────────────────────────────────────────────────")
+                for msg in self.history_messages:
+                    role = "用户" if msg['role'] == 'user' else "助手"
+                    lines.append(f"  [{role}] {msg['content'][:100]}{'...' if len(msg['content']) > 100 else ''}")
+                lines.append(f"")
+        
+        elif self.mode == 'rag':
+            if self.rag_context:
+                lines.append(f"【检索上下文】")
+                lines.append(f"───────────────────────────────────────────────────────")
+                lines.append(self.rag_context)
+                lines.append(f"")
+            
+            if self.rag_prompt:
+                lines.append(f"【完整提示词】")
+                lines.append(f"───────────────────────────────────────────────────────")
+                lines.append(self.rag_prompt)
+                lines.append(f"")
+        
+        lines.append(f"【最终输入】")
+        lines.append(f"───────────────────────────────────────────────────────")
+        # 截断过长的输入
+        final = self.final_input
+        if len(final) > 2000:
+            final = final[:1000] + "\n... (中间省略) ...\n" + final[-500:]
+        lines.append(final)
+        lines.append(f"")
+        lines.append(f"═══════════════════════════════════════════════════════")
+        
+        return "\n".join(lines)
+
+
+@dataclass
 class ExperimentResult:
     """Single experiment result."""
     mode: str
@@ -59,6 +164,8 @@ class ExperimentResult:
     alpha: Optional[float] = None
     cache_hit: bool = False
     metrics: Dict[str, Any] = field(default_factory=dict)
+    # 新增: 注入信息
+    injection_info: Optional[InjectionInfo] = None
     
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -72,6 +179,7 @@ class ExperimentResult:
             'alpha': self.alpha,
             'cache_hit': self.cache_hit,
             'metrics': self.metrics,
+            'injection_info': self.injection_info.to_dict() if self.injection_info else None,
         }
 
 
@@ -283,16 +391,33 @@ class ExperimentRunner:
         session_id: str,
         item: Dict[str, Any],
         config: ExperimentConfig,
+        user_id: str = "experiment_user",
     ) -> ExperimentResult:
-        """Run a single query."""
+        """Run a single query and capture injection info."""
         try:
             if mode == 'dki':
                 response = self.dki_system.chat(
                     query=query,
                     session_id=session_id,
+                    user_id=user_id,
                     max_new_tokens=config.max_new_tokens,
                     temperature=config.temperature,
                 )
+                
+                # 构造 DKI 注入信息
+                hybrid_info = response.metadata.get('hybrid_injection', {})
+                injection_info = InjectionInfo(
+                    mode='dki',
+                    original_query=query,
+                    preference_text=hybrid_info.get('preference_text'),
+                    preference_tokens=hybrid_info.get('preference_tokens', 0),
+                    history_suffix=hybrid_info.get('history_suffix_text'),
+                    history_tokens=hybrid_info.get('history_tokens', 0),
+                    history_messages=hybrid_info.get('history_messages', []),
+                    final_input=hybrid_info.get('final_input', query),
+                    alpha=response.gating_decision.alpha,
+                )
+                
                 return ExperimentResult(
                     mode=mode,
                     dataset=item.get('_dataset', 'unknown'),
@@ -303,15 +428,29 @@ class ExperimentRunner:
                     memories_used=[m.memory_id for m in response.memories_used],
                     alpha=response.gating_decision.alpha,
                     cache_hit=response.cache_hit,
+                    injection_info=injection_info,
                 )
                 
             elif mode == 'rag':
                 response = self.rag_system.chat(
                     query=query,
                     session_id=session_id,
+                    user_id=user_id,
                     max_new_tokens=config.max_new_tokens,
                     temperature=config.temperature,
                 )
+                
+                # 构造 RAG 注入信息
+                prompt_info = response.prompt_info
+                injection_info = InjectionInfo(
+                    mode='rag',
+                    original_query=query,
+                    rag_context=prompt_info.retrieved_context if prompt_info else None,
+                    rag_prompt=prompt_info.final_prompt if prompt_info else None,
+                    history_messages=prompt_info.history_messages if prompt_info else [],
+                    final_input=prompt_info.final_prompt if prompt_info else query,
+                )
+                
                 return ExperimentResult(
                     mode=mode,
                     dataset=item.get('_dataset', 'unknown'),
@@ -320,6 +459,7 @@ class ExperimentRunner:
                     response=response.text,
                     latency_ms=response.latency_ms,
                     memories_used=[m.memory_id for m in response.memories_used],
+                    injection_info=injection_info,
                 )
                 
             else:  # baseline
@@ -329,6 +469,14 @@ class ExperimentRunner:
                     max_new_tokens=config.max_new_tokens,
                     temperature=config.temperature,
                 )
+                
+                # Baseline 无注入
+                injection_info = InjectionInfo(
+                    mode='baseline',
+                    original_query=query,
+                    final_input=query,
+                )
+                
                 return ExperimentResult(
                     mode=mode,
                     dataset=item.get('_dataset', 'unknown'),
@@ -337,6 +485,7 @@ class ExperimentRunner:
                     response=output.text,
                     latency_ms=output.latency_ms,
                     memories_used=[],
+                    injection_info=injection_info,
                 )
                 
         except Exception as e:
@@ -572,3 +721,154 @@ class ExperimentRunner:
         
         logger.info(f"Latency comparison results saved to {filepath}")
         return results
+
+
+class InjectionInfoViewer:
+    """
+    注入信息查看器 - 用于显示和比较 DKI/RAG 的注入内容
+    
+    功能:
+    - 显示 DKI 偏好注入 (明文, 不显示 K/V)
+    - 显示 DKI 历史后缀提示词
+    - 显示 RAG 完整提示词
+    - 支持最大化和复制
+    """
+    
+    def __init__(self, output_dir: str = "./injection_logs"):
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self._injection_history: List[InjectionInfo] = []
+    
+    def record(self, injection_info: InjectionInfo) -> None:
+        """记录注入信息"""
+        self._injection_history.append(injection_info)
+    
+    def get_latest(self, n: int = 10) -> List[InjectionInfo]:
+        """获取最近的注入信息"""
+        return self._injection_history[-n:]
+    
+    def display(self, injection_info: InjectionInfo) -> str:
+        """
+        显示注入信息 (返回格式化文本)
+        
+        可用于:
+        - 控制台输出
+        - 保存到文件
+        - UI 显示
+        """
+        return injection_info.get_display_text()
+    
+    def compare(self, dki_info: InjectionInfo, rag_info: InjectionInfo) -> str:
+        """
+        并排比较 DKI 和 RAG 的注入信息
+        """
+        lines = []
+        lines.append("╔═══════════════════════════════════════════════════════════════════════════════════════════════════╗")
+        lines.append("║                              DKI vs RAG 注入信息对比                                               ║")
+        lines.append("╚═══════════════════════════════════════════════════════════════════════════════════════════════════╝")
+        lines.append("")
+        
+        # 原始查询
+        lines.append(f"【原始查询】")
+        lines.append(f"  {dki_info.original_query}")
+        lines.append("")
+        
+        # DKI 部分
+        lines.append("┌─────────────────────────────────────────────────────────────────────────────────────────────────────┐")
+        lines.append("│                                          DKI 注入                                                   │")
+        lines.append("├─────────────────────────────────────────────────────────────────────────────────────────────────────┤")
+        
+        if dki_info.preference_text:
+            lines.append(f"│ 【偏好注入】(K/V 注入, α={dki_info.alpha:.2f}, {dki_info.preference_tokens} tokens)")
+            lines.append(f"│   {dki_info.preference_text[:80]}{'...' if len(dki_info.preference_text) > 80 else ''}")
+        else:
+            lines.append("│ 【偏好注入】无")
+        
+        if dki_info.history_messages:
+            lines.append(f"│ 【历史消息】({len(dki_info.history_messages)} 条, {dki_info.history_tokens} tokens)")
+            for msg in dki_info.history_messages[:3]:
+                role = "用户" if msg['role'] == 'user' else "助手"
+                lines.append(f"│   [{role}] {msg['content'][:60]}{'...' if len(msg['content']) > 60 else ''}")
+            if len(dki_info.history_messages) > 3:
+                lines.append(f"│   ... 还有 {len(dki_info.history_messages) - 3} 条消息")
+        else:
+            lines.append("│ 【历史消息】无")
+        
+        lines.append("└─────────────────────────────────────────────────────────────────────────────────────────────────────┘")
+        lines.append("")
+        
+        # RAG 部分
+        lines.append("┌─────────────────────────────────────────────────────────────────────────────────────────────────────┐")
+        lines.append("│                                          RAG 注入                                                   │")
+        lines.append("├─────────────────────────────────────────────────────────────────────────────────────────────────────┤")
+        
+        if rag_info.rag_context:
+            lines.append(f"│ 【检索上下文】")
+            context_preview = rag_info.rag_context[:200].replace('\n', ' ')
+            lines.append(f"│   {context_preview}{'...' if len(rag_info.rag_context) > 200 else ''}")
+        else:
+            lines.append("│ 【检索上下文】无")
+        
+        if rag_info.history_messages:
+            lines.append(f"│ 【历史消息】({len(rag_info.history_messages)} 条)")
+            for msg in rag_info.history_messages[:3]:
+                role = "用户" if msg['role'] == 'user' else "助手"
+                lines.append(f"│   [{role}] {msg['content'][:60]}{'...' if len(msg['content']) > 60 else ''}")
+        else:
+            lines.append("│ 【历史消息】无")
+        
+        lines.append("│")
+        lines.append(f"│ 【完整提示词长度】{len(rag_info.rag_prompt or '')} 字符")
+        lines.append("└─────────────────────────────────────────────────────────────────────────────────────────────────────┘")
+        
+        return "\n".join(lines)
+    
+    def save_to_file(self, injection_info: InjectionInfo, filename: Optional[str] = None) -> str:
+        """保存注入信息到文件"""
+        if filename is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"injection_{injection_info.mode}_{timestamp}.txt"
+        
+        filepath = self.output_dir / filename
+        content = self.display(injection_info)
+        
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write(content)
+        
+        logger.info(f"Injection info saved to {filepath}")
+        return str(filepath)
+    
+    def save_comparison(
+        self,
+        dki_info: InjectionInfo,
+        rag_info: InjectionInfo,
+        filename: Optional[str] = None,
+    ) -> str:
+        """保存对比信息到文件"""
+        if filename is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"injection_comparison_{timestamp}.txt"
+        
+        filepath = self.output_dir / filename
+        content = self.compare(dki_info, rag_info)
+        
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write(content)
+        
+        logger.info(f"Injection comparison saved to {filepath}")
+        return str(filepath)
+    
+    def export_json(self, injection_info: InjectionInfo) -> Dict[str, Any]:
+        """导出为 JSON 格式 (用于 API)"""
+        return {
+            **injection_info.to_dict(),
+            'display_text': injection_info.get_display_text(),
+        }
+    
+    def get_copyable_text(self, injection_info: InjectionInfo) -> str:
+        """
+        获取可复制的纯文本格式
+        
+        用于 UI 的复制功能
+        """
+        return injection_info.get_display_text()
