@@ -18,7 +18,7 @@ Version: 1.0.0
 
 import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Any, Callable
+from typing import Dict, List, Optional, Any, Callable, Tuple
 from enum import Enum
 from datetime import datetime
 import yaml
@@ -313,7 +313,7 @@ class ReferenceResolver:
         ref_type: ReferenceType,
         history: List[Message],
         stance_cache: Optional[Dict[str, Any]] = None,
-    ) -> tuple[Optional[str], List[int]]:
+    ) -> Tuple[Optional[str], List[int]]:
         """
         根据范围解析内容
         
@@ -369,7 +369,7 @@ class ReferenceResolver:
         
         return "\n".join(lines)
     
-    def _find_last_topic(self, history: List[Message]) -> tuple[Optional[str], List[int]]:
+    def _find_last_topic(self, history: List[Message]) -> Tuple[Optional[str], List[int]]:
         """
         查找上一个共享主题
         
@@ -393,7 +393,7 @@ class ReferenceResolver:
         self,
         history: List[Message],
         stance_cache: Optional[Dict[str, Any]] = None,
-    ) -> tuple[Optional[str], List[int]]:
+    ) -> Tuple[Optional[str], List[int]]:
         """
         查找助手的历史立场
         

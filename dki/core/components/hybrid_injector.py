@@ -228,6 +228,31 @@ Note: Historical information is for reference; please answer comprehensively.
         result.input_text = "\n\n".join(text_parts)
         result.total_tokens = self._estimate_tokens(result.input_text)
         
+        # Safety: 检查总 prompt 长度是否超过模型限制 (预留 512 tokens 给生成)
+        max_model_len = self.config.history_max_tokens * 6  # 粗略估算模型最大长度
+        if hasattr(self.model, 'max_model_len') and self.model is not None:
+            max_model_len = getattr(self.model, 'max_model_len', 4096)
+        elif self.tokenizer and hasattr(self.tokenizer, 'model_max_length'):
+            max_model_len = self.tokenizer.model_max_length
+        else:
+            max_model_len = 4096
+        
+        max_prompt_tokens = max_model_len - 512
+        if result.total_tokens > max_prompt_tokens:
+            logger.warning(
+                f"DKI prompt too long ({result.total_tokens} > {max_prompt_tokens}), "
+                f"truncating history"
+            )
+            # 截断历史, 只保留 system prompt + query
+            truncated_parts = []
+            if system_prompt:
+                truncated_parts.append(system_prompt)
+            truncated_parts.append(f"User: {user_query}")
+            result.input_text = "\n\n".join(truncated_parts)
+            result.history_tokens = 0
+            result.history_suffix_text = ""
+            result.total_tokens = self._estimate_tokens(result.input_text)
+        
         # 4. Preference K/V (if enabled)
         if self.config.preference_enabled and preference and preference.content:
             kv_cache = self._get_or_compute_preference_kv(preference)
