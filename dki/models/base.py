@@ -69,12 +69,30 @@ class KVCacheEntry:
         layer_idx: int,
         dtype: torch.dtype = torch.float16,
     ) -> 'KVCacheEntry':
-        """Deserialize from bytes."""
+        """Deserialize from bytes.
+        
+        Args:
+            key_bytes: Serialized key tensor bytes
+            value_bytes: Serialized value tensor bytes
+            shape: Tensor shape
+            layer_idx: Layer index
+            dtype: Target torch dtype (also used to determine numpy dtype for parsing)
+        """
+        # Map torch dtype to numpy dtype for correct byte interpretation
+        # Previously hardcoded np.float16, causing data corruption for float32/bfloat16 models
+        _torch_to_numpy = {
+            torch.float16: np.float16,
+            torch.float32: np.float32,
+            torch.float64: np.float64,
+            torch.bfloat16: np.float16,  # bfloat16 has no numpy equivalent, store as float16
+        }
+        np_dtype = _torch_to_numpy.get(dtype, np.float16)
+        
         key = torch.from_numpy(
-            np.frombuffer(key_bytes, dtype=np.float16).reshape(shape)
+            np.frombuffer(key_bytes, dtype=np_dtype).copy().reshape(shape)
         ).to(dtype)
         value = torch.from_numpy(
-            np.frombuffer(value_bytes, dtype=np.float16).reshape(shape)
+            np.frombuffer(value_bytes, dtype=np_dtype).copy().reshape(shape)
         ).to(dtype)
         return cls(key=key, value=value, layer_idx=layer_idx)
 

@@ -274,9 +274,12 @@ class DeepSeekAdapter(BaseModelAdapter):
                 return 0.5  # Default entropy value
             
             layer_idx = min(layer_idx, len(outputs.attentions) - 1)
-            attn_weights = outputs.attentions[layer_idx]
+            attn_weights = outputs.attentions[layer_idx]  # [batch, heads, seq_q, seq_k]
             attn_weights = attn_weights.clamp(min=1e-9)
-            entropy = -torch.sum(attn_weights * torch.log(attn_weights))
+            # Compute per-row entropy (each row is a probability distribution over keys)
+            # then average across all rows, heads, and batch
+            per_row_entropy = -torch.sum(attn_weights * torch.log(attn_weights), dim=-1)  # [batch, heads, seq_q]
+            entropy = per_row_entropy.mean()  # scalar: average entropy per attention row
             
             return entropy.item()
             

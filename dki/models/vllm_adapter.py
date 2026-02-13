@@ -244,10 +244,16 @@ class VLLMAdapter(BaseModelAdapter):
                 **kwargs
             )
         
-        # Standard path: Prepare past_key_values
-        past_kv = tuple(
-            (entry.key, entry.value) for entry in injected_kv
-        )
+        # Standard path: Prepare past_key_values with alpha scaling
+        # Alpha scales the values (values affect output, keys affect attention weights)
+        if alpha < 1.0:
+            past_kv = tuple(
+                (entry.key, entry.value * alpha) for entry in injected_kv
+            )
+        else:
+            past_kv = tuple(
+                (entry.key, entry.value) for entry in injected_kv
+            )
         
         # Extend attention mask for injected K/V
         if mem_len > 0:
@@ -307,10 +313,15 @@ class VLLMAdapter(BaseModelAdapter):
         # This is a simplified integration; full integration would require
         # modifying the model's attention layers directly
         
-        # Prepare past_key_values
-        past_kv = tuple(
-            (entry.key, entry.value) for entry in injected_kv
-        )
+        # Prepare past_key_values with alpha scaling
+        if alpha < 1.0:
+            past_kv = tuple(
+                (entry.key, entry.value * alpha) for entry in injected_kv
+            )
+        else:
+            past_kv = tuple(
+                (entry.key, entry.value) for entry in injected_kv
+            )
         
         # Extend attention mask for injected K/V
         if mem_len > 0:
@@ -381,11 +392,13 @@ class VLLMAdapter(BaseModelAdapter):
                 logger.warning(f"Layer index out of range, using layer {layer_idx}")
             
             # Get attention weights from specified layer
-            attn_weights = outputs.attentions[layer_idx]  # [batch, heads, seq, seq]
+            attn_weights = outputs.attentions[layer_idx]  # [batch, heads, seq_q, seq_k]
             
-            # Compute entropy
+            # Compute per-row entropy (each row is a probability distribution over keys)
+            # then average across all rows, heads, and batch
             attn_weights = attn_weights.clamp(min=1e-9)
-            entropy = -torch.sum(attn_weights * torch.log(attn_weights))
+            per_row_entropy = -torch.sum(attn_weights * torch.log(attn_weights), dim=-1)  # [batch, heads, seq_q]
+            entropy = per_row_entropy.mean()  # scalar: average entropy per attention row
             
             return entropy.item()
             

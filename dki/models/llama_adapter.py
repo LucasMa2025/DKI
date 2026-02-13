@@ -279,11 +279,13 @@ class LlamaAdapter(BaseModelAdapter):
             
             # Get attention weights
             layer_idx = min(layer_idx, len(outputs.attentions) - 1)
-            attn_weights = outputs.attentions[layer_idx]
+            attn_weights = outputs.attentions[layer_idx]  # [batch, heads, seq_q, seq_k]
             
-            # Compute entropy
+            # Compute per-row entropy (each row is a probability distribution over keys)
+            # then average across all rows, heads, and batch
             attn_weights = attn_weights.clamp(min=1e-9)
-            entropy = -torch.sum(attn_weights * torch.log(attn_weights))
+            per_row_entropy = -torch.sum(attn_weights * torch.log(attn_weights), dim=-1)  # [batch, heads, seq_q]
+            entropy = per_row_entropy.mean()  # scalar: average entropy per attention row
             
             return entropy.item()
             
