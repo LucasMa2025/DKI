@@ -21,6 +21,31 @@ from dki.config.config_loader import ConfigLoader
 
 
 @dataclass
+class RAGPromptInfo:
+    """RAG 提示词构造信息 - 用于显示"""
+    original_query: str = ""
+    system_prompt: str = ""
+    retrieved_context: str = ""  # 检索到的上下文
+    history_text: str = ""  # 历史对话文本
+    history_messages: List[Dict[str, str]] = None  # 历史消息列表
+    final_prompt: str = ""  # 最终构造的提示词
+    
+    def __post_init__(self):
+        if self.history_messages is None:
+            self.history_messages = []
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'original_query': self.original_query,
+            'system_prompt': self.system_prompt,
+            'retrieved_context': self.retrieved_context,
+            'history_text': self.history_text,
+            'history_messages': self.history_messages,
+            'final_prompt': self.final_prompt,
+        }
+
+
+@dataclass
 class RAGResponse:
     """RAG system response."""
     text: str
@@ -29,6 +54,8 @@ class RAGResponse:
     input_tokens: int
     output_tokens: int
     metadata: Dict[str, Any] = None
+    # 新增: 提示词构造信息
+    prompt_info: Optional[RAGPromptInfo] = None
     
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -38,6 +65,7 @@ class RAGResponse:
             'input_tokens': self.input_tokens,
             'output_tokens': self.output_tokens,
             'metadata': self.metadata or {},
+            'prompt_info': self.prompt_info.to_dict() if self.prompt_info else None,
         }
 
 
@@ -155,7 +183,7 @@ class RAGSystem:
                     memory_id=mem.id,
                     content=mem.content,
                     embedding=embedding,
-                    metadata=mem.metadata,
+                    metadata=mem.get_metadata(),
                 )
                 count += 1
         
@@ -168,7 +196,7 @@ class RAGSystem:
         memories: List[MemorySearchResult],
         system_prompt: Optional[str] = None,
         history: Optional[List[Dict[str, str]]] = None,
-    ) -> str:
+    ) -> tuple:
         """
         Build prompt with retrieved memories and conversation history.
         
@@ -179,34 +207,51 @@ class RAGSystem:
             history: Optional conversation history [{"role": "user/assistant", "content": "..."}]
             
         Returns:
-            Formatted prompt
+            Tuple of (formatted_prompt, RAGPromptInfo)
         """
         parts = []
+        
+        # 用于记录的信息
+        prompt_info = RAGPromptInfo(
+            original_query=query,
+            system_prompt=system_prompt or "",
+            history_messages=history or [],
+        )
         
         # System prompt
         if system_prompt:
             parts.append(f"System: {system_prompt}\n")
         
         # Retrieved context
+        context_parts = []
         if memories:
             parts.append("Relevant information:")
             for i, mem in enumerate(memories, 1):
                 parts.append(f"[{i}] {mem.content}")
+                context_parts.append(f"[{i}] {mem.content}")
             parts.append("")
+        prompt_info.retrieved_context = "\n".join(context_parts)
         
         # Conversation history
+        history_parts = []
         if history:
             parts.append("Previous conversation:")
             for msg in history:
                 role = "User" if msg["role"] == "user" else "Assistant"
-                parts.append(f"{role}: {msg['content']}")
+                line = f"{role}: {msg['content']}"
+                parts.append(line)
+                history_parts.append(line)
             parts.append("")
+        prompt_info.history_text = "\n".join(history_parts)
         
         # User query
         parts.append(f"User: {query}")
         parts.append("\nAssistant:")
         
-        return "\n".join(parts)
+        final_prompt = "\n".join(parts)
+        prompt_info.final_prompt = final_prompt
+        
+        return final_prompt, prompt_info
     
     def _get_conversation_history(
         self,
@@ -278,8 +323,8 @@ class RAGSystem:
                 logger.warning(f"Failed to get conversation history: {e}")
                 history = None
         
-        # Build prompt with history
-        prompt = self._build_prompt(query, memories, system_prompt, history)
+        # Build prompt with history (now returns tuple)
+        prompt, prompt_info = self._build_prompt(query, memories, system_prompt, history)
         
         # Generate response
         output = self.model.generate(
@@ -340,6 +385,7 @@ class RAGSystem:
                 'model': self.model.model_name,
                 'history_turns': len(history) if history else 0,
             },
+            prompt_info=prompt_info,
         )
     
     def search_memories(

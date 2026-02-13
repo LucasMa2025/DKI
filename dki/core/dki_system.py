@@ -415,7 +415,7 @@ class DKISystem:
                     memory_id=mem.id,
                     content=mem.content,
                     embedding=embedding,
-                    metadata=mem.metadata,
+                    metadata=mem.get_metadata(),
                 )
                 count += 1
         
@@ -634,7 +634,7 @@ class DKISystem:
         # Record latency for analysis
         self._budget_analyzer.record_latency(timer.breakdown)
         
-        # Add hybrid injection metadata
+        # Add hybrid injection metadata with display info
         if hybrid_result:
             metadata = {
                 'model': self.model.model_name,
@@ -645,6 +645,11 @@ class DKISystem:
                     'preference_tokens': hybrid_result.preference_tokens,
                     'history_tokens': hybrid_result.history_tokens,
                     'preference_alpha': hybrid_result.preference_alpha,
+                    # 用于显示的明文信息
+                    'preference_text': hybrid_result.preference_text,
+                    'history_suffix_text': hybrid_result.history_suffix_text,
+                    'history_messages': hybrid_result.history_messages,
+                    'final_input': hybrid_result.input_text,
                 },
             }
         else:
