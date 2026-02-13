@@ -154,9 +154,11 @@ export const api = {
     // Preferences - 使用 /api/preferences 前缀
     preferences: {
         async list(userId: string): Promise<UserPreference[]> {
-            return http.get(`/api/preferences`, {
+            const response = await http.get(`/api/preferences`, {
                 params: { user_id: userId },
             });
+            // 后端返回 camelCase 字段，直接返回
+            return response as UserPreference[];
         },
 
         async get(id: string): Promise<UserPreference> {
