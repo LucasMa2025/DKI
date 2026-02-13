@@ -502,10 +502,18 @@ class ExperimentRunner:
     
     def _compute_mode_metrics(self, results: List[ExperimentResult]) -> Dict[str, Any]:
         """Compute metrics for a mode."""
+        import numpy as np
+        
         latencies = [r.latency_ms for r in results]
+        
+        # Filter out error results
+        valid_results = [r for r in results if not r.response.startswith("ERROR:")]
+        error_count = len(results) - len(valid_results)
         
         metrics = {
             'count': len(results),
+            'valid_count': len(valid_results),
+            'error_count': error_count,
             'latency': self.metrics.compute_latency_stats(latencies),
             'memory_usage': {
                 'total_memories_used': sum(len(r.memories_used) for r in results),
@@ -516,7 +524,6 @@ class ExperimentRunner:
         # Alpha stats for DKI
         alphas = [r.alpha for r in results if r.alpha is not None]
         if alphas:
-            import numpy as np
             metrics['alpha'] = {
                 'mean': float(np.mean(alphas)),
                 'std': float(np.std(alphas)),
@@ -528,6 +535,47 @@ class ExperimentRunner:
         cache_hits = [r.cache_hit for r in results]
         if any(cache_hits):
             metrics['cache_hit_rate'] = sum(cache_hits) / len(cache_hits)
+        
+        # Memory recall: check if response references the memories
+        recall_scores = []
+        for r in valid_results:
+            if r.memories_used:
+                recall, _ = self.metrics.compute_memory_recall(
+                    expected_memories=r.memories_used,
+                    response=r.response,
+                    threshold=0.3,
+                )
+                recall_scores.append(recall)
+        if recall_scores:
+            metrics['memory_recall'] = {
+                'mean': float(np.mean(recall_scores)),
+                'std': float(np.std(recall_scores)),
+            }
+        
+        # Hallucination rate (heuristic)
+        hallucination_rates = []
+        for r in valid_results:
+            if r.memories_used:
+                h_rate, _ = self.metrics.compute_hallucination_rate(
+                    response=r.response,
+                    grounding_texts=r.memories_used,
+                )
+                hallucination_rates.append(h_rate)
+        if hallucination_rates:
+            metrics['hallucination'] = {
+                'mean_rate': float(np.mean(hallucination_rates)),
+                'std_rate': float(np.std(hallucination_rates)),
+            }
+        
+        # Response length statistics
+        response_lengths = [len(r.response) for r in valid_results]
+        if response_lengths:
+            metrics['response_length'] = {
+                'mean': float(np.mean(response_lengths)),
+                'std': float(np.std(response_lengths)),
+                'min': int(np.min(response_lengths)),
+                'max': int(np.max(response_lengths)),
+            }
         
         return metrics
     
@@ -614,6 +662,7 @@ class ExperimentRunner:
                 response = self.dki_system.chat(
                     query=query,
                     session_id=session_id,
+                    user_id="experiment_user",
                     force_alpha=alpha,
                 )
                 
@@ -678,7 +727,11 @@ class ExperimentRunner:
         
         # DKI turns
         for i, query in enumerate(queries[:n_turns]):
-            response = self.dki_system.chat(query, session_id)
+            response = self.dki_system.chat(
+                query=query,
+                session_id=session_id,
+                user_id="experiment_user",
+            )
             results['dki_latencies'].append({
                 'turn': i + 1,
                 'latency_ms': response.latency_ms,
@@ -691,7 +744,11 @@ class ExperimentRunner:
             self.rag_system.add_memory(rag_session_id, mem)
         
         for i, query in enumerate(queries[:n_turns]):
-            response = self.rag_system.chat(query, rag_session_id)
+            response = self.rag_system.chat(
+                query=query,
+                session_id=rag_session_id,
+                user_id="experiment_user",
+            )
             results['rag_latencies'].append({
                 'turn': i + 1,
                 'latency_ms': response.latency_ms,
@@ -720,6 +777,259 @@ class ExperimentRunner:
             json.dump(results, f, ensure_ascii=False, indent=2)
         
         logger.info(f"Latency comparison results saved to {filepath}")
+        return results
+
+
+    def run_multi_turn_coherence(
+        self,
+        data_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        运行多轮连贯性实验
+        
+        测试 DKI 和 RAG 在多轮对话中的记忆保持能力。
+        每个会话有明确的期望记忆回忆，可以精确衡量记忆召回率。
+        """
+        self._ensure_systems()
+        
+        logger.info("Running multi-turn coherence experiment")
+        
+        # Load data
+        if data_path:
+            with open(data_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        else:
+            data_file = Path("./data/multi_turn_coherence.json")
+            if data_file.exists():
+                with open(data_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+            else:
+                logger.warning("No multi-turn coherence data found, generating...")
+                from dki.experiment.data_generator import ExperimentDataGenerator
+                gen = ExperimentDataGenerator("./data")
+                data = gen.generate_multi_turn_coherence()
+        
+        results = {
+            'dki': {'sessions': [], 'per_turn_recall': {}},
+            'rag': {'sessions': [], 'per_turn_recall': {}},
+        }
+        
+        for mode in ['dki', 'rag']:
+            system = self.dki_system if mode == 'dki' else self.rag_system
+            
+            for session_data in tqdm(data[:20], desc=f"Coherence ({mode})"):
+                session_id = f"coherence_{mode}_{session_data['session_id']}"
+                
+                # Add memories
+                for mem in session_data['personas']:
+                    system.add_memory(session_id, mem)
+                
+                session_results = []
+                
+                for turn_idx, turn in enumerate(session_data['turns']):
+                    query = turn['query']
+                    
+                    if mode == 'dki':
+                        response = self.dki_system.chat(
+                            query=query,
+                            session_id=session_id,
+                            user_id="experiment_user",
+                        )
+                        response_text = response.text
+                    else:
+                        response = self.rag_system.chat(
+                            query=query,
+                            session_id=session_id,
+                            user_id="experiment_user",
+                        )
+                        response_text = response.text
+                    
+                    # Compute recall for turns that test memory
+                    recall_score = 0.0
+                    if turn.get('tests_memory') and turn.get('expected_recall'):
+                        expected = turn['expected_recall']
+                        response_lower = response_text.lower()
+                        hits = sum(1 for kw in expected if kw.lower() in response_lower)
+                        recall_score = hits / len(expected) if expected else 0.0
+                    
+                    turn_result = {
+                        'turn_idx': turn_idx,
+                        'query': query,
+                        'response': response_text,
+                        'tests_memory': turn.get('tests_memory', False),
+                        'expected_recall': turn.get('expected_recall', []),
+                        'recall_score': recall_score,
+                    }
+                    session_results.append(turn_result)
+                    
+                    # Aggregate per-turn recall
+                    turn_key = f"turn_{turn_idx}"
+                    if turn_key not in results[mode]['per_turn_recall']:
+                        results[mode]['per_turn_recall'][turn_key] = []
+                    if turn.get('tests_memory'):
+                        results[mode]['per_turn_recall'][turn_key].append(recall_score)
+                
+                results[mode]['sessions'].append({
+                    'session_id': session_data['session_id'],
+                    'turns': session_results,
+                })
+        
+        # Compute summary
+        import numpy as np
+        for mode in ['dki', 'rag']:
+            per_turn = results[mode]['per_turn_recall']
+            results[mode]['per_turn_summary'] = {
+                turn_key: {
+                    'mean_recall': float(np.mean(scores)) if scores else 0.0,
+                    'count': len(scores),
+                }
+                for turn_key, scores in per_turn.items()
+            }
+            
+            # Overall recall
+            all_recalls = [
+                s for scores in per_turn.values() for s in scores
+            ]
+            results[mode]['overall_recall'] = float(np.mean(all_recalls)) if all_recalls else 0.0
+        
+        # Save results
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filepath = self.output_dir / f"multi_turn_coherence_{timestamp}.json"
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(results, f, ensure_ascii=False, indent=2)
+        
+        logger.info(f"Multi-turn coherence results saved to {filepath}")
+        logger.info(
+            f"Overall Recall - DKI: {results['dki']['overall_recall']:.3f}, "
+            f"RAG: {results['rag']['overall_recall']:.3f}"
+        )
+        return results
+    
+    def run_ablation_study(
+        self,
+        data_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        运行消融实验
+        
+        测试 DKI 各组件的独立贡献:
+        - full_dki: 完整 DKI (偏好 K/V + 历史后缀 + 门控)
+        - no_gating: 无门控 (固定 α=1.0)
+        - rag_baseline: RAG 对照
+        - no_memory: 无记忆基线
+        """
+        self._ensure_systems()
+        
+        logger.info("Running ablation study")
+        
+        # Load data
+        if data_path:
+            with open(data_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        else:
+            data_file = Path("./data/ablation.json")
+            if data_file.exists():
+                with open(data_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+            else:
+                logger.warning("No ablation data found, generating...")
+                from dki.experiment.data_generator import ExperimentDataGenerator
+                gen = ExperimentDataGenerator("./data")
+                data = gen.generate_ablation_data()
+        
+        ablation_configs = {
+            'full_dki': {'system': 'dki', 'force_alpha': None, 'use_memory': True},
+            'no_gating': {'system': 'dki', 'force_alpha': 1.0, 'use_memory': True},
+            'rag_baseline': {'system': 'rag', 'force_alpha': None, 'use_memory': True},
+            'no_memory': {'system': 'dki', 'force_alpha': None, 'use_memory': False},
+        }
+        
+        results = {mode: {'samples': [], 'latencies': []} for mode in ablation_configs}
+        
+        for ablation_mode, config in ablation_configs.items():
+            logger.info(f"Running ablation: {ablation_mode}")
+            
+            session_id = f"ablation_{ablation_mode}_{int(time.time())}"
+            system = self.dki_system if config['system'] == 'dki' else self.rag_system
+            
+            # Add memories if applicable
+            if config['use_memory']:
+                for item in data[:30]:
+                    if 'memory' in item:
+                        system.add_memory(session_id, item['memory'])
+            
+            for item in tqdm(data[:30], desc=f"Ablation ({ablation_mode})"):
+                query = item.get('query', '')
+                if not query:
+                    continue
+                
+                try:
+                    if config['system'] == 'dki':
+                        response = self.dki_system.chat(
+                            query=query,
+                            session_id=session_id,
+                            user_id="experiment_user",
+                            force_alpha=config.get('force_alpha'),
+                            allow_injection=config['use_memory'],
+                        )
+                        response_text = response.text
+                        latency = response.latency_ms
+                    else:
+                        response = self.rag_system.chat(
+                            query=query,
+                            session_id=session_id,
+                            user_id="experiment_user",
+                        )
+                        response_text = response.text
+                        latency = response.latency_ms
+                    
+                    # Check memory recall
+                    relevant = item.get('relevant_memories', [])
+                    recall_score = 0.0
+                    if relevant:
+                        recall_score, _ = self.metrics.compute_memory_recall(
+                            expected_memories=relevant,
+                            response=response_text,
+                            threshold=0.3,
+                        )
+                    
+                    results[ablation_mode]['samples'].append({
+                        'query': query,
+                        'response': response_text,
+                        'latency_ms': latency,
+                        'memory_recall': recall_score,
+                    })
+                    results[ablation_mode]['latencies'].append(latency)
+                    
+                except Exception as e:
+                    logger.error(f"Ablation query failed ({ablation_mode}): {e}")
+        
+        # Compute summaries
+        import numpy as np
+        summary = {}
+        for mode, mode_results in results.items():
+            recalls = [s['memory_recall'] for s in mode_results['samples']]
+            latencies = mode_results['latencies']
+            
+            summary[mode] = {
+                'sample_count': len(mode_results['samples']),
+                'mean_recall': float(np.mean(recalls)) if recalls else 0.0,
+                'mean_latency_ms': float(np.mean(latencies)) if latencies else 0.0,
+                'p95_latency_ms': float(np.percentile(latencies, 95)) if latencies else 0.0,
+            }
+        
+        results['summary'] = summary
+        
+        # Save results
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filepath = self.output_dir / f"ablation_study_{timestamp}.json"
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(results, f, ensure_ascii=False, indent=2)
+        
+        logger.info(f"Ablation study results saved to {filepath}")
+        for mode, s in summary.items():
+            logger.info(f"  {mode}: recall={s['mean_recall']:.3f}, latency={s['mean_latency_ms']:.1f}ms")
+        
         return results
 
 
