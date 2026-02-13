@@ -38,6 +38,13 @@ from dki.api.visualization_routes import create_visualization_router
 from dki.api.dki_routes import create_dki_router, set_dki_plugin
 from dki.api.dependencies import init_dependencies, cleanup_dependencies
 from dki.adapters import AdapterFactory, AdapterConfig, AdapterType
+from dki.cache import (
+    PreferenceCacheManager,
+    CacheConfig,
+    DKIRedisClient,
+    RedisConfig,
+    REDIS_AVAILABLE,
+)
 
 
 # Request/Response Models
@@ -106,6 +113,8 @@ def create_app() -> FastAPI:
     
     # Initialize systems (lazy)
     _systems = {}
+    _redis_client = None  # Redis 客户端 (全局)
+    _preference_cache = None  # 偏好缓存管理器 (全局)
     
     def get_dki_system() -> DKISystem:
         if 'dki' not in _systems:
@@ -129,10 +138,22 @@ def create_app() -> FastAPI:
                 _systems['user_adapter'] = AdapterFactory.create_memory()
         return _systems['user_adapter']
     
+    def get_preference_cache() -> Optional[PreferenceCacheManager]:
+        """获取偏好缓存管理器 (支持 Redis)"""
+        nonlocal _preference_cache
+        return _preference_cache
+    
+    def get_redis_client() -> Optional[DKIRedisClient]:
+        """获取 Redis 客户端"""
+        nonlocal _redis_client
+        return _redis_client
+    
     # Initialize dependencies for API routes
     @app.on_event("startup")
     async def startup_event():
         """Initialize dependencies on startup."""
+        nonlocal _redis_client, _preference_cache
+        
         dki = get_dki_system()
         adapter = get_user_adapter()
         
@@ -141,6 +162,59 @@ def create_app() -> FastAPI:
             await adapter.connect()
         except Exception as e:
             logger.warning(f"Failed to connect user adapter: {e}")
+        
+        # ============ 初始化 Redis 缓存 (与生产系统一致) ============
+        # 从配置文件加载 Redis 配置
+        import yaml
+        config_loader = ConfigLoader()
+        try:
+            with open(config_loader._config_path, 'r', encoding='utf-8') as f:
+                raw_config = yaml.safe_load(f) or {}
+        except Exception:
+            raw_config = {}
+        
+        redis_config_data = raw_config.get('redis', {})
+        cache_config_data = raw_config.get('preference_cache', {})
+        
+        # 初始化 Redis 客户端
+        if REDIS_AVAILABLE and redis_config_data.get('enabled', False):
+            redis_config = RedisConfig.from_dict(redis_config_data)
+            _redis_client = DKIRedisClient(redis_config)
+            
+            try:
+                connected = await _redis_client.connect()
+                if connected:
+                    logger.info(
+                        f"✅ Redis connected: {redis_config.host}:{redis_config.port} "
+                        f"(db={redis_config.db})"
+                    )
+                else:
+                    logger.warning("⚠️ Redis connection failed, falling back to L1 only")
+                    _redis_client = None
+            except Exception as e:
+                logger.warning(f"⚠️ Redis connection error: {e}")
+                _redis_client = None
+        else:
+            if not REDIS_AVAILABLE:
+                logger.info("Redis library not installed, using L1 cache only")
+            else:
+                logger.info("Redis disabled in configuration, using L1 cache only")
+        
+        # 初始化偏好缓存管理器 (支持 Redis L2 缓存)
+        cache_config = CacheConfig.from_dict(cache_config_data)
+        if _redis_client and _redis_client.is_available:
+            cache_config.l2_enabled = True
+        
+        _preference_cache = PreferenceCacheManager(
+            redis_client=_redis_client,
+            config=cache_config,
+        )
+        
+        logger.info(
+            f"Preference cache initialized: "
+            f"L1={cache_config.l1_max_size}, "
+            f"L2={'Redis' if cache_config.l2_enabled else 'disabled'}"
+        )
         
         # Initialize API dependencies
         init_dependencies(
@@ -156,6 +230,13 @@ def create_app() -> FastAPI:
     @app.on_event("shutdown")
     async def shutdown_event():
         """Cleanup on shutdown."""
+        nonlocal _redis_client
+        
+        # 关闭 Redis 连接
+        if _redis_client:
+            await _redis_client.close()
+            logger.info("Redis connection closed")
+        
         await cleanup_dependencies()
         logger.info("DKI System stopped")
     
@@ -324,13 +405,97 @@ def create_app() -> FastAPI:
         try:
             dki = get_dki_system()
             rag = get_rag_system()
+            
+            # 获取缓存统计
+            cache_stats = {}
+            if _preference_cache:
+                cache_stats = _preference_cache.get_stats()
+            
             return {
                 "dki": dki.get_stats(),
                 "rag": rag.get_stats(),
+                "cache": cache_stats,
             }
         except Exception as e:
             logger.error(f"Stats error: {e}")
             raise HTTPException(status_code=500, detail=str(e))
+    
+    @app.get("/api/cache/stats")
+    async def get_cache_stats():
+        """
+        获取缓存统计信息
+        
+        包括:
+        - L1 (Memory) 缓存状态
+        - L2 (Redis) 缓存状态 (如果启用)
+        - 命中率统计
+        """
+        try:
+            if not _preference_cache:
+                return {
+                    "status": "not_initialized",
+                    "message": "Preference cache not initialized",
+                }
+            
+            stats = _preference_cache.get_stats()
+            
+            # 添加 Redis 服务器信息
+            if _redis_client and _redis_client.is_available:
+                redis_info = await _redis_client.info()
+                stats["redis_server"] = redis_info
+            
+            return {
+                "status": "ok",
+                "cache": stats,
+            }
+        except Exception as e:
+            logger.error(f"Cache stats error: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    @app.get("/api/redis/status")
+    async def get_redis_status():
+        """
+        获取 Redis 连接状态
+        
+        用于验证 Redis 是否正常工作
+        """
+        try:
+            if not REDIS_AVAILABLE:
+                return {
+                    "status": "unavailable",
+                    "reason": "Redis library not installed",
+                    "install_command": "pip install redis",
+                }
+            
+            if not _redis_client:
+                return {
+                    "status": "disabled",
+                    "reason": "Redis is disabled in configuration or failed to connect",
+                }
+            
+            if not _redis_client.is_available:
+                return {
+                    "status": "disconnected",
+                    "reason": "Redis client exists but not connected",
+                }
+            
+            # 测试连接
+            ping_ok = await _redis_client.ping()
+            info = await _redis_client.info()
+            client_stats = _redis_client.get_stats()
+            
+            return {
+                "status": "connected" if ping_ok else "error",
+                "ping": ping_ok,
+                "server_info": info,
+                "client_stats": client_stats,
+            }
+        except Exception as e:
+            logger.error(f"Redis status error: {e}")
+            return {
+                "status": "error",
+                "error": str(e),
+            }
     
     @app.post("/api/experiment/generate-data")
     async def generate_experiment_data():
