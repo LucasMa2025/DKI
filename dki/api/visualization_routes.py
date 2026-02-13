@@ -81,6 +81,11 @@ class InjectionVisualizationResponse(BaseModel):
     # 最终输入
     final_input_preview: str = Field("", description="最终输入预览 (截断)")
     
+    # 注入明文信息 (用于显示, 不显示实际 K/V)
+    preference_text: str = Field("", description="偏好原文")
+    history_suffix_text: str = Field("", description="历史后缀原文")
+    history_messages: List[Dict[str, str]] = Field(default_factory=list, description="历史消息列表")
+    
     # 性能指标
     total_latency_ms: float = Field(0.0, description="总延迟 (ms)")
     injection_overhead_ms: float = Field(0.0, description="注入开销 (ms)")
@@ -409,6 +414,11 @@ def build_visualization_response(data: Dict[str, Any]) -> InjectionVisualization
         token_distribution=token_distribution,
         attention_viz=None,  # 简化版不包含完整注意力矩阵
         final_input_preview=final_input_preview,
+        # 注入明文信息
+        preference_text=data.get("preference_text", ""),
+        history_suffix_text=data.get("history_suffix_text", ""),
+        history_messages=data.get("history_messages", []),
+        # 性能指标
         total_latency_ms=data.get("latency_ms", 0),
         injection_overhead_ms=data.get("adapter_latency_ms", 0) + data.get("injection_latency_ms", 0),
     )

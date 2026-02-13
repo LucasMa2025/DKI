@@ -22,6 +22,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from loguru import logger
 
+# 导入可视化记录函数
+from dki.api.visualization_routes import record_visualization
+
 
 # ============ Request/Response Models ============
 
@@ -167,18 +170,56 @@ def create_dki_router() -> APIRouter:
             
             # 构造响应
             # 从 DKIResponse 中提取元数据
+            hybrid_info = response.metadata.get("hybrid_injection", {})
+            preference_tokens = hybrid_info.get("preference_tokens", 0)
+            history_tokens = hybrid_info.get("history_tokens", 0)
+            
             dki_metadata = DKIMetadataResponse(
                 injection_enabled=response.gating_decision.should_inject if response.gating_decision else False,
                 alpha=response.gating_decision.alpha if response.gating_decision else 0.0,
-                preference_tokens=response.metadata.get("hybrid_injection", {}).get("preference_tokens", 0),
-                history_tokens=response.metadata.get("hybrid_injection", {}).get("history_tokens", 0),
+                preference_tokens=preference_tokens,
+                history_tokens=history_tokens,
                 cache_hit=response.cache_hit,
                 cache_tier=response.cache_tier or "none",
                 latency_ms=response.latency_ms,
             )
             
+            request_id = f"dki-{uuid.uuid4().hex[:8]}"
+            
+            # 记录可视化数据
+            try:
+                viz_data = {
+                    "request_id": request_id,
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "query": request.query,
+                    "user_id": request.user_id,
+                    "session_id": request.session_id or request.user_id,
+                    "injection_enabled": response.gating_decision.should_inject if response.gating_decision else False,
+                    "alpha": response.gating_decision.alpha if response.gating_decision else 0.0,
+                    "preference_tokens": preference_tokens,
+                    "history_tokens": history_tokens,
+                    "query_tokens": response.input_tokens - preference_tokens - history_tokens,
+                    "total_tokens": response.input_tokens,
+                    "cache_hit": response.cache_hit,
+                    "cache_tier": response.cache_tier or "none",
+                    "latency_ms": response.latency_ms,
+                    # 注入明文信息 (用于显示)
+                    "preference_text": hybrid_info.get("preference_text", ""),
+                    "history_suffix_text": hybrid_info.get("history_suffix_text", ""),
+                    "history_messages": hybrid_info.get("history_messages", []),
+                    "final_input": hybrid_info.get("final_input", request.query),
+                    # 延迟分解
+                    "adapter_latency_ms": response.latency_breakdown.adapter_ms if response.latency_breakdown else 0,
+                    "injection_latency_ms": response.latency_breakdown.projection_ms if response.latency_breakdown else 0,
+                    "inference_latency_ms": response.latency_breakdown.prefill_ms if response.latency_breakdown else 0,
+                }
+                record_visualization(viz_data)
+                logger.debug(f"Recorded visualization data for request {request_id}")
+            except Exception as viz_error:
+                logger.warning(f"Failed to record visualization: {viz_error}")
+            
             return DKIChatResponse(
-                id=f"dki-{uuid.uuid4().hex[:8]}",
+                id=request_id,
                 text=response.text,
                 input_tokens=response.input_tokens,
                 output_tokens=response.output_tokens,
