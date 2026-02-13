@@ -64,6 +64,9 @@ class LlamaAdapter(BaseModelAdapter):
             else:
                 model_kwargs['device_map'] = 'auto'
             
+            # Add eager attention for output_attentions support
+            model_kwargs['attn_implementation'] = 'eager'
+            
             self.model = AutoModelForCausalLM.from_pretrained(
                 self.model_name,
                 **model_kwargs,
@@ -261,19 +264,29 @@ class LlamaAdapter(BaseModelAdapter):
         
         inputs = self.tokenize(text)
         
-        with torch.no_grad():
-            outputs = self.model(
-                **inputs,
-                output_attentions=True,
-                return_dict=True,
-            )
-        
-        # Get attention weights
-        layer_idx = min(layer_idx, len(outputs.attentions) - 1)
-        attn_weights = outputs.attentions[layer_idx]
-        
-        # Compute entropy
-        attn_weights = attn_weights.clamp(min=1e-9)
-        entropy = -torch.sum(attn_weights * torch.log(attn_weights))
-        
-        return entropy.item()
+        try:
+            with torch.no_grad():
+                outputs = self.model(
+                    **inputs,
+                    output_attentions=True,
+                    return_dict=True,
+                )
+            
+            # Check if attentions are available
+            if outputs.attentions is None:
+                logger.warning("Attention outputs not available, returning default entropy")
+                return 0.5  # Default entropy value
+            
+            # Get attention weights
+            layer_idx = min(layer_idx, len(outputs.attentions) - 1)
+            attn_weights = outputs.attentions[layer_idx]
+            
+            # Compute entropy
+            attn_weights = attn_weights.clamp(min=1e-9)
+            entropy = -torch.sum(attn_weights * torch.log(attn_weights))
+            
+            return entropy.item()
+            
+        except Exception as e:
+            logger.warning(f"Failed to compute prefill entropy: {e}, returning default")
+            return 0.5  # Default entropy value

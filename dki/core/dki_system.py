@@ -662,6 +662,7 @@ class DKISystem:
             response=output.text,
             gating_decision=gating_decision,
             latency_ms=timer.breakdown.total_ms,
+            user_id=user_id,
         )
         
         return DKIResponse(
@@ -879,9 +880,14 @@ class DKISystem:
         response: str,
         gating_decision: GatingDecision,
         latency_ms: float,
+        user_id: Optional[str] = None,
     ) -> None:
         """Log conversation to database."""
         with self.db_manager.session_scope() as db:
+            # Ensure session exists before inserting conversation
+            session_repo = SessionRepository(db)
+            session_repo.get_or_create(session_id=session_id, user_id=user_id)
+            
             conv_repo = ConversationRepository(db)
             audit_repo = AuditLogRepository(db)
             

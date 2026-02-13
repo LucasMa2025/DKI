@@ -167,14 +167,16 @@ class RAGSystem:
         query: str,
         memories: List[MemorySearchResult],
         system_prompt: Optional[str] = None,
+        history: Optional[List[Dict[str, str]]] = None,
     ) -> str:
         """
-        Build prompt with retrieved memories.
+        Build prompt with retrieved memories and conversation history.
         
         Args:
             query: User query
             memories: Retrieved memories
             system_prompt: Optional system prompt
+            history: Optional conversation history [{"role": "user/assistant", "content": "..."}]
             
         Returns:
             Formatted prompt
@@ -192,32 +194,70 @@ class RAGSystem:
                 parts.append(f"[{i}] {mem.content}")
             parts.append("")
         
+        # Conversation history
+        if history:
+            parts.append("Previous conversation:")
+            for msg in history:
+                role = "User" if msg["role"] == "user" else "Assistant"
+                parts.append(f"{role}: {msg['content']}")
+            parts.append("")
+        
         # User query
         parts.append(f"User: {query}")
         parts.append("\nAssistant:")
         
         return "\n".join(parts)
     
+    def _get_conversation_history(
+        self,
+        session_id: str,
+        max_turns: int = 5,
+    ) -> List[Dict[str, str]]:
+        """
+        Get conversation history for a session.
+        
+        Args:
+            session_id: Session identifier
+            max_turns: Maximum number of conversation turns to retrieve
+            
+        Returns:
+            List of conversation messages
+        """
+        with self.db_manager.session_scope() as db:
+            conv_repo = ConversationRepository(db)
+            messages = conv_repo.get_recent(session_id, n_turns=max_turns)
+            
+            return [
+                {"role": msg.role, "content": msg.content}
+                for msg in messages
+            ]
+    
     def chat(
         self,
         query: str,
         session_id: str,
+        user_id: Optional[str] = None,
         top_k: Optional[int] = None,
         system_prompt: Optional[str] = None,
         max_new_tokens: int = 512,
         temperature: float = 0.7,
+        include_history: bool = True,
+        max_history_turns: int = 5,
         **kwargs
     ) -> RAGResponse:
         """
-        Generate response using RAG.
+        Generate response using RAG with conversation history.
         
         Args:
             query: User query
             session_id: Session identifier
+            user_id: User identifier (optional)
             top_k: Number of memories to retrieve
             system_prompt: Optional system prompt
             max_new_tokens: Maximum tokens to generate
             temperature: Sampling temperature
+            include_history: Whether to include conversation history
+            max_history_turns: Maximum history turns to include
             
         Returns:
             RAGResponse with generated text and metadata
@@ -228,8 +268,18 @@ class RAGSystem:
         top_k = top_k or self.config.rag.top_k
         memories = self.memory_router.search(query, top_k=top_k)
         
-        # Build prompt
-        prompt = self._build_prompt(query, memories, system_prompt)
+        # Get conversation history if enabled
+        history = None
+        if include_history:
+            try:
+                history = self._get_conversation_history(session_id, max_turns=max_history_turns)
+                logger.debug(f"Retrieved {len(history)} history messages for session {session_id}")
+            except Exception as e:
+                logger.warning(f"Failed to get conversation history: {e}")
+                history = None
+        
+        # Build prompt with history
+        prompt = self._build_prompt(query, memories, system_prompt, history)
         
         # Generate response
         output = self.model.generate(
@@ -243,34 +293,41 @@ class RAGSystem:
         total_latency = (end_time - start_time) * 1000
         
         # Log to database
-        with self.db_manager.session_scope() as db:
-            conv_repo = ConversationRepository(db)
-            audit_repo = AuditLogRepository(db)
-            
-            # Store user message
-            conv_repo.create(
-                session_id=session_id,
-                role='user',
-                content=query,
-            )
-            
-            # Store assistant response
-            conv_repo.create(
-                session_id=session_id,
-                role='assistant',
-                content=output.text,
-                injection_mode='rag',
-                memory_ids=[m.memory_id for m in memories],
-                latency_ms=total_latency,
-            )
-            
-            # Audit log
-            audit_repo.log(
-                action='rag_generate',
-                session_id=session_id,
-                memory_ids=[m.memory_id for m in memories],
-                mode='rag',
-            )
+        try:
+            with self.db_manager.session_scope() as db:
+                # Ensure session exists before inserting conversation
+                session_repo = SessionRepository(db)
+                session_repo.get_or_create(session_id=session_id, user_id=user_id)
+                
+                conv_repo = ConversationRepository(db)
+                audit_repo = AuditLogRepository(db)
+                
+                # Store user message
+                conv_repo.create(
+                    session_id=session_id,
+                    role='user',
+                    content=query,
+                )
+                
+                # Store assistant response
+                conv_repo.create(
+                    session_id=session_id,
+                    role='assistant',
+                    content=output.text,
+                    injection_mode='rag',
+                    memory_ids=[m.memory_id for m in memories],
+                    latency_ms=total_latency,
+                )
+                
+                # Audit log
+                audit_repo.log(
+                    action='rag_generate',
+                    session_id=session_id,
+                    memory_ids=[m.memory_id for m in memories],
+                    mode='rag',
+                )
+        except Exception as e:
+            logger.error(f"Failed to log conversation: {e}")
         
         return RAGResponse(
             text=output.text,
@@ -281,6 +338,7 @@ class RAGSystem:
             metadata={
                 'prompt_length': len(prompt),
                 'model': self.model.model_name,
+                'history_turns': len(history) if history else 0,
             },
         )
     

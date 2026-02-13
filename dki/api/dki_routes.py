@@ -192,8 +192,10 @@ def create_dki_router() -> APIRouter:
             )
             
         except Exception as e:
-            logger.error(f"DKI chat error: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
+            import traceback
+            error_detail = traceback.format_exc()
+            logger.error(f"DKI chat error: {e}\n{error_detail}")
+            raise HTTPException(status_code=500, detail=f"DKI chat error: {str(e)}")
     
     @router.get(
         "/info",

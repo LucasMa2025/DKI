@@ -50,12 +50,14 @@ class GLMAdapter(BaseModelAdapter):
             if self.tokenizer.pad_token is None:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
             
-            # Load model
+            # Load model with eager attention for output_attentions support
+            # SDPA attention does not support output_attentions=True
             self.model = AutoModelForCausalLM.from_pretrained(
                 self.model_name,
                 torch_dtype=self.torch_dtype,
                 device_map="auto",
                 trust_remote_code=self.trust_remote_code,
+                attn_implementation="eager",  # Required for output_attentions support
             )
             self.model.eval()
             
@@ -288,19 +290,25 @@ class GLMAdapter(BaseModelAdapter):
         
         inputs = self.tokenize(text)
         
-        with torch.no_grad():
-            outputs = self.model(
-                **inputs,
-                output_attentions=True,
-                return_dict=True,
-            )
-        
-        if outputs.attentions is None or len(outputs.attentions) == 0:
-            return 0.5  # Default value if attentions not available
-        
-        layer_idx = min(layer_idx, len(outputs.attentions) - 1)
-        attn_weights = outputs.attentions[layer_idx]
-        attn_weights = attn_weights.clamp(min=1e-9)
-        entropy = -torch.sum(attn_weights * torch.log(attn_weights))
-        
-        return entropy.item()
+        try:
+            with torch.no_grad():
+                outputs = self.model(
+                    **inputs,
+                    output_attentions=True,
+                    return_dict=True,
+                )
+            
+            if outputs.attentions is None or len(outputs.attentions) == 0:
+                logger.warning("Attention outputs not available, returning default entropy")
+                return 0.5  # Default value if attentions not available
+            
+            layer_idx = min(layer_idx, len(outputs.attentions) - 1)
+            attn_weights = outputs.attentions[layer_idx]
+            attn_weights = attn_weights.clamp(min=1e-9)
+            entropy = -torch.sum(attn_weights * torch.log(attn_weights))
+            
+            return entropy.item()
+            
+        except Exception as e:
+            logger.warning(f"Failed to compute prefill entropy: {e}, returning default")
+            return 0.5  # Default entropy value

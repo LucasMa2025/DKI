@@ -106,11 +106,14 @@ class VLLMAdapter(BaseModelAdapter):
         from transformers import AutoModelForCausalLM
         
         logger.info(f"Loading HF model for K/V computation: {self.model_name}")
+        # Use attn_implementation="eager" to support output_attentions=True
+        # SDPA attention does not support output_attentions
         self.hf_model = AutoModelForCausalLM.from_pretrained(
             self.model_name,
             torch_dtype=self.torch_dtype,
             device_map="auto",
             trust_remote_code=self.trust_remote_code,
+            attn_implementation="eager",  # Required for output_attentions support
         )
         self.hf_model.eval()
     
@@ -359,21 +362,36 @@ class VLLMAdapter(BaseModelAdapter):
         
         inputs = self.tokenize(text)
         
-        with torch.no_grad():
-            outputs = self.hf_model(
-                **inputs,
-                output_attentions=True,
-                return_dict=True,
-            )
-        
-        # Get attention weights from specified layer
-        attn_weights = outputs.attentions[layer_idx]  # [batch, heads, seq, seq]
-        
-        # Compute entropy
-        attn_weights = attn_weights.clamp(min=1e-9)
-        entropy = -torch.sum(attn_weights * torch.log(attn_weights))
-        
-        return entropy.item()
+        try:
+            with torch.no_grad():
+                outputs = self.hf_model(
+                    **inputs,
+                    output_attentions=True,
+                    return_dict=True,
+                )
+            
+            # Check if attentions are available
+            if outputs.attentions is None:
+                logger.warning("Attention outputs not available, returning default entropy")
+                return 0.5  # Default entropy value
+            
+            # Ensure layer_idx is valid
+            if layer_idx >= len(outputs.attentions):
+                layer_idx = len(outputs.attentions) - 1
+                logger.warning(f"Layer index out of range, using layer {layer_idx}")
+            
+            # Get attention weights from specified layer
+            attn_weights = outputs.attentions[layer_idx]  # [batch, heads, seq, seq]
+            
+            # Compute entropy
+            attn_weights = attn_weights.clamp(min=1e-9)
+            entropy = -torch.sum(attn_weights * torch.log(attn_weights))
+            
+            return entropy.item()
+            
+        except Exception as e:
+            logger.warning(f"Failed to compute prefill entropy: {e}, returning default")
+            return 0.5  # Default entropy value
     
     def unload(self) -> None:
         """Unload models."""

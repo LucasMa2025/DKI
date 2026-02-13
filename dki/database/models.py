@@ -34,6 +34,16 @@ class Session(Base):
     conversations = relationship("Conversation", back_populates="session", cascade="all, delete-orphan")
     
     @hybrid_property
+    def metadata(self) -> Dict[str, Any]:
+        """Get metadata as dict (alias for extra_metadata)."""
+        return json.loads(self._metadata) if self._metadata else {}
+    
+    @metadata.setter
+    def metadata(self, value: Dict[str, Any]):
+        """Set metadata from dict."""
+        self._metadata = json.dumps(value, ensure_ascii=False)
+    
+    @hybrid_property
     def extra_metadata(self) -> Dict[str, Any]:
         return json.loads(self._metadata) if self._metadata else {}
     
@@ -327,3 +337,42 @@ class ModelRegistry(Base):
     @extra_metadata.setter
     def extra_metadata(self, value: Dict[str, Any]):
         self._metadata = json.dumps(value, ensure_ascii=False)
+
+
+class UserPreference(Base):
+    """User preference model for storing user preferences for DKI injection."""
+    
+    __tablename__ = 'user_preferences'
+    
+    id = Column(String(64), primary_key=True)
+    user_id = Column(String(64), nullable=False, index=True)
+    preference_text = Column(Text, nullable=False)
+    preference_type = Column(String(32), default='general')  # general, style, technical, format, domain, other
+    priority = Column(Integer, default=5)  # 0-10, higher = more important
+    category = Column(String(64))  # Optional category for grouping
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    _metadata = Column('metadata', Text, default='{}')
+    
+    @hybrid_property
+    def extra_metadata(self) -> Dict[str, Any]:
+        return json.loads(self._metadata) if self._metadata else {}
+    
+    @extra_metadata.setter
+    def extra_metadata(self, value: Dict[str, Any]):
+        self._metadata = json.dumps(value, ensure_ascii=False)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'preference_text': self.preference_text,
+            'preference_type': self.preference_type,
+            'priority': self.priority,
+            'category': self.category,
+            'is_active': self.is_active,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+            'metadata': self.extra_metadata,
+        }
