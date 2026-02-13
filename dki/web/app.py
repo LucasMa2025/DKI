@@ -11,6 +11,7 @@ Updated to include:
 
 import os
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -37,6 +38,8 @@ from dki.api.stats_routes import create_stats_router
 from dki.api.visualization_routes import create_visualization_router
 from dki.api.dki_routes import create_dki_router, set_dki_plugin
 from dki.api.dependencies import init_dependencies, cleanup_dependencies
+from dki.api.visualization_routes import record_visualization
+from dki.api.stats_routes import record_dki_request
 from dki.adapters import AdapterFactory, AdapterConfig, AdapterType
 from dki.cache import (
     PreferenceCacheManager,
@@ -268,16 +271,14 @@ def create_app() -> FastAPI:
     dki_router = create_dki_router()
     app.include_router(dki_router)
     
-    # API Routes
-    @app.get("/api/health")
-    async def health_check():
-        """Health check endpoint."""
-        return {"status": "healthy", "version": "1.0.0"}
+    # Note: /api/health and /api/stats are already defined in stats_routes.py
+    # Do not duplicate them here
     
     @app.post("/api/chat", response_model=ChatResponse)
     async def chat(request: ChatRequest):
         """
         Chat endpoint supporting DKI, RAG, and baseline modes.
+        Also records visualization and statistics data.
         """
         session_id = request.session_id or f"session_{uuid.uuid4().hex[:8]}"
         
@@ -287,17 +288,66 @@ def create_app() -> FastAPI:
                 response = dki.chat(
                     query=request.query,
                     session_id=session_id,
+                    user_id="demo_user",  # Demo 使用默认用户
                     force_alpha=request.force_alpha,
                     max_new_tokens=request.max_new_tokens,
                     temperature=request.temperature,
                 )
+                
+                # 记录可视化数据
+                try:
+                    hybrid_info = response.metadata.get("hybrid_injection", {})
+                    preference_tokens = hybrid_info.get("preference_tokens", 0)
+                    history_tokens = hybrid_info.get("history_tokens", 0)
+                    lb = response.latency_breakdown
+                    
+                    viz_data = {
+                        "request_id": f"chat-dki-{uuid.uuid4().hex[:8]}",
+                        "timestamp": datetime.utcnow().isoformat(),
+                        "mode": "dki",
+                        "query": request.query,
+                        "user_id": "demo_user",
+                        "session_id": session_id,
+                        "injection_enabled": response.gating_decision.should_inject if response.gating_decision else False,
+                        "alpha": response.gating_decision.alpha if response.gating_decision else 0.0,
+                        "preference_tokens": preference_tokens,
+                        "history_tokens": history_tokens,
+                        "query_tokens": max(0, response.input_tokens - preference_tokens - history_tokens),
+                        "total_tokens": response.input_tokens,
+                        "cache_hit": response.cache_hit,
+                        "cache_tier": response.cache_tier or "none",
+                        "latency_ms": response.latency_ms,
+                        "preference_text": hybrid_info.get("preference_text", ""),
+                        "history_suffix_text": hybrid_info.get("history_suffix_text", ""),
+                        "history_messages": hybrid_info.get("history_messages", []),
+                        "final_input": hybrid_info.get("final_input", request.query),
+                        "rag_prompt_text": "",
+                        "rag_context_text": "",
+                        "adapter_latency_ms": (lb.router_ms if lb else 0),
+                        "injection_latency_ms": ((lb.kv_compute_ms + lb.projection_ms) if lb else 0),
+                        "inference_latency_ms": ((lb.prefill_ms + lb.decode_ms) if lb else 0),
+                    }
+                    record_visualization(viz_data)
+                except Exception as viz_err:
+                    logger.warning(f"Failed to record visualization for /api/chat DKI: {viz_err}")
+                
+                # 记录统计数据
+                try:
+                    record_dki_request(
+                        cache_tier=response.cache_tier or "L3",
+                        alpha=response.gating_decision.alpha if response.gating_decision else 0.0,
+                        injected=response.gating_decision.should_inject if response.gating_decision else False,
+                    )
+                except Exception:
+                    pass
+                
                 return ChatResponse(
                     response=response.text,
                     mode="dki",
                     session_id=session_id,
                     latency_ms=response.latency_ms,
                     memories_used=[m.to_dict() for m in response.memories_used],
-                    alpha=response.gating_decision.alpha,
+                    alpha=response.gating_decision.alpha if response.gating_decision else None,
                     cache_hit=response.cache_hit,
                     metadata=response.metadata,
                 )
@@ -307,9 +357,47 @@ def create_app() -> FastAPI:
                 response = rag.chat(
                     query=request.query,
                     session_id=session_id,
+                    user_id="demo_user",
                     max_new_tokens=request.max_new_tokens,
                     temperature=request.temperature,
                 )
+                
+                # 记录 RAG 可视化 (基本信息)
+                try:
+                    rag_prompt_info = {}
+                    if response.prompt_info:
+                        rag_prompt_info = response.prompt_info.to_dict()
+                    
+                    viz_data = {
+                        "request_id": f"chat-rag-{uuid.uuid4().hex[:8]}",
+                        "timestamp": datetime.utcnow().isoformat(),
+                        "mode": "rag",
+                        "query": request.query,
+                        "user_id": "demo_user",
+                        "session_id": session_id,
+                        "injection_enabled": False,
+                        "alpha": 0.0,
+                        "preference_tokens": 0,
+                        "history_tokens": len(response.memories_used) * 50,  # 估算
+                        "query_tokens": response.input_tokens,
+                        "total_tokens": response.input_tokens,
+                        "cache_hit": False,
+                        "cache_tier": "none",
+                        "latency_ms": response.latency_ms,
+                        "preference_text": "",
+                        "history_suffix_text": rag_prompt_info.get("history_text", ""),
+                        "history_messages": rag_prompt_info.get("history_messages", []),
+                        "final_input": rag_prompt_info.get("final_prompt", request.query),
+                        "rag_prompt_text": rag_prompt_info.get("final_prompt", ""),
+                        "rag_context_text": rag_prompt_info.get("retrieved_context", ""),
+                        "adapter_latency_ms": 0,
+                        "injection_latency_ms": 0,
+                        "inference_latency_ms": response.latency_ms,
+                    }
+                    record_visualization(viz_data)
+                except Exception as viz_err:
+                    logger.warning(f"Failed to record visualization for /api/chat RAG: {viz_err}")
+                
                 return ChatResponse(
                     response=response.text,
                     mode="rag",
@@ -399,9 +487,11 @@ def create_app() -> FastAPI:
             logger.error(f"Search error: {e}")
             raise HTTPException(status_code=500, detail=str(e))
     
-    @app.get("/api/stats")
-    async def get_stats():
-        """Get system statistics."""
+    # Note: /api/stats is defined in stats_routes.py (camelCase format for Vue frontend)
+    # Use /api/stats/detailed for the raw system stats if needed
+    @app.get("/api/stats/detailed")
+    async def get_detailed_stats():
+        """Get detailed system statistics (raw format)."""
         try:
             dki = get_dki_system()
             rag = get_rag_system()
@@ -989,6 +1079,11 @@ def get_index_html() -> str:
                     </div>
                 </div>
                 
+                <div class="panel-title" style="margin-top: 20px;">Injection Info</div>
+                <button class="experiment-btn" style="background: var(--accent-primary); color: white; border-color: var(--accent-primary);" onclick="viewInjectionInfo()">
+                    🔍 查看注入信息 (View Injection)
+                </button>
+                
                 <div class="panel-title" style="margin-top: 20px;">Experiments</div>
                 
                 <button class="experiment-btn" onclick="generateData()">Generate Test Data</button>
@@ -1000,6 +1095,22 @@ def get_index_html() -> str:
                     Session ID: <span id="sessionId">-</span>
                 </div>
                 <button class="experiment-btn" style="margin-top: 10px;" onclick="newSession()">New Session</button>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Injection Info Modal -->
+    <div id="injectionModal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.8); z-index:1000; overflow:auto;">
+        <div style="max-width:900px; margin:30px auto; background:var(--bg-secondary); border-radius:12px; border:1px solid var(--border-color); max-height:90vh; overflow:auto;">
+            <div style="padding:20px; border-bottom:1px solid var(--border-color); display:flex; justify-content:space-between; align-items:center; position:sticky; top:0; background:var(--bg-secondary); z-index:1;">
+                <h2 style="margin:0; background:linear-gradient(135deg, var(--accent-primary), var(--accent-secondary)); -webkit-background-clip:text; -webkit-text-fill-color:transparent;">🔍 注入信息 (Injection Info)</h2>
+                <div>
+                    <button onclick="copyInjectionText()" style="padding:8px 16px; background:var(--accent-success); color:white; border:none; border-radius:6px; cursor:pointer; font-family:inherit; margin-right:8px;">📋 复制</button>
+                    <button onclick="closeInjectionModal()" style="padding:8px 16px; background:var(--bg-tertiary); color:var(--text-primary); border:2px solid var(--border-color); border-radius:6px; cursor:pointer; font-family:inherit;">✕ 关闭</button>
+                </div>
+            </div>
+            <div id="injectionContent" style="padding:20px;">
+                <p style="color:var(--text-secondary);">暂无注入信息，请先发送一条消息。</p>
             </div>
         </div>
     </div>
@@ -1221,6 +1332,166 @@ def get_index_html() -> str:
             // This would typically call the alpha sensitivity endpoint
             alert('Feature coming soon!');
         }
+        
+        // ============ Injection Info Viewer ============
+        let lastInjectionData = null;
+        
+        async function viewInjectionInfo() {
+            const modal = document.getElementById('injectionModal');
+            const content = document.getElementById('injectionContent');
+            
+            modal.style.display = 'block';
+            content.innerHTML = '<p style="color:var(--text-secondary);">加载中...</p>';
+            
+            try {
+                // Fetch latest visualization data
+                const response = await fetch('/v1/dki/visualization/latest');
+                
+                if (response.ok) {
+                    const data = await response.json();
+                    lastInjectionData = data;
+                    content.innerHTML = renderInjectionInfo(data);
+                } else if (response.status === 404) {
+                    content.innerHTML = '<p style="color:var(--text-secondary);">暂无注入信息。请先发送一条消息，系统会自动记录注入过程。</p>';
+                } else {
+                    content.innerHTML = '<p style="color:#f56c6c;">获取数据失败: ' + response.statusText + '</p>';
+                }
+            } catch (error) {
+                content.innerHTML = '<p style="color:#f56c6c;">请求失败: ' + error.message + '</p>';
+            }
+        }
+        
+        function renderInjectionInfo(data) {
+            let html = '';
+            
+            // 基本信息
+            html += '<div style="background:var(--bg-tertiary); padding:15px; border-radius:8px; margin-bottom:15px;">';
+            html += '<h3 style="margin:0 0 10px 0; color:var(--accent-primary);">📌 基本信息</h3>';
+            html += '<div style="display:grid; grid-template-columns:1fr 1fr; gap:8px; font-size:0.85rem;">';
+            html += '<div>请求 ID: <span style="color:var(--accent-primary)">' + (data.request_id || '-') + '</span></div>';
+            html += '<div>时间: <span style="color:var(--text-secondary)">' + (data.timestamp || '-') + '</span></div>';
+            html += '<div>用户 ID: <span style="color:var(--text-secondary)">' + (data.user_id || '-') + '</span></div>';
+            html += '<div>会话 ID: <span style="color:var(--text-secondary)">' + (data.session_id || '-') + '</span></div>';
+            html += '<div>总延迟: <span style="color:var(--accent-warning)">' + (data.total_latency_ms?.toFixed(1) || 0) + ' ms</span></div>';
+            html += '<div>注入开销: <span style="color:var(--accent-warning)">' + (data.injection_overhead_ms?.toFixed(1) || 0) + ' ms</span></div>';
+            html += '</div></div>';
+            
+            // Token 分布
+            const dist = data.token_distribution || {};
+            html += '<div style="background:var(--bg-tertiary); padding:15px; border-radius:8px; margin-bottom:15px;">';
+            html += '<h3 style="margin:0 0 10px 0; color:var(--accent-primary);">📊 Token 分布</h3>';
+            html += '<div style="display:flex; gap:20px; font-size:0.85rem;">';
+            html += '<div style="text-align:center; flex:1;"><div style="font-size:1.5rem; font-weight:bold; color:#3b82f6;">' + (dist.query || 0) + '</div><div style="color:var(--text-secondary);">查询</div></div>';
+            html += '<div style="text-align:center; flex:1;"><div style="font-size:1.5rem; font-weight:bold; color:#10b981;">' + (dist.preference || 0) + '</div><div style="color:var(--text-secondary);">偏好 (K/V)</div></div>';
+            html += '<div style="text-align:center; flex:1;"><div style="font-size:1.5rem; font-weight:bold; color:#f59e0b;">' + (dist.history || 0) + '</div><div style="color:var(--text-secondary);">历史 (后缀)</div></div>';
+            html += '<div style="text-align:center; flex:1;"><div style="font-size:1.5rem; font-weight:bold; color:var(--accent-primary);">' + (dist.total || 0) + '</div><div style="color:var(--text-secondary);">总计</div></div>';
+            html += '</div></div>';
+            
+            // 原始查询
+            html += '<div style="background:var(--bg-tertiary); padding:15px; border-radius:8px; margin-bottom:15px;">';
+            html += '<h3 style="margin:0 0 10px 0; color:var(--accent-primary);">💬 原始查询</h3>';
+            html += '<pre style="background:var(--bg-primary); padding:10px; border-radius:6px; color:var(--text-primary); white-space:pre-wrap; word-break:break-all; max-height:100px; overflow:auto;">' + escapeHtml(data.original_query || '') + '</pre>';
+            html += '</div>';
+            
+            // DKI 偏好注入
+            html += '<div style="background:var(--bg-tertiary); padding:15px; border-radius:8px; margin-bottom:15px; border-left:4px solid #10b981;">';
+            html += '<h3 style="margin:0 0 10px 0; color:#10b981;">🧠 DKI 偏好注入 (K/V, 负位置)</h3>';
+            html += '<pre style="background:var(--bg-primary); padding:10px; border-radius:6px; color:var(--text-primary); white-space:pre-wrap; word-break:break-all; max-height:200px; overflow:auto;">' + escapeHtml(data.preference_text || '(无偏好注入)') + '</pre>';
+            html += '</div>';
+            
+            // DKI 历史后缀
+            html += '<div style="background:var(--bg-tertiary); padding:15px; border-radius:8px; margin-bottom:15px; border-left:4px solid #f59e0b;">';
+            html += '<h3 style="margin:0 0 10px 0; color:#f59e0b;">📜 DKI 历史后缀 (Suffix, 正位置)</h3>';
+            html += '<pre style="background:var(--bg-primary); padding:10px; border-radius:6px; color:var(--text-primary); white-space:pre-wrap; word-break:break-all; max-height:300px; overflow:auto;">' + escapeHtml(data.history_suffix_text || '(无历史后缀)') + '</pre>';
+            html += '</div>';
+            
+            // 历史消息
+            if (data.history_messages && data.history_messages.length > 0) {
+                html += '<div style="background:var(--bg-tertiary); padding:15px; border-radius:8px; margin-bottom:15px;">';
+                html += '<h3 style="margin:0 0 10px 0; color:var(--accent-primary);">💬 历史消息 (' + data.history_messages.length + ' 条)</h3>';
+                for (const msg of data.history_messages) {
+                    const isUser = msg.role === 'user';
+                    html += '<div style="padding:8px 12px; margin-bottom:6px; border-radius:8px; background:' + (isUser ? 'rgba(99,102,241,0.2)' : 'var(--bg-primary)') + '; font-size:0.85rem;">';
+                    html += '<span style="color:' + (isUser ? 'var(--accent-primary)' : 'var(--accent-success)') + '; font-weight:bold;">' + (isUser ? '用户' : '助手') + ':</span> ';
+                    html += escapeHtml(msg.content || '');
+                    html += '</div>';
+                }
+                html += '</div>';
+            }
+            
+            // 最终输入预览
+            html += '<div style="background:var(--bg-tertiary); padding:15px; border-radius:8px; margin-bottom:15px; border-left:4px solid var(--accent-primary);">';
+            html += '<h3 style="margin:0 0 10px 0; color:var(--accent-primary);">📄 最终输入预览</h3>';
+            html += '<pre style="background:var(--bg-primary); padding:10px; border-radius:6px; color:var(--text-primary); white-space:pre-wrap; word-break:break-all; max-height:400px; overflow:auto;">' + escapeHtml(data.final_input_preview || '') + '</pre>';
+            html += '</div>';
+            
+            // 流程步骤
+            if (data.flow_steps && data.flow_steps.length > 0) {
+                html += '<div style="background:var(--bg-tertiary); padding:15px; border-radius:8px; margin-bottom:15px;">';
+                html += '<h3 style="margin:0 0 10px 0; color:var(--accent-primary);">⚡ 注入流程步骤</h3>';
+                for (const step of data.flow_steps) {
+                    const statusColor = step.status === 'completed' ? '#10b981' : step.status === 'skipped' ? '#94a3b8' : '#f59e0b';
+                    html += '<div style="display:flex; align-items:center; gap:10px; padding:6px 0; border-bottom:1px solid var(--border-color);">';
+                    html += '<span style="min-width:20px; color:' + statusColor + ';">' + (step.status === 'completed' ? '✓' : step.status === 'skipped' ? '○' : '●') + '</span>';
+                    html += '<span style="flex:1;">' + escapeHtml(step.step_name) + '</span>';
+                    html += '<span style="color:var(--text-secondary); font-size:0.8rem;">' + step.duration_ms.toFixed(1) + 'ms</span>';
+                    html += '</div>';
+                }
+                html += '</div>';
+            }
+            
+            return html;
+        }
+        
+        function escapeHtml(str) {
+            const div = document.createElement('div');
+            div.textContent = str;
+            return div.innerHTML;
+        }
+        
+        function closeInjectionModal() {
+            document.getElementById('injectionModal').style.display = 'none';
+        }
+        
+        function copyInjectionText() {
+            if (!lastInjectionData) {
+                alert('无注入数据可复制');
+                return;
+            }
+            
+            let text = '=== DKI 注入信息 ===\\n';
+            text += '请求 ID: ' + (lastInjectionData.request_id || '-') + '\\n';
+            text += '时间: ' + (lastInjectionData.timestamp || '-') + '\\n';
+            text += '\\n== 偏好注入 (K/V) ==\\n';
+            text += (lastInjectionData.preference_text || '(无)') + '\\n';
+            text += '\\n== 历史后缀 (Suffix) ==\\n';
+            text += (lastInjectionData.history_suffix_text || '(无)') + '\\n';
+            text += '\\n== 最终输入 ==\\n';
+            text += (lastInjectionData.final_input_preview || '(无)') + '\\n';
+            
+            navigator.clipboard.writeText(text).then(() => {
+                alert('已复制到剪贴板');
+            }).catch(() => {
+                // Fallback
+                const textarea = document.createElement('textarea');
+                textarea.value = text;
+                document.body.appendChild(textarea);
+                textarea.select();
+                document.execCommand('copy');
+                document.body.removeChild(textarea);
+                alert('已复制到剪贴板');
+            });
+        }
+        
+        // Close modal on click outside
+        document.getElementById('injectionModal').addEventListener('click', function(e) {
+            if (e.target === this) closeInjectionModal();
+        });
+        
+        // Close modal on Escape
+        document.addEventListener('keydown', function(e) {
+            if (e.key === 'Escape') closeInjectionModal();
+        });
     </script>
 </body>
 </html>'''
