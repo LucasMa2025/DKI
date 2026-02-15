@@ -440,12 +440,19 @@ def create_app() -> FastAPI:
             )
             
             # Also add to RAG for comparison
-            rag.add_memory(
-                session_id=request.session_id,
-                content=request.content,
-                memory_id=memory_id,
-                metadata=request.metadata,
-            )
+            # Note: DKI and RAG share the same database, so the memory_id already exists.
+            # RAG should only add to its in-memory index, not re-insert into DB.
+            try:
+                rag.add_memory(
+                    session_id=request.session_id,
+                    content=request.content,
+                    memory_id=memory_id,
+                    metadata=request.metadata,
+                )
+            except Exception as rag_err:
+                # UNIQUE constraint or other DB error — memory already exists in DB,
+                # just log and continue (DKI already stored it successfully)
+                logger.warning(f"RAG add_memory skipped (already in DB): {rag_err}")
             
             return MemoryResponse(
                 memory_id=memory_id,
