@@ -229,13 +229,14 @@ Note: Historical information is for reference; please answer comprehensively.
         result.total_tokens = self._estimate_tokens(result.input_text)
         
         # Safety: 检查总 prompt 长度是否超过模型限制 (预留 512 tokens 给生成)
-        max_model_len = self.config.history_max_tokens * 6  # 粗略估算模型最大长度
-        if hasattr(self.model, 'max_model_len') and self.model is not None:
+        max_model_len = 4096  # 默认值
+        if self.model is not None and hasattr(self.model, 'max_model_len'):
             max_model_len = getattr(self.model, 'max_model_len', 4096)
         elif self.tokenizer and hasattr(self.tokenizer, 'model_max_length'):
-            max_model_len = self.tokenizer.model_max_length
-        else:
-            max_model_len = 4096
+            tok_max = self.tokenizer.model_max_length
+            # 某些 tokenizer 返回极大值 (如 1e30)，需要过滤
+            if tok_max and tok_max < 1_000_000:
+                max_model_len = tok_max
         
         max_prompt_tokens = max_model_len - 512
         if result.total_tokens > max_prompt_tokens:
@@ -281,6 +282,9 @@ Note: Historical information is for reference; please answer comprehensively.
         1. Establishes trust ("real conversation records, trustworthy")
         2. Guides processing ("understand context, then respond")
         3. Sets expectations ("comprehensive answer")
+        
+        Safety: Filters out messages that contain injection template markers
+        to prevent recursive nesting of history prompts.
         """
         if not history.messages:
             return ""
@@ -288,13 +292,36 @@ Note: Historical information is for reference; please answer comprehensively.
         # Get recent messages (respect max_messages)
         recent = history.get_recent(self.config.history_max_messages)
         
-        # Format messages
+        # 安全过滤: 跳过包含注入模板标记的消息 (防止递归嵌套)
+        # 这些标记表明消息内容是之前注入的历史后缀，不应再次嵌套
+        injection_markers = [
+            "[会话历史参考]",
+            "[Session History Reference]",
+            "[会话历史结束]",
+            "[End of Session History]",
+        ]
+        
+        # Format messages (过滤掉包含注入标记的消息)
         lines = []
         for msg in recent:
+            # 检查消息是否包含注入模板标记
+            content = msg.content
+            has_marker = any(marker in content for marker in injection_markers)
+            if has_marker:
+                logger.debug(f"Skipping message with injection markers (role={msg.role})")
+                continue
+            
+            # 跳过空消息
+            if not content.strip():
+                continue
+            
             role_label = "User" if msg.role == "user" else "Assistant"
             if self.language == "cn":
                 role_label = "用户" if msg.role == "user" else "助手"
-            lines.append(f"{role_label}: {msg.content}")
+            lines.append(f"{role_label}: {content}")
+        
+        if not lines:
+            return ""
         
         history_content = "\n".join(lines)
         
@@ -378,14 +405,30 @@ Note: Historical information is for reference; please answer comprehensively.
             return None
     
     def _estimate_tokens(self, text: str) -> int:
-        """Estimate token count for text."""
+        """Estimate token count for text.
+        
+        When tokenizer is available, uses exact tokenization.
+        Otherwise, uses heuristic estimation that handles both
+        Chinese (character-based) and English (word-based) text.
+        """
         if self.tokenizer is not None:
             try:
                 return len(self.tokenizer.encode(text))
             except Exception:
                 pass
-        # Rough estimate: ~1.3 tokens per word
-        return int(len(text.split()) * 1.3)
+        # Heuristic estimation for mixed Chinese/English text:
+        # - Chinese characters: ~1.5 tokens per character (subword tokenization)
+        # - English words: ~1.3 tokens per word
+        # - Punctuation/spaces: ~1 token each
+        import re
+        # Count Chinese characters (CJK Unified Ideographs)
+        chinese_chars = len(re.findall(r'[\u4e00-\u9fff\u3400-\u4dbf]', text))
+        # Count English words (remaining non-Chinese text)
+        non_chinese = re.sub(r'[\u4e00-\u9fff\u3400-\u4dbf]', ' ', text)
+        english_words = len(non_chinese.split())
+        
+        estimated = int(chinese_chars * 1.5 + english_words * 1.3)
+        return max(estimated, 1)  # At least 1 token
     
     def clear_preference_cache(self, user_id: Optional[str] = None):
         """Clear preference K/V cache."""
