@@ -150,7 +150,10 @@ export const useChatStore = defineStore('chat', () => {
       const lastMessage = messages.value[messages.value.length - 1]
       if (lastMessage.role === 'assistant') {
         lastMessage.id = response.id
-        lastMessage.content = response.choices[0]?.message.content || ''
+        // 优先从 choices 获取，fallback 到 text 字段 (兼容 DKIChatResponse)
+        lastMessage.content = response.choices?.[0]?.message?.content 
+          || (response as any).text 
+          || ''
         lastMessage.dkiMetadata = response.dkiMetadata
       }
       
