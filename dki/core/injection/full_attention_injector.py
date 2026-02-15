@@ -426,10 +426,11 @@ class FullAttentionInjector:
             h_k, h_v = history_kv[layer_idx]
             p_k, p_v = preference_kv[layer_idx]
             
-            # 应用 α 缩放
-            h_k = h_k * history_alpha
+            # 应用 α 缩放 (仅缩放 Value, Key 不变)
+            # Key 作为注意力寻址地址，缩放会干扰匹配精度
+            # Value 承载输出贡献，通过 α 调制记忆影响强度
+            # 参考: Engram 论文 (arXiv:2601.07372) Section 2.3
             h_v = h_v * history_alpha
-            p_k = p_k * preference_alpha
             p_v = p_v * preference_alpha
             
             # 拼接: [History, Preference]
@@ -445,8 +446,13 @@ class FullAttentionInjector:
         kv_list: List[Tuple[torch.Tensor, torch.Tensor]],
         alpha: float,
     ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
-        """应用 α 缩放"""
-        return [(k * alpha, v * alpha) for k, v in kv_list]
+        """
+        应用 α 缩放 (仅缩放 Value, Key 不变)
+        
+        Key 作为注意力寻址地址不应被缩放，否则会降低注意力匹配精度。
+        Value 承载输出贡献，通过 α 调制记忆影响强度。
+        """
+        return [(k, v * alpha) for k, v in kv_list]
     
     def _truncate_history(
         self,
