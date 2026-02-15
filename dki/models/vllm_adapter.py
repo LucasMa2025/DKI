@@ -368,7 +368,26 @@ class VLLMAdapter(BaseModelAdapter):
         )
     
     def compute_prefill_entropy(self, text: str, layer_idx: int = 3) -> float:
-        """Compute prefill-stage entropy for gating."""
+        """Compute prefill-stage entropy for gating.
+        
+        Note: This method uses the HF model (not vLLM) to compute attention weights.
+        When GPU memory is tight (vLLM process occupies most VRAM), this will fail with
+        CUDA OOM. In that case, we return a default entropy value and release any
+        intermediate tensors to avoid memory leaks.
+        """
+        # Pre-check: if CUDA memory is very low, skip computation entirely
+        if torch.cuda.is_available():
+            try:
+                free_mem = torch.cuda.mem_get_info()[0]
+                # If less than 256MB free, skip to avoid OOM
+                if free_mem < 256 * 1024 * 1024:
+                    logger.debug(
+                        f"Skipping prefill entropy: only {free_mem / 1024 / 1024:.0f}MB free GPU memory"
+                    )
+                    return 0.5
+            except Exception:
+                pass
+        
         self._load_hf_model()
         
         inputs = self.tokenize(text)
@@ -404,6 +423,9 @@ class VLLMAdapter(BaseModelAdapter):
             
         except Exception as e:
             logger.warning(f"Failed to compute prefill entropy: {e}, returning default")
+            # Release GPU memory after OOM
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             return 0.5  # Default entropy value
     
     def unload(self) -> None:
