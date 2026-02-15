@@ -328,14 +328,23 @@ class ExperimentRunner:
         data: List[Dict[str, Any]],
         config: ExperimentConfig,
     ) -> Dict[str, Any]:
-        """Run experiment for a specific mode."""
+        """Run experiment for a specific mode.
+        
+        Each sample uses its own session_id to prevent history accumulation
+        across unrelated samples, which would cause prompt length overflow
+        (decoder prompt > max_model_len).
+        """
         samples = data[:config.max_samples]
         results = []
         
-        session_id = f"exp_{mode}_{int(time.time())}"
+        base_ts = int(time.time())
         
-        # Add memories from data
-        for item in samples:
+        # Run queries — each sample gets its own session to avoid cross-contamination
+        for idx, item in enumerate(tqdm(samples, desc=f"Running {mode}")):
+            # Per-sample session: prevents history from accumulating across samples
+            session_id = f"exp_{mode}_{base_ts}_{idx}"
+            
+            # Add memories for this sample only
             memories = item.get('personas', []) + item.get('supporting_facts', [])
             if 'memory' in item:
                 memories.append(item['memory'])
@@ -345,9 +354,7 @@ class ExperimentRunner:
                     self.dki_system.add_memory(session_id, mem)
                 elif mode == 'rag':
                     self.rag_system.add_memory(session_id, mem)
-        
-        # Run queries
-        for item in tqdm(samples, desc=f"Running {mode}"):
+            
             queries = self._extract_queries(item)
             
             for query in queries:
