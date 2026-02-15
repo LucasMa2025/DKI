@@ -331,10 +331,16 @@ class DKISystem:
             
             logger.info(f"Creating HybridDKIInjector with language={language}")
             
+            # 获取 tokenizer: 优先从 model_adapter 获取，确保 token 估算准确
+            # 如果 tokenizer=None，中文文本的 token 估算会严重偏低（因为中文不按空格分词）
+            tokenizer = None
+            if self._model_adapter is not None and hasattr(self._model_adapter, 'tokenizer'):
+                tokenizer = self._model_adapter.tokenizer
+            
             self._hybrid_injector = HybridDKIInjector(
                 config=config,
                 model=self._model_adapter,
-                tokenizer=None,  # Will be set when model is loaded
+                tokenizer=tokenizer,
                 language=language,
             )
         return self._hybrid_injector
@@ -462,6 +468,54 @@ class DKISystem:
         """Get user preference."""
         return self._user_preferences.get(user_id)
     
+    def _load_user_preferences_from_db(self, user_id: str) -> None:
+        """
+        从数据库加载用户偏好并设置到 DKI 系统中。
+        
+        这是关键的桥接方法:
+        - 前端通过 /api/preferences 管理偏好 (存入 SQLite)
+        - DKI 系统通过 _user_preferences 内存缓存读取偏好
+        - 此方法将数据库中的偏好加载到内存缓存中
+        """
+        try:
+            with self.db_manager.session_scope() as db:
+                from sqlalchemy import text
+                
+                query = text("""
+                    SELECT preference_text, preference_type, priority, category
+                    FROM user_preferences
+                    WHERE user_id = :user_id AND is_active = 1
+                    ORDER BY priority DESC
+                """)
+                
+                result = db.execute(query, {"user_id": user_id})
+                rows = result.fetchall()
+                
+                if rows:
+                    # 将所有偏好合并为一个文本
+                    preference_lines = []
+                    for row in rows:
+                        pref_text = row[0]
+                        pref_type = row[1] or "general"
+                        preference_lines.append(f"- [{pref_type}] {pref_text}")
+                    
+                    combined_text = "\n".join(preference_lines)
+                    
+                    self.set_user_preference(
+                        user_id=user_id,
+                        preference_text=combined_text,
+                    )
+                    
+                    logger.info(
+                        f"Loaded {len(rows)} preferences from DB for user {user_id}: "
+                        f"{len(combined_text)} chars"
+                    )
+                else:
+                    logger.debug(f"No preferences found in DB for user {user_id}")
+                    
+        except Exception as e:
+            logger.warning(f"Failed to load preferences from DB for user {user_id}: {e}")
+    
     def get_session_history(self, session_id: str, max_messages: int = 10) -> SessionHistory:
         """
         Get session history for hybrid injection.
@@ -530,6 +584,9 @@ class DKISystem:
         # Determine injection mode
         use_hybrid_mode = use_hybrid if use_hybrid is not None else self._use_hybrid_injection
         
+        # 保存原始用户输入 (用于数据库记录，避免历史递归嵌套)
+        original_query = query
+        
         # Start latency timer
         with LatencyTimer() as timer:
             cache_hit = False
@@ -538,7 +595,12 @@ class DKISystem:
             # Get session cache
             session_cache = self._get_session_cache(session_id)
             
-            # Step 0: Hybrid injection preparation (if enabled)
+            # Step 0: Load user preferences from database (if not already cached)
+            if use_hybrid_mode and allow_injection and user_id:
+                if not self.get_user_preference(user_id):
+                    self._load_user_preferences_from_db(user_id)
+            
+            # Step 0.5: Hybrid injection preparation (if enabled)
             hybrid_result = None
             if use_hybrid_mode and allow_injection:
                 timer.start_stage("hybrid_prep")
@@ -669,10 +731,10 @@ class DKISystem:
                 'hybrid_injection': {'enabled': False},
             }
         
-        # Log to database
+        # Log to database (使用原始用户输入，避免历史后缀递归嵌套)
         self._log_conversation(
             session_id=session_id,
-            query=query,
+            query=original_query,
             response=output.text,
             gating_decision=gating_decision,
             latency_ms=timer.breakdown.total_ms,
