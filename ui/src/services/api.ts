@@ -93,7 +93,7 @@ export const api = {
             // - query: 原始用户输入 (不含任何 prompt 构造)
             // - user_id: 用户标识 (DKI 用于读取偏好和历史)
             // - session_id: 会话标识 (DKI 用于读取会话历史)
-            return http.post("/v1/dki/chat", {
+            const raw: any = await http.post("/v1/dki/chat", {
                 // 原始用户输入，不拼接任何历史或 prompt
                 query: request.query,
                 // 用户标识 - DKI 用于读取偏好和历史
@@ -105,6 +105,36 @@ export const api = {
                 temperature: request.temperature,
                 max_tokens: request.maxTokens,
             });
+            
+            // 后端返回 snake_case (DKIChatResponse)，前端期望 camelCase (ChatResponse)
+            // 进行字段映射转换
+            const dkiMeta = raw.dki_metadata || raw.dkiMetadata;
+            return {
+                id: raw.id,
+                object: "chat.completion",
+                created: raw.created,
+                model: raw.model || "",
+                choices: (raw.choices || []).map((c: any) => ({
+                    index: c.index,
+                    message: c.message,
+                    finishReason: c.finish_reason || c.finishReason || "stop",
+                })),
+                usage: {
+                    promptTokens: raw.input_tokens || 0,
+                    completionTokens: raw.output_tokens || 0,
+                    totalTokens: (raw.input_tokens || 0) + (raw.output_tokens || 0),
+                },
+                dkiMetadata: dkiMeta ? {
+                    injectionEnabled: dkiMeta.injection_enabled ?? dkiMeta.injectionEnabled ?? false,
+                    alpha: dkiMeta.alpha ?? 0,
+                    memoriesUsed: dkiMeta.memories_used ?? dkiMeta.memoriesUsed ?? 0,
+                    preferenceTokens: dkiMeta.preference_tokens ?? dkiMeta.preferenceTokens ?? 0,
+                    historyTokens: dkiMeta.history_tokens ?? dkiMeta.historyTokens ?? 0,
+                    cacheHit: dkiMeta.cache_hit ?? dkiMeta.cacheHit ?? false,
+                    cacheTier: dkiMeta.cache_tier ?? dkiMeta.cacheTier ?? "none",
+                    latencyMs: dkiMeta.latency_ms ?? dkiMeta.latencyMs ?? 0,
+                } : undefined,
+            } as ChatResponse;
         },
 
         // Streaming chat (returns EventSource)
