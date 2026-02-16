@@ -143,9 +143,21 @@ dki:
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Full Attention Strategy (Research)
+### Full Attention / Engram-Inspired Strategy (⚠️ Deprecated)
 
-**Research strategy**, based on Plan C, both preferences and history injected via K/V:
+> **Deprecation Notice**: The Full Attention strategy and Engram-Inspired Injection strategy have been deprecated. These strategies injected both preferences and history entirely via K/V to achieve near-zero context usage, but have **fundamental limitations with long history**:
+>
+> 1. **Limited K/V injection capacity**: As conversation history grows (tens to hundreds of turns), K/V token count increases dramatically, exceeding the effective attention range
+> 2. **No explicit referenceability**: History injected via K/V cannot be explicitly referenced or reasoned about by the model
+> 3. **OOD risk**: Massive K/V injection at negative positions causes severe distribution shift from training
+> 4. **Poor factual accuracy**: The model cannot extract specific facts (dates, prices, etc.) from K/V-injected history
+>
+> **Replacement**: Use **Recall v4 Memory Recall Strategy** (see below), which provides stable and reliable memory recall for long history scenarios through multi-signal retrieval + dynamic summarization + application-layer fact supplementation.
+
+<details>
+<summary>Original Full Attention Strategy documentation (deprecated, click to expand)</summary>
+
+Implemented in `dki/core/injection/full_attention_injector.py`.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -177,6 +189,38 @@ dki:
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
+
+#### Full Attention Injector Implementation
+
+The `FullAttentionInjector` class (`dki/core/injection/full_attention_injector.py`) is the core implementation of the Full Attention Strategy. Key design details:
+
+**Position Encoding Modes**: Three modes are supported, configurable via `position_mode`:
+
+| Mode               | Description                                        | Use Case                        |
+| ------------------ | -------------------------------------------------- | ------------------------------- |
+| `fixed_negative`   | Memory tokens mapped to negative positions (RoPE)  | Default, clean separation       |
+| `constant`         | All memory tokens share the same position           | Tests position-independence     |
+| `nope`             | No position encoding applied to memory K/V          | Tests NoPE hypothesis           |
+
+**Value-Only Scaling (Engram-Inspired)**: The injector applies α scaling exclusively to Value tensors, keeping Keys unscaled. This preserves attention addressing precision while modulating memory influence strength—a principle adopted from Engram [arXiv:2601.07372]:
+
+```python
+# Key (address) is NOT scaled — preserves matching precision
+# Value (output contribution) IS scaled — modulates influence
+h_v = h_v * history_alpha     # e.g., 0.3
+p_v = p_v * preference_alpha  # e.g., 0.4
+```
+
+**K/V Merging**: History and preference K/V pairs are merged per-layer with history positioned further from the query (earlier negative positions) and preferences closer:
+
+```
+Merged layout per layer: [History K/V (far negative)] [Preference K/V (near negative)] [User K/V (positive)]
+```
+
+**Safety Mechanisms**:
+- **Token limit**: If total K/V tokens exceed `max_total_kv_tokens` (default: 600), the injector either falls back to the Stable strategy or truncates history (most recent messages preserved)
+- **Attention pattern logging**: When enabled, logs position distributions, token counts, and compute times for research analysis
+- **Graceful fallback**: On any error, returns a non-injected result so the vanilla LLM can proceed normally
 
 **Configuration Example**:
 
@@ -219,6 +263,92 @@ stats = dki.get_full_attention_stats()
 logs = dki.get_full_attention_logs(limit=50)
 ```
 
+</details>
+
+### Recall v4 Memory Recall Strategy (Recommended)
+
+**Production-recommended strategy**. Simulates human memory recall through multi-signal retrieval, dynamic history construction, and application-layer fact supplementation, providing stable and reliable memory capabilities for long history scenarios. Core implementation in `dki/core/recall/`.
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                  DKI Recall v4 Memory Recall Architecture               │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  Phase 1: Multi-Signal Recall                                           │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │  User Input → [Keywords+Weights] + [Anaphora] + [Vector Sim]   │    │
+│  │            →  Weighted Merge + Normalization → Message List     │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                          ↓                                              │
+│  Phase 2: Dynamic History Construction                                  │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │  Iterate messages:                                               │    │
+│  │    Over threshold → [SUMMARY] + trace_id (traceable)            │    │
+│  │    Under threshold → Original message                            │    │
+│  │  + Recent N turns of complete conversation                       │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                          ↓                                              │
+│  Phase 3: Model-Adaptive Assembly + Inference                           │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │  [History Suffix] + [Trust+Reasoning Constraints] + [Pref K/V]  │    │
+│  │  + [Query] → LLM Inference → Detect retrieve_fact call          │    │
+│  │  → Fact supplementation (chunked offset+limit) → Continue       │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                         │
+│  Advantages:                                                            │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │  ✅ Stable and reliable for long history                         │    │
+│  │  ✅ Facts are traceable (trace_id → original message)            │    │
+│  │  ✅ Dynamic context budget management                            │    │
+│  │  ✅ Multi-model support (DeepSeek, GLM, Generic)                 │    │
+│  │  ✅ Preferences still via K/V injection (reuses existing infra)  │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**Configuration Example**:
+
+```yaml
+dki:
+    injection_strategy: "recall_v4"
+
+    recall:
+        enabled: true
+        strategy: "summary_with_fact_call"
+
+        signals:
+            keyword_enabled: true
+            keyword_topk: 5
+            keyword_method: "tfidf"
+            vector_enabled: true
+            vector_top_k: 10
+
+        budget:
+            generation_reserve: 512
+            min_recent_turns: 2
+            max_recent_turns: 5
+
+        summary:
+            per_message_threshold: 200
+            strategy: "extractive"    # extractive (jieba TextRank) | llm
+
+        fact_call:
+            enabled: true
+            max_rounds: 3
+            max_fact_tokens: 800
+```
+
+**Runtime Strategy Switching**:
+
+```python
+# Switch to recall_v4 strategy
+dki.switch_injection_strategy("recall_v4")
+
+# Switch back to stable strategy
+dki.switch_injection_strategy("stable")
+```
+
 ### Data Flow
 
 ```
@@ -259,6 +389,8 @@ logs = dki.get_full_attention_logs(limit=50)
 ```
 
 ## 🚀 Quick Start
+
+> 📖 **Complete Deployment Guide**: If you need to deploy DKI + AGA + vLLM from scratch on Ubuntu Server, see [DKI+AGA Complete Deployment Guide](docs/DKI_AGA_Complete_Deployment_Guide.md) for detailed environment setup, model download, service startup, and testing steps.
 
 ### Installation
 
@@ -609,6 +741,7 @@ DKI/
 │   └── README.md
 │
 ├── docs/                                # 📚 Documentation
+│   ├── DKI_AGA_Complete_Deployment_Guide.md  # ⭐ DKI+AGA Full Deployment Guide
 │   ├── DKI_Architecture_Diagrams.md     # ⭐ Architecture & flow diagrams
 │   ├── DKI_Optimization_Roadmap.md      # ⭐ Optimization plan & productization
 │   ├── Integration_Guide.md             # Integration guide
@@ -676,7 +809,8 @@ DKI/
 | Module                  | Status     | Description                                |
 | ----------------------- | ---------- | ------------------------------------------ |
 | DKI Core Plugin         | ✅ Done    | K/V injection, hybrid strategy, gating     |
-| Full Attention Strategy | ✅ Done    | Research: full K/V injection, configurable |
+| Full Attention Strategy | ⚠️ Deprecated | Deprecated: limited by long history scenarios |
+| Recall v4 Memory Recall | ✅ Done    | Multi-signal retrieval + dynamic summary + fact call |
 | Config-Driven Adapter   | ✅ Done    | SQLAlchemy dynamic table mapping           |
 | JSON Content Extraction | ✅ Done    | Auto-parse JSON content fields             |
 | Memory Trigger          | ✅ Done    | Memory trigger detection, configurable     |
