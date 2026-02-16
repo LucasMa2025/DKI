@@ -69,7 +69,14 @@ class MockLLMAdapter(BaseModelAdapter):
             output_tokens=25,
         )
     
-    def compute_kv(self, text: str):
+    def load(self) -> None:
+        pass
+    
+    def embed(self, text: str):
+        import torch
+        return torch.randn(self._hidden_dim)
+    
+    def compute_kv(self, text: str, return_hidden: bool = False):
         import torch
         seq_len = max(1, len(text.split()))
         kv_entries = []
@@ -77,7 +84,12 @@ class MockLLMAdapter(BaseModelAdapter):
             k = torch.randn(1, 32, seq_len, 128)
             v = torch.randn(1, 32, seq_len, 128)
             kv_entries.append(KVCacheEntry(layer_idx=layer_idx, key=k, value=v))
+        if return_hidden:
+            return kv_entries, torch.randn(1, seq_len, self._hidden_dim)
         return kv_entries, seq_len
+    
+    def compute_prefill_entropy(self, text: str, layer_idx: int = 3) -> float:
+        return 2.0
 
 
 class TestDKIChatFlow:

@@ -598,3 +598,66 @@ class TestExperimentRunnerUtils:
         mock_runner._ensure_systems()
         assert mock_runner.dki_system is original_dki
         assert mock_runner.rag_system is original_rag
+
+    # ---- _get_first_experiment_user_id (v3.1) ----
+
+    def test_get_first_experiment_user_id_with_map(self, mock_runner):
+        """有实验用户映射时返回第一个用户 ID"""
+        mock_runner._experiment_user_map = {
+            "exp_user_vegetarian": "uid_veg",
+            "exp_user_outdoor": "uid_out",
+        }
+        user_id = mock_runner._get_first_experiment_user_id()
+        assert user_id == "uid_veg"
+
+    def test_get_first_experiment_user_id_no_map(self, mock_runner):
+        """无实验用户映射时返回默认值"""
+        user_id = mock_runner._get_first_experiment_user_id()
+        assert user_id == "experiment_user"
+
+    def test_get_first_experiment_user_id_empty_map(self, mock_runner):
+        """空映射时返回默认值"""
+        mock_runner._experiment_user_map = {}
+        user_id = mock_runner._get_first_experiment_user_id()
+        assert user_id == "experiment_user"
+
+    # ---- clear_preference_cache 使用 (v3.1) ----
+
+    def test_write_session_preferences_calls_clear_cache(self, mock_runner):
+        """_write_session_preferences 应通过公开 API 清除缓存"""
+        mock_runner.db_manager = MagicMock()
+        # mock session_scope 上下文管理器
+        mock_db = MagicMock()
+        mock_runner.db_manager.session_scope.return_value.__enter__ = MagicMock(return_value=mock_db)
+        mock_runner.db_manager.session_scope.return_value.__exit__ = MagicMock(return_value=False)
+        
+        mock_pref_repo = MagicMock()
+        mock_pref_repo.get_by_user.return_value = []
+        
+        with patch("dki.experiment.runner.UserPreferenceRepository", return_value=mock_pref_repo):
+            mock_runner._write_session_preferences("user_123", ["persona_1"])
+        
+        # 验证调用了 clear_preference_cache 而非直接操作 _user_preferences
+        mock_runner.dki_system.clear_preference_cache.assert_called_once_with("user_123")
+
+    # ---- CacheKeySigner 初始化 (v3.1) ----
+
+    def test_cache_key_signer_initialized(self, tmp_path):
+        """当 user_isolation 模块可用时，应初始化 CacheKeySigner"""
+        with patch("dki.experiment.runner.ConfigLoader") as MockConfigLoader, \
+             patch("dki.experiment.runner.DatabaseManager") as MockDBManager, \
+             patch("dki.experiment.runner.USER_ISOLATION_AVAILABLE", True), \
+             patch("dki.experiment.runner.CacheKeySigner") as MockSigner:
+            
+            mock_config = MagicMock()
+            mock_config.database.path = str(tmp_path / "test.db")
+            MockConfigLoader.return_value.config = mock_config
+            
+            runner = ExperimentRunner(
+                dki_system=MagicMock(),
+                rag_system=MagicMock(),
+                output_dir=str(tmp_path / "results"),
+            )
+            
+            MockSigner.assert_called_once()
+            assert runner._cache_key_signer is not None

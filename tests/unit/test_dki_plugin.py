@@ -36,12 +36,19 @@ class MockModelAdapter(BaseModelAdapter):
     def hidden_dim(self) -> int:
         return self._hidden_dim
     
+    def load(self) -> None:
+        pass
+    
     def generate(self, prompt: str, **kwargs) -> ModelOutput:
         return ModelOutput(
             text=f"Response to: {prompt[:50]}...",
             input_tokens=len(prompt.split()),
             output_tokens=20,
         )
+    
+    def embed(self, text: str):
+        import torch
+        return torch.randn(self._hidden_dim)
     
     def forward_with_kv_injection(
         self,
@@ -56,7 +63,7 @@ class MockModelAdapter(BaseModelAdapter):
             output_tokens=25,
         )
     
-    def compute_kv(self, text: str):
+    def compute_kv(self, text: str, return_hidden: bool = False):
         import torch
         seq_len = len(text.split())
         kv_entries = []
@@ -64,7 +71,12 @@ class MockModelAdapter(BaseModelAdapter):
             k = torch.randn(1, 32, seq_len, 128)
             v = torch.randn(1, 32, seq_len, 128)
             kv_entries.append(KVCacheEntry(layer_idx=layer_idx, key=k, value=v))
+        if return_hidden:
+            return kv_entries, torch.randn(1, seq_len, self._hidden_dim)
         return kv_entries, seq_len
+    
+    def compute_prefill_entropy(self, text: str, layer_idx: int = 3) -> float:
+        return 2.0  # 模拟熵值
 
 
 class MockUserDataAdapter(IUserDataAdapter):
@@ -246,8 +258,12 @@ class TestDKIPlugin:
             force_alpha=0.8,
         )
         
-        assert response.metadata.alpha == 0.8
+        # force_alpha=0.8 会被 SafetyEnvelope.override_cap=0.7 截断
+        # effective_preference_alpha = min(0.8, 0.7) = 0.7
+        assert response.metadata.alpha == 0.7
         assert response.metadata.injection_enabled is True
+        # 验证安全违规被记录
+        assert len(response.metadata.safety_violations) > 0
     
     @pytest.mark.asyncio
     async def test_chat_no_injection(self, dki_plugin):
@@ -310,11 +326,16 @@ class TestInjectionMetadata:
         
         data = metadata.to_dict()
         
-        assert data["injection"]["enabled"] is True
-        assert data["injection"]["alpha"] == 0.5
+        assert data["injection_enabled"] is True
+        assert data["injection_strategy"] == "recall_v4"
+        assert data["alpha"] == 0.5
         assert data["tokens"]["preference"] == 50
         assert data["tokens"]["history"] == 100
-        assert data["performance"]["latency_ms"] == 150.5
+        assert data["tokens"]["query"] == 20
+        assert data["tokens"]["total"] == 170
+        assert data["latency"]["total_ms"] == 150.5
+        assert data["data_source"]["preferences_count"] == 2
+        assert data["data_source"]["relevant_history_count"] == 3
 
 
 class TestDKIPluginResponse:
