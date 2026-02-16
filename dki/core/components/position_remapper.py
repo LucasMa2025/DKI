@@ -38,7 +38,7 @@ class PositionRemapper:
     ):
         config = ConfigLoader().config
         
-        self.strategy = strategy or config.dki.position.strategy
+        self.strategy = strategy if strategy is not None else config.dki.position.strategy
         self.position_encoding = position_encoding
     
     def remap_for_rope(
@@ -144,8 +144,8 @@ class PositionRemapper:
         if (num_heads & (num_heads - 1)) == 0:
             slopes = get_slopes_power_of_2(num_heads)
         else:
-            # Find closest power of 2
-            closest_power = 2 ** ((num_heads - 1).bit_length() - 1)
+            # Find closest power of 2 that is <= num_heads
+            closest_power = 2 ** (num_heads.bit_length() - 1)
             slopes = get_slopes_power_of_2(closest_power)
             
             # Add extra slopes for remaining heads

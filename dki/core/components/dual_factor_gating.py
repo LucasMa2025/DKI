@@ -74,10 +74,10 @@ class DualFactorGating:
     ):
         config = ConfigLoader().config
         
-        self.entropy_threshold = entropy_threshold or config.dki.gating.entropy_threshold
-        self.relevance_threshold = relevance_threshold or config.dki.gating.relevance_threshold
+        self.entropy_threshold = entropy_threshold if entropy_threshold is not None else config.dki.gating.entropy_threshold
+        self.relevance_threshold = relevance_threshold if relevance_threshold is not None else config.dki.gating.relevance_threshold
         self.use_margin = use_margin
-        self.margin_weight = margin_weight or config.dki.gating.margin_weight
+        self.margin_weight = margin_weight if margin_weight is not None else config.dki.gating.margin_weight
         
         # Alpha computation weights
         self.entropy_weight = 2.0

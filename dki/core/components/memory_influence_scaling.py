@@ -76,9 +76,9 @@ class MemoryInfluenceScaling(nn.Module):
         
         self.hidden_dim = hidden_dim
         self.use_learned_alpha = use_learned_alpha
-        self.alpha_min = alpha_min or config.dki.mis.alpha_min
-        self.alpha_max = alpha_max or config.dki.mis.alpha_max
-        self.alpha_default = alpha_default or config.dki.mis.alpha_default
+        self.alpha_min = alpha_min if alpha_min is not None else config.dki.mis.alpha_min
+        self.alpha_max = alpha_max if alpha_max is not None else config.dki.mis.alpha_max
+        self.alpha_default = alpha_default if alpha_default is not None else config.dki.mis.alpha_default
         
         if use_learned_alpha:
             # Multi-factor alpha prediction network
@@ -189,10 +189,21 @@ class MemoryInfluenceScaling(nn.Module):
         alpha: float,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Scale K/V values directly (alternative to logit bias).
+        Scale Value tensors directly (alternative to logit bias).
         
-        This method scales the value vectors, which affects
-        the output but not the attention distribution.
+        IMPORTANT: Only Value is scaled, Key is NEVER modified.
+        
+        Rationale (Paper Section 3.3, Value-Only Scaling Principle):
+        - Key determines attention distribution (which positions are attended to)
+        - Value determines output content (what information is retrieved)
+        - Scaling Key would distort attention addressing, causing the model to
+          "forget" where memory tokens are, leading to unpredictable behavior
+        - Scaling Value only adjusts the contribution strength of memory to output,
+          preserving correct attention routing
+        
+        This is consistent with the Engram paper's "Value-Only Gating" design,
+        where α gates only V while K remains unchanged to preserve attention
+        addressing accuracy.
         
         Args:
             key: Key tensor [batch, heads, seq, head_dim]
@@ -200,15 +211,15 @@ class MemoryInfluenceScaling(nn.Module):
             alpha: Injection strength
             
         Returns:
-            Scaled (key, value) tensors
+            (key, scaled_value) — key is always returned unchanged
         """
         if alpha >= 1.0:
             return key, value
         
         if alpha <= 0.0:
-            return key * 0, value * 0
+            return key, value * 0
         
-        # Scale value (key affects attention, value affects output)
+        # Scale value only (key is never modified)
         scaled_value = value * alpha
         
         return key, scaled_value

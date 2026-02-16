@@ -82,6 +82,20 @@ from dki.database.repository import (
 )
 from dki.config.config_loader import ConfigLoader
 
+# Recall v4 组件 (可选, 通过配置启用)
+try:
+    from dki.core.recall import (
+        RecallConfig,
+        MultiSignalRecall,
+        SuffixBuilder,
+        FactRetriever,
+        create_formatter,
+    )
+    from dki.core.recall.recall_config import FactRequest
+    RECALL_V4_AVAILABLE = True
+except ImportError:
+    RECALL_V4_AVAILABLE = False
+
 
 @dataclass
 class DKIResponse:
@@ -247,10 +261,35 @@ class DKISystem:
             echo=self.config.database.echo,
         )
         
+        # ============ Recall v4 组件 (惰性初始化) ============
+        self._recall_config: Optional[Any] = None
+        self._multi_signal_recall: Optional[Any] = None
+        self._suffix_builder: Optional[Any] = None
+        self._fact_retriever: Optional[Any] = None
+        self._recall_formatter: Optional[Any] = None
+        self._use_recall_v4 = False
+        
+        if RECALL_V4_AVAILABLE:
+            recall_dict = {}
+            if hasattr(self.config, 'dki') and hasattr(self.config.dki, 'recall'):
+                recall_obj = self.config.dki.recall
+                if isinstance(recall_obj, dict):
+                    recall_dict = recall_obj
+                elif hasattr(recall_obj, '__dict__'):
+                    recall_dict = self._obj_to_dict(recall_obj)
+            
+            if recall_dict:
+                self._recall_config = RecallConfig.from_dict(recall_dict)
+                self._use_recall_v4 = (
+                    self._recall_config.enabled
+                    and self._recall_config.strategy == "summary_with_fact_call"
+                )
+        
         logger.info(
             f"DKI System initialized "
             f"(tiered_cache={self._use_tiered_cache}, "
-            f"hybrid_injection={self._use_hybrid_injection})"
+            f"hybrid_injection={self._use_hybrid_injection}, "
+            f"recall_v4={self._use_recall_v4})"
         )
     
     @property
@@ -344,6 +383,89 @@ class DKISystem:
                 language=language,
             )
         return self._hybrid_injector
+    
+    @staticmethod
+    def _obj_to_dict(obj: Any) -> Dict[str, Any]:
+        """将配置对象递归转为字典"""
+        if isinstance(obj, dict):
+            return obj
+        result = {}
+        for key in dir(obj):
+            if key.startswith('_'):
+                continue
+            val = getattr(obj, key)
+            if callable(val):
+                continue
+            if hasattr(val, '__dict__') and not isinstance(val, (str, int, float, bool, list)):
+                result[key] = DKISystem._obj_to_dict(val)
+            else:
+                result[key] = val
+        return result
+    
+    def _init_recall_v4_components(self) -> None:
+        """惰性初始化 Recall v4 组件 (需要 model_adapter 和 db_manager)"""
+        if not self._use_recall_v4 or not RECALL_V4_AVAILABLE:
+            return
+        if self._multi_signal_recall is not None:
+            return  # 已初始化
+        
+        cfg = self._recall_config
+        
+        # 获取模型名 (用于自动选择格式化器)
+        model_name = ""
+        if self._model_adapter:
+            model_name = getattr(self._model_adapter, "model_name", "")
+        elif hasattr(self.config, 'model'):
+            engine = self.config.model.default_engine
+            engine_cfg = self.config.model.engines.get(engine, {})
+            model_name = getattr(engine_cfg, 'model_name', '') if hasattr(engine_cfg, 'model_name') else ''
+        
+        # 格式化器
+        language = "cn"
+        if hasattr(self.config.dki, 'hybrid_injection'):
+            language = getattr(self.config.dki.hybrid_injection, 'language', 'cn')
+        
+        self._recall_formatter = create_formatter(
+            model_name=model_name,
+            formatter_type=cfg.prompt_formatter,
+            language=language,
+        )
+        
+        # ConversationRepository 的简单包装器 (recall 组件使用)
+        conv_repo_wrapper = _ConversationRepoWrapper(self.db_manager)
+        
+        # 多信号召回器
+        self._multi_signal_recall = MultiSignalRecall(
+            config=cfg,
+            reference_resolver=None,  # 将在 build_plan 中通过 planner 使用
+            memory_router=self.memory_router,
+            conversation_repo=conv_repo_wrapper,
+        )
+        
+        # 后缀组装器
+        token_counter = None
+        if self._model_adapter and hasattr(self._model_adapter, 'tokenizer'):
+            tokenizer = self._model_adapter.tokenizer
+            token_counter = lambda text: len(tokenizer.encode(text)) if text else 0
+        
+        self._suffix_builder = SuffixBuilder(
+            config=cfg,
+            prompt_formatter=self._recall_formatter,
+            token_counter=token_counter,
+            model_adapter=self._model_adapter,
+        )
+        
+        # 事实检索器
+        self._fact_retriever = FactRetriever(
+            config=cfg,
+            conversation_repo=conv_repo_wrapper,
+        )
+        
+        logger.info(
+            f"Recall v4 components initialized: "
+            f"formatter={type(self._recall_formatter).__name__}, "
+            f"strategy={cfg.strategy}"
+        )
     
     def _get_session_cache(self, session_id: str) -> Union[SessionKVCache, TieredKVCache]:
         """
@@ -600,9 +722,66 @@ class DKISystem:
                 if not self.get_user_preference(user_id):
                     self._load_user_preferences_from_db(user_id)
             
-            # Step 0.5: Hybrid injection preparation (if enabled)
+            # Step 0.5: History preparation (Recall v4 or Hybrid)
             hybrid_result = None
-            if use_hybrid_mode and allow_injection:
+            recall_v4_suffix = None
+            recall_v4_trace_ids = []
+            
+            if self._use_recall_v4 and use_hybrid_mode and allow_injection:
+                # ============ Recall v4: 多信号召回 + 后缀组装 ============
+                timer.start_stage("recall_v4")
+                self._init_recall_v4_components()
+                
+                # Get user preference (for K/V injection, 不变)
+                preference = None
+                if user_id:
+                    preference = self.get_user_preference(user_id)
+                
+                # 多信号召回
+                recall_result = self._multi_signal_recall.recall(
+                    query=query,
+                    session_id=session_id,
+                    user_id=user_id,
+                )
+                
+                # 后缀组装
+                context_window = 4096
+                if hasattr(self.config.model, 'engines'):
+                    engine_cfg = self.config.model.engines.get(
+                        self.config.model.default_engine, {}
+                    )
+                    context_window = getattr(engine_cfg, 'max_model_len', 4096) if hasattr(engine_cfg, 'max_model_len') else 4096
+                
+                pref_tokens = 0
+                if preference:
+                    pref_tokens = len(preference.content.split()) * 2  # 粗估
+                
+                assembled = self._suffix_builder.build(
+                    query=query,
+                    recalled_messages=recall_result.messages,
+                    context_window=context_window,
+                    preference_tokens=pref_tokens,
+                )
+                
+                recall_v4_suffix = assembled.text
+                recall_v4_trace_ids = assembled.trace_ids
+                
+                # 使用组装好的后缀替代 query
+                if assembled.total_tokens > 0:
+                    query = assembled.text
+                
+                # 仍然准备 hybrid_result 用于偏好 K/V 注入 (history 已由 recall_v4 处理)
+                if preference:
+                    hybrid_result = self.hybrid_injector.prepare_input(
+                        user_query=original_query,
+                        preference=preference,
+                        history=None,
+                    )
+                
+                timer.end_stage()
+                
+            elif use_hybrid_mode and allow_injection:
+                # ============ 原有 Hybrid 注入 (flat_history) ============
                 timer.start_stage("hybrid_prep")
                 
                 # Get user preference (if user_id provided)
@@ -700,6 +879,27 @@ class DKISystem:
                 )
                 memories_used = gating_decision.memories
             
+            # ============ Recall v4: Fact Call 循环 ============
+            fact_rounds_used = 0
+            if (self._use_recall_v4
+                    and recall_v4_trace_ids
+                    and self._fact_retriever
+                    and self._recall_formatter
+                    and self._recall_config
+                    and self._recall_config.fact_call.enabled):
+                timer.start_stage("fact_call")
+                output, fact_rounds_used = self._execute_fact_call_loop(
+                    output=output,
+                    prompt=query,
+                    session_id=session_id,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    preference_kv=hybrid_result.preference_kv if hybrid_result else None,
+                    preference_alpha=hybrid_result.preference_alpha if hybrid_result else 0.0,
+                    **kwargs,
+                )
+                timer.end_stage()
+            
             timer.set_cache_info(cache_hit, cache_tier)
         
         # Record latency for analysis
@@ -729,6 +929,15 @@ class DKISystem:
                 'session_cache_stats': session_cache.get_stats(),
                 'task_type': task_type,
                 'hybrid_injection': {'enabled': False},
+            }
+        
+        # Recall v4 metadata
+        if self._use_recall_v4 and recall_v4_suffix:
+            metadata['recall_v4'] = {
+                'enabled': True,
+                'strategy': self._recall_config.strategy if self._recall_config else '',
+                'trace_ids': recall_v4_trace_ids,
+                'fact_rounds_used': fact_rounds_used,
             }
         
         # Log to database (使用原始用户输入，避免历史后缀递归嵌套)
@@ -917,6 +1126,87 @@ class DKISystem:
         
         return output, cache_hit, cache_tier
     
+    def _execute_fact_call_loop(
+        self,
+        output: ModelOutput,
+        prompt: str,
+        session_id: str,
+        max_new_tokens: int,
+        temperature: float,
+        preference_kv: Optional[Any] = None,
+        preference_alpha: float = 0.0,
+        **kwargs,
+    ) -> tuple:
+        """
+        Recall v4: Fact Call 循环
+        
+        检测模型输出中的 retrieve_fact 调用, 补充事实后重新推理。
+        
+        Returns:
+            (final_output, fact_rounds_used)
+        """
+        max_rounds = self._recall_config.fact_call.max_rounds
+        max_fact_tokens = self._recall_config.fact_call.max_fact_tokens
+        total_fact_tokens = 0
+        
+        for round_idx in range(max_rounds):
+            # 检查输出是否包含 fact_call
+            fact_request = self._recall_formatter.detect_fact_request(output.text)
+            
+            if fact_request is None:
+                return output, round_idx  # 不需要补充事实 ✅
+            
+            logger.info(
+                f"DKI System fact call round {round_idx + 1}: "
+                f"trace_id={fact_request.trace_id}"
+            )
+            
+            # 检索事实
+            fact_response = self._fact_retriever.retrieve(
+                trace_id=fact_request.trace_id,
+                session_id=session_id,
+                offset=fact_request.offset,
+                limit=fact_request.limit,
+            )
+            
+            if not fact_response.messages:
+                return output, round_idx
+            
+            # 格式化事实段落
+            fact_text = self._recall_formatter.format_fact_segment(fact_response)
+            
+            # 粗估 token
+            fact_tokens = len(fact_text) // 2
+            total_fact_tokens += fact_tokens
+            
+            if total_fact_tokens > max_fact_tokens:
+                logger.info(f"Fact token budget exhausted: {total_fact_tokens}")
+                return output, round_idx
+            
+            # 追加事实到 prompt
+            continuation = "请基于以上补充事实回答用户问题。"
+            prompt = prompt + "\n\n" + fact_text + "\n\n" + continuation
+            
+            # 重新推理
+            if preference_kv and preference_alpha > 0.1:
+                output = self.model.forward_with_kv_injection(
+                    prompt=prompt,
+                    injected_kv=preference_kv,
+                    alpha=preference_alpha,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    **kwargs,
+                )
+            else:
+                output = self.model.generate(
+                    prompt=prompt,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    **kwargs,
+                )
+        
+        return output, max_rounds
+    
     def _merge_kv_entries(
         self,
         kv_list: List[List[KVCacheEntry]],
@@ -1103,3 +1393,48 @@ class DKISystem:
     ) -> BudgetAnalysis:
         """Get token/attention budget analysis for RAG vs DKI."""
         return self._budget_analyzer.analyze(user_tokens, memory_tokens)
+
+
+# ============================================================
+# Recall v4 辅助类
+# ============================================================
+
+class _ConversationRepoWrapper:
+    """
+    ConversationRepository 的简单包装器
+    
+    为 recall 组件提供统一接口, 自动管理数据库 session。
+    """
+    
+    def __init__(self, db_manager: DatabaseManager):
+        self._db_manager = db_manager
+    
+    def get_by_session(
+        self,
+        session_id: str,
+        db_session: Optional[Any] = None,
+        **kwargs,
+    ) -> List[Any]:
+        """获取会话的所有消息"""
+        with self._db_manager.session_scope() as db:
+            repo = ConversationRepository(db)
+            return repo.get_by_session(session_id)
+    
+    def get_recent(
+        self,
+        session_id: str,
+        limit: int = 10,
+        **kwargs,
+    ) -> List[Any]:
+        """获取最近的消息"""
+        with self._db_manager.session_scope() as db:
+            repo = ConversationRepository(db)
+            return repo.get_recent(session_id, limit=limit)
+    
+    def get_by_id(self, message_id: str) -> Optional[Any]:
+        """根据 ID 获取消息"""
+        with self._db_manager.session_scope() as db:
+            repo = ConversationRepository(db)
+            if hasattr(repo, 'get_by_id'):
+                return repo.get_by_id(message_id)
+        return None

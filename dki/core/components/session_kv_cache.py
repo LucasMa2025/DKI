@@ -71,9 +71,9 @@ class SessionKVCache:
     ):
         config = ConfigLoader().config
         
-        self.max_size = max_size or config.dki.cache.max_size
-        self.strategy = strategy or config.dki.cache.strategy
-        self.ttl_seconds = ttl_seconds or config.dki.cache.ttl_seconds
+        self.max_size = max_size if max_size is not None else config.dki.cache.max_size
+        self.strategy = strategy if strategy is not None else config.dki.cache.strategy
+        self.ttl_seconds = ttl_seconds if ttl_seconds is not None else config.dki.cache.ttl_seconds
         
         # Cache storage
         self._cache: OrderedDict[str, CachedKV] = OrderedDict()

@@ -30,6 +30,18 @@ from dki.core.components.reference_resolver import (
     Message,
     create_reference_resolver,
 )
+from dki.core.components.attention_budget import (
+    AttentionBudgetAnalyzer,
+    BudgetAnalysis,
+    LatencyBreakdown,
+    LatencyTimer,
+)
+from dki.core.components.tiered_kv_cache import (
+    TieredKVCache,
+    CacheTier,
+    SimpleCompressor,
+    KVCompressor,
+)
 
 __all__ = [
     # Core components
@@ -60,4 +72,14 @@ __all__ = [
     "ResolvedReference",
     "Message",
     "create_reference_resolver",
+    # Attention budget
+    "AttentionBudgetAnalyzer",
+    "BudgetAnalysis",
+    "LatencyBreakdown",
+    "LatencyTimer",
+    # Tiered KV cache
+    "TieredKVCache",
+    "CacheTier",
+    "SimpleCompressor",
+    "KVCompressor",
 ]

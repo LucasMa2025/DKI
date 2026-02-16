@@ -53,8 +53,8 @@ class QueryConditionedProjection(nn.Module):
         config = ConfigLoader().config
         
         self.hidden_dim = hidden_dim
-        self.rank = rank or config.dki.projection.rank
-        self.dropout_rate = dropout or config.dki.projection.dropout
+        self.rank = rank if rank is not None else config.dki.projection.rank
+        self.dropout_rate = dropout if dropout is not None else config.dki.projection.dropout
         
         # Low-rank projection matrix
         self.W_mem = nn.Parameter(torch.randn(hidden_dim, self.rank) * 0.01)
