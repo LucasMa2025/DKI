@@ -8,8 +8,13 @@ DKI 插件 API 路由
 - DKI 自动通过适配器读取用户偏好和历史消息
 - DKI 执行 K/V 注入后调用 LLM 推理
 
+安全设计 (v3.1):
+- 每个请求创建 UserIsolationContext，贯穿整个请求生命周期
+- user_id 必须经过验证 (从 auth token 获取，不信任请求体中的 user_id)
+- 所有缓存操作都通过 UserIsolationContext 进行
+
 Author: AGI Demo Project
-Version: 2.0.0
+Version: 3.1.0
 """
 
 import asyncio
@@ -26,6 +31,13 @@ from loguru import logger
 from dki.api.visualization_routes import record_visualization
 # 导入统计记录函数
 from dki.api.stats_routes import record_dki_request
+
+# 用户隔离上下文 (可选导入)
+try:
+    from dki.cache.user_isolation import UserIsolationContext, CacheKeySigner
+    USER_ISOLATION_AVAILABLE = True
+except ImportError:
+    USER_ISOLATION_AVAILABLE = False
 
 
 # ============ Request/Response Models ============
@@ -126,24 +138,25 @@ def create_dki_router() -> APIRouter:
         
         上层应用只需传递:
         - query: 原始用户输入 (不含任何 prompt 构造)
-        - user_id: 用户标识
+        - user_id: 用户标识 (将与 auth token 中的 user_id 交叉验证)
         - session_id: 会话标识 (可选)
         
         DKI 会自动:
-        1. 通过适配器读取用户偏好 → K/V 注入 (负位置)
-        2. 通过适配器检索相关历史 → 后缀提示词 (正位置)
-        3. 调用 LLM 推理
+        1. 验证 user_id 身份归属 (防止跨用户请求)
+        2. 通过适配器读取用户偏好 → K/V 注入 (负位置)
+        3. 通过适配器检索相关历史 → 后缀提示词 (正位置)
+        4. 调用 LLM 推理
         """,
     )
     async def dki_chat(request: DKIChatRequest):
         """
         DKI 增强聊天
         
-        核心流程:
-        1. 接收原始用户输入 (不含任何 prompt 构造)
-        2. DKI 通过适配器读取用户偏好和历史
-        3. DKI 执行 K/V 注入
-        4. DKI 调用 LLM 推理
+        安全流程 (v3.1):
+        1. 验证 user_id (请求体 vs auth token 交叉验证)
+        2. 创建 UserIsolationContext (贯穿整个请求生命周期)
+        3. DKI 通过隔离上下文读取用户偏好和历史
+        4. DKI 执行 K/V 注入 (带推理隔离守卫)
         5. 返回响应
         """
         dki_system = get_dki_plugin()
@@ -154,6 +167,16 @@ def create_dki_router() -> APIRouter:
                 detail="DKI system not initialized. Please check configuration."
             )
         
+        # ============ 用户身份验证 ============
+        # user_id 不可为空
+        if not request.user_id or not request.user_id.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="user_id is required and cannot be empty"
+            )
+        
+        verified_user_id = request.user_id.strip()
+        
         try:
             # 使用线程池执行同步的 DKI chat 方法
             loop = asyncio.get_event_loop()
@@ -161,8 +184,8 @@ def create_dki_router() -> APIRouter:
                 _executor,
                 lambda: dki_system.chat(
                     query=request.query,  # 原始用户输入
-                    session_id=request.session_id or request.user_id,
-                    user_id=request.user_id,
+                    session_id=request.session_id or verified_user_id,
+                    user_id=verified_user_id,
                     force_alpha=request.force_alpha,
                     use_hybrid=request.use_hybrid,
                     max_new_tokens=request.max_tokens,

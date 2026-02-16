@@ -4,6 +4,11 @@ FastAPI routes for user authentication
 
 Author: AGI Demo Project
 Version: 1.0.0
+
+演示系统认证:
+- 只查询用户账号，不验证密码
+- 登录时查询用户，如不存在则创建
+- 用户数据持久化到数据库，确保测试过程中的偏好及会话历史可管理
 """
 
 import uuid
@@ -16,16 +21,23 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from loguru import logger
 
+from dki.database.connection import DatabaseManager
+from dki.database.repository import DemoUserRepository
 
-# Simple in-memory user store for demo purposes
-# In production, use a proper database
-_users_db = {}
+
+# Token store (in-memory, tokens are transient)
+# 用户数据现在存储在数据库中，只有 token 是临时的
 _tokens_db = {}
 
 
 class LoginRequest(BaseModel):
+    """
+    登录请求 - 演示系统简化版
+    
+    注意: 演示系统不验证密码，只查询用户名
+    """
     username: str
-    password: str
+    password: str = ""  # 演示系统不验证密码，设为可选
     remember: bool = False
 
 
@@ -74,7 +86,14 @@ def get_current_user(
     if not user_id:
         return None
     
-    return _users_db.get(user_id)
+    # 从数据库获取用户
+    db_manager = DatabaseManager.get_instance()
+    with db_manager.session_scope() as db:
+        user_repo = DemoUserRepository(db)
+        user = user_repo.get(user_id)
+        if user:
+            return user.to_dict()
+    return None
 
 
 def require_auth(
@@ -98,15 +117,18 @@ def require_auth(
             headers={"WWW-Authenticate": "Bearer"},
         )
     
-    user = _users_db.get(user_id)
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="User not found",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    
-    return user
+    # 从数据库获取用户
+    db_manager = DatabaseManager.get_instance()
+    with db_manager.session_scope() as db:
+        user_repo = DemoUserRepository(db)
+        user = user_repo.get(user_id)
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="User not found",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return user.to_dict()
 
 
 def create_auth_router() -> APIRouter:
@@ -119,43 +141,42 @@ def create_auth_router() -> APIRouter:
         """
         User login endpoint.
         
-        For demo purposes, accepts any username/password and creates
-        a user if it doesn't exist.
+        演示系统登录:
+        - 只查询用户账号，不验证密码
+        - 如果用户不存在则自动创建
+        - 用户数据持久化到数据库
         """
-        # Demo mode: create user if not exists
-        user_id = None
-        for uid, user in _users_db.items():
-            if user["username"] == request.username:
-                user_id = uid
-                break
+        db_manager = DatabaseManager.get_instance()
         
-        if not user_id:
-            # Create new user for demo
-            user_id = f"user_{uuid.uuid4().hex[:8]}"
-            _users_db[user_id] = {
-                "id": user_id,
-                "username": request.username,
-                "password_hash": hash_password(request.password),
-                "email": None,
-                "avatar": None,
-                "created_at": datetime.now().isoformat(),
-            }
-            logger.info(f"Created demo user: {request.username}")
+        with db_manager.session_scope() as db:
+            user_repo = DemoUserRepository(db)
+            
+            # 查询或创建用户 (不验证密码)
+            user, created = user_repo.get_or_create(
+                username=request.username,
+                display_name=request.username,
+            )
+            
+            if created:
+                logger.info(f"Created new demo user: {request.username} (id={user.id})")
+            else:
+                logger.info(f"Demo user logged in: {request.username} (id={user.id})")
+            
+            user_id = user.id
+            user_dict = user.to_dict()
         
-        # Generate token
+        # Generate token (token 仍然是临时的)
         token = generate_token()
         _tokens_db[token] = user_id
-        
-        user = _users_db[user_id]
         
         return LoginResponse(
             token=token,
             user=UserResponse(
-                id=user["id"],
-                username=user["username"],
-                email=user.get("email"),
-                avatar=user.get("avatar"),
-                created_at=user.get("created_at"),
+                id=user_dict["id"],
+                username=user_dict["username"],
+                email=user_dict.get("email"),
+                avatar=user_dict.get("avatar"),
+                created_at=user_dict.get("createdAt"),
             ),
         )
     
@@ -163,33 +184,37 @@ def create_auth_router() -> APIRouter:
     async def register(request: RegisterRequest):
         """
         User registration endpoint.
+        
+        演示系统注册 (实际上与登录相同，因为不验证密码)
         """
-        # Check if username exists
-        for user in _users_db.values():
-            if user["username"] == request.username:
+        db_manager = DatabaseManager.get_instance()
+        
+        with db_manager.session_scope() as db:
+            user_repo = DemoUserRepository(db)
+            
+            # Check if username exists
+            existing_user = user_repo.get_by_username(request.username)
+            if existing_user:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="Username already exists",
                 )
-        
-        # Create user
-        user_id = f"user_{uuid.uuid4().hex[:8]}"
-        _users_db[user_id] = {
-            "id": user_id,
-            "username": request.username,
-            "password_hash": hash_password(request.password),
-            "email": request.email,
-            "avatar": None,
-            "created_at": datetime.now().isoformat(),
-        }
-        
-        logger.info(f"Registered user: {request.username}")
+            
+            # Create user
+            user = user_repo.create(
+                username=request.username,
+                display_name=request.username,
+                email=request.email,
+            )
+            
+            logger.info(f"Registered user: {request.username} (id={user.id})")
+            user_dict = user.to_dict()
         
         return UserResponse(
-            id=user_id,
-            username=request.username,
-            email=request.email,
-            created_at=_users_db[user_id]["created_at"],
+            id=user_dict["id"],
+            username=user_dict["username"],
+            email=user_dict.get("email"),
+            created_at=user_dict.get("createdAt"),
         )
     
     @router.post("/logout")
@@ -217,7 +242,21 @@ def create_auth_router() -> APIRouter:
             username=user["username"],
             email=user.get("email"),
             avatar=user.get("avatar"),
-            created_at=user.get("created_at"),
+            created_at=user.get("createdAt"),
         )
+    
+    @router.get("/users", response_model=list)
+    async def list_users():
+        """
+        List all demo users.
+        
+        用于演示系统管理界面，查看所有已创建的用户
+        """
+        db_manager = DatabaseManager.get_instance()
+        
+        with db_manager.session_scope() as db:
+            user_repo = DemoUserRepository(db)
+            users = user_repo.list_all(limit=100)
+            return [user.to_dict() for user in users]
     
     return router

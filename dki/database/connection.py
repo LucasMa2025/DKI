@@ -133,6 +133,16 @@ class DatabaseManager:
         logger.info("Database reset completed")
     
     @classmethod
+    def get_instance(cls) -> 'DatabaseManager':
+        """Get singleton instance of DatabaseManager.
+        
+        Returns existing instance or creates a new one with default settings.
+        """
+        if cls._instance is None or not cls._instance._initialized:
+            return cls()
+        return cls._instance
+    
+    @classmethod
     def reset_instance(cls) -> None:
         """Reset singleton instance."""
         if cls._instance is not None:

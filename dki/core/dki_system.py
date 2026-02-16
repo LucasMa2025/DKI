@@ -96,6 +96,19 @@ try:
 except ImportError:
     RECALL_V4_AVAILABLE = False
 
+# 用户隔离组件 (v3.1)
+try:
+    from dki.cache.user_isolation import (
+        UserIsolationContext,
+        UserIsolationConfig,
+        CacheKeySigner,
+        InferenceContextGuard,
+        CacheAuditLog,
+    )
+    USER_ISOLATION_AVAILABLE = True
+except ImportError:
+    USER_ISOLATION_AVAILABLE = False
+
 
 @dataclass
 class DKIResponse:
@@ -254,6 +267,18 @@ class DKISystem:
         
         # User preferences cache (user_id -> UserPreference)
         self._user_preferences: Dict[str, UserPreference] = {}
+        
+        # ============ 用户隔离 (v3.1) ============
+        self._user_isolation_enabled = USER_ISOLATION_AVAILABLE
+        self._cache_key_signer: Optional[Any] = None
+        self._cache_audit_log: Optional[Any] = None
+        
+        if self._user_isolation_enabled:
+            import os
+            hmac_secret = os.environ.get("DKI_HMAC_SECRET", "")
+            self._cache_key_signer = CacheKeySigner(secret=hmac_secret)
+            self._cache_audit_log = CacheAuditLog(max_entries=10000)
+            logger.info("DKI user isolation enabled (HMAC signer + audit log)")
         
         # Database
         self.db_manager = DatabaseManager(
@@ -574,21 +599,67 @@ class DKISystem:
         - Injected via K/V at negative positions
         - Cached for reuse across sessions
         
+        安全 (v3.1): user_id 必须经过验证
+        
         Args:
-            user_id: User identifier
+            user_id: User identifier (must be validated)
             preference_text: Preference content (e.g., "素食主义者，住北京，不喜欢辣")
             metadata: Optional metadata
         """
+        if not user_id or not user_id.strip():
+            logger.warning("Attempted to set preference with empty user_id, ignoring")
+            return
+        
+        user_id = user_id.strip()
         self._user_preferences[user_id] = UserPreference(
             content=preference_text,
             user_id=user_id,
             metadata=metadata or {},
         )
+        
+        # 审计日志
+        if self._cache_audit_log:
+            self._cache_audit_log.record(
+                user_id=user_id,
+                action="put",
+                cache_key=f"preference:{user_id}",
+                cache_tier="memory",
+                success=True,
+                metadata={"text_length": len(preference_text)},
+            )
+        
         logger.info(f"Set preference for user {user_id}: {len(preference_text)} chars")
     
     def get_user_preference(self, user_id: str) -> Optional[UserPreference]:
         """Get user preference."""
         return self._user_preferences.get(user_id)
+    
+    def clear_preference_cache(self, user_id: Optional[str] = None) -> None:
+        """
+        清除用户偏好的内存缓存，强制下次从数据库重新加载。
+        
+        这是公开 API，供实验系统等外部组件安全地清除缓存，
+        避免直接操作 _user_preferences 内部状态。
+        
+        Args:
+            user_id: 指定用户 ID 则只清除该用户; None 则清除所有用户
+        """
+        if user_id:
+            removed = self._user_preferences.pop(user_id, None)
+            if removed:
+                logger.debug(f"Cleared preference cache for user {user_id}")
+                if self._cache_audit_log:
+                    self._cache_audit_log.record(
+                        user_id=user_id,
+                        action="invalidate",
+                        cache_key=f"preference:{user_id}",
+                        cache_tier="memory",
+                        success=True,
+                    )
+        else:
+            count = len(self._user_preferences)
+            self._user_preferences.clear()
+            logger.debug(f"Cleared all preference caches ({count} users)")
     
     def _load_user_preferences_from_db(self, user_id: str) -> None:
         """
@@ -703,6 +774,13 @@ class DKISystem:
         Returns:
             DKIResponse with generated text, metadata, and budget analysis
         """
+        # ============ 用户身份验证 (v3.1) ============
+        if user_id:
+            user_id = user_id.strip()
+            if not user_id:
+                logger.warning("Empty user_id after strip, proceeding without user context")
+                user_id = None
+        
         # Determine injection mode
         use_hybrid_mode = use_hybrid if use_hybrid is not None else self._use_hybrid_injection
         
@@ -1327,6 +1405,11 @@ class DKISystem:
             for sid, cache in self._tiered_caches.items()
         }
         
+        # 用户隔离统计
+        isolation_stats = {}
+        if self._cache_audit_log:
+            isolation_stats = self._cache_audit_log.get_stats()
+        
         return {
             'router_stats': self.memory_router.get_stats(),
             'model_info': self.model.get_model_info() if self._model_adapter else None,
@@ -1334,6 +1417,10 @@ class DKISystem:
             'tiered_caches': tiered_stats,
             'tiered_memory_footprint': tiered_footprint,
             'budget_analysis': self._budget_analyzer.get_stats(),
+            'user_isolation': {
+                'enabled': self._user_isolation_enabled,
+                'audit': isolation_stats,
+            },
             'config': {
                 'use_tiered_cache': self._use_tiered_cache,
                 'gating': {

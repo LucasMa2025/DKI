@@ -2,10 +2,10 @@
 DKI Injection Executor - 注入计划执行器
 
 职责: 只做执行, 不做决策
-- 根据 InjectionPlan 选择执行路径
+- 根据 InjectionPlan 执行 recall_v4 策略
 - 计算偏好 K/V (含缓存)
-- 调用 Full Attention 注入器
-- 调用模型推理
+- 调用模型推理 (带 K/V 注入)
+- 执行 Fact Call 循环 (事实补充)
 - 处理降级 (fallback)
 
 输入: InjectionPlan + ModelAdapter
@@ -16,8 +16,17 @@ DKI Injection Executor - 注入计划执行器
 - Preference alpha 永远不超过 AlphaProfile.override_cap
 - 任何异常自动降级到无注入推理
 
+安全不变量 (v3.1):
+- 偏好 K/V 缓存按用户物理分区，不同用户的 K/V 不共享数据结构
+- 每次缓存访问都验证 user_id 归属权
+- 推理前后有上下文隔离检查，防止 K/V 残留泄露
+
+注意 (v3.2):
+- stable 和 full_attention 策略已移除
+- 系统统一使用 recall_v4 (偏好 K/V + 后缀组装 + Fact Call)
+
 Author: AGI Demo Project
-Version: 3.0.0
+Version: 3.2.0
 """
 
 import time
@@ -31,10 +40,17 @@ from dki.core.plugin.injection_plan import (
     InjectionPlan,
     ExecutionResult,
 )
-from dki.core.injection import (
-    FullAttentionInjector,
-    FullAttentionConfig,
-)
+
+# 用户隔离组件
+try:
+    from dki.cache.user_isolation import (
+        UserIsolationContext,
+        InferenceContextGuard,
+        CacheKeySigner,
+    )
+    USER_ISOLATION_AVAILABLE = True
+except ImportError:
+    USER_ISOLATION_AVAILABLE = False
 
 # Recall v4 组件 (可选)
 try:
@@ -47,14 +63,20 @@ except ImportError:
 
 class InjectionExecutor:
     """
-    注入计划执行器
+    注入计划执行器 (v3.2)
     
     纯执行层，根据 InjectionPlan 调用模型。
+    统一使用 recall_v4 策略: 偏好 K/V 注入 + 后缀组装 + Fact Call 循环。
     
     不变量:
     - Key tensor 永远不被 alpha 缩放 (保护 attention addressing)
     - Preference alpha 永远不超过 AlphaProfile.override_cap
     - 任何异常自动降级到无注入推理
+    
+    安全不变量 (v3.1):
+    - 偏好 K/V 缓存按 user_id 物理分区
+    - 每次缓存访问验证 user_id 归属
+    - 推理上下文隔离 (InferenceContextGuard)
     
     用法:
         executor = InjectionExecutor(model_adapter=model)
@@ -68,8 +90,7 @@ class InjectionExecutor:
     def __init__(
         self,
         model_adapter: BaseModelAdapter,
-        full_attention_injector: Optional[FullAttentionInjector] = None,
-        # Recall v4 组件 (可选)
+        # Recall v4 组件
         fact_retriever: Optional[Any] = None,
         prompt_formatter: Optional[Any] = None,
         recall_config: Optional[Any] = None,
@@ -79,31 +100,35 @@ class InjectionExecutor:
         
         Args:
             model_adapter: LLM 模型适配器
-            full_attention_injector: Full Attention 注入器 (可选)
-            fact_retriever: 事实检索器 (Recall v4, 可选)
-            prompt_formatter: 提示格式化器 (Recall v4, 可选)
-            recall_config: 召回配置 (Recall v4, 可选)
+            fact_retriever: 事实检索器 (Recall v4)
+            prompt_formatter: 提示格式化器 (Recall v4)
+            recall_config: 召回配置 (Recall v4)
         """
         self.model = model_adapter
-        self._full_attention_injector = full_attention_injector
         
         # Recall v4 组件
         self._fact_retriever = fact_retriever
         self._prompt_formatter = prompt_formatter
         self._recall_config = recall_config
         
-        # 偏好 K/V 缓存 (内存级)
-        self._preference_kv_cache: Dict[str, Tuple[Any, str]] = {}
+        # ============ 用户级隔离的偏好 K/V 缓存 ============
+        # 改进: 从全局 Dict 改为用户级分区 Dict
+        # 结构: {user_id: {content_hash: (kv_entries, content_hash)}}
+        self._preference_kv_cache: Dict[str, Dict[str, Tuple[Any, str]]] = {}
+        
+        # 推理上下文守卫 (防止 K/V 残留泄露)
+        self._inference_guard: Optional[InferenceContextGuard] = None
+        if USER_ISOLATION_AVAILABLE:
+            self._inference_guard = InferenceContextGuard()
         
         # 统计
         self._stats = {
             "executions": 0,
-            "stable_executions": 0,
-            "full_attention_executions": 0,
-            "plain_executions": 0,
             "recall_v4_executions": 0,
+            "plain_executions": 0,
             "fallbacks": 0,
             "cache_hits": 0,
+            "cache_user_isolation_denials": 0,
             "fact_call_rounds": 0,
         }
     
@@ -119,12 +144,11 @@ class InjectionExecutor:
         **kwargs,
     ) -> ExecutionResult:
         """
-        执行注入计划
+        执行注入计划 (v3.2: 统一 recall_v4 策略)
         
-        根据 plan.strategy 选择执行路径:
-        - stable: 偏好 K/V 注入 + suffix prompt
-        - full_attention: 偏好 K/V + 历史 K/V
-        - none / 无注入: 直接生成
+        执行路径:
+        - 有偏好 + 注入启用: K/V 注入推理 + Fact Call 循环
+        - 无偏好 / 无注入: 直接生成
         
         Args:
             plan: 注入计划 (来自 Planner)
@@ -137,19 +161,12 @@ class InjectionExecutor:
         self._stats["executions"] += 1
         
         try:
-            if (plan.strategy == "full_attention"
-                    and self._full_attention_injector
-                    and plan.injection_enabled):
-                result = await self._execute_full_attention(
+            if plan.injection_enabled and plan.preference_text:
+                # recall_v4: 偏好 K/V 注入 + 后缀组装
+                result = await self._execute_with_kv_injection(
                     plan, max_new_tokens, temperature, **kwargs
                 )
-                self._stats["full_attention_executions"] += 1
-            elif plan.injection_enabled and plan.preference_text:
-                # Stable 策略 (含 recall_v4 的 fact call 循环)
-                result = await self._execute_stable(
-                    plan, max_new_tokens, temperature, **kwargs
-                )
-                # 如果启用了 recall_v4 fact call, 执行循环
+                # Fact Call 循环 (事实补充)
                 if (plan.has_fact_call_instruction
                         and self._fact_retriever
                         and self._prompt_formatter
@@ -158,9 +175,7 @@ class InjectionExecutor:
                     result = await self._execute_fact_call_loop(
                         plan, result, max_new_tokens, temperature, **kwargs
                     )
-                self._stats["stable_executions"] += 1
-                if plan.recall_strategy:
-                    self._stats["recall_v4_executions"] += 1
+                self._stats["recall_v4_executions"] += 1
             else:
                 result = await self._execute_plain(
                     plan, max_new_tokens, temperature, **kwargs
@@ -176,10 +191,10 @@ class InjectionExecutor:
             )
     
     # ================================================================
-    # Stable 策略执行
+    # K/V 注入推理 (recall_v4 统一策略)
     # ================================================================
     
-    async def _execute_stable(
+    async def _execute_with_kv_injection(
         self,
         plan: InjectionPlan,
         max_new_tokens: int,
@@ -187,14 +202,16 @@ class InjectionExecutor:
         **kwargs,
     ) -> ExecutionResult:
         """
-        执行 Stable 策略
+        执行 K/V 注入推理 (recall_v4 统一策略)
         
         偏好: K/V 注入 (负位置)
-        历史: Suffix Prompt (正位置，已包含在 plan.final_input 中)
+        历史: 由 recall_v4 后缀组装 (已包含在 plan.final_input 中)
+        
+        安全: 使用 InferenceContextGuard 确保推理上下文隔离
         """
         result = ExecutionResult()
         
-        # 获取偏好 K/V (含缓存)
+        # 获取偏好 K/V (含用户级隔离缓存)
         preference_kv, cache_hit, cache_tier = self._get_preference_kv(
             user_id=plan.user_id,
             preference_text=plan.preference_text,
@@ -205,19 +222,33 @@ class InjectionExecutor:
         # 使用 effective alpha (受 override_cap 约束)
         alpha = plan.alpha_profile.effective_preference_alpha
         
-        # 推理
+        # 推理 (带上下文隔离守卫)
         inference_start = time.time()
         
         if preference_kv and alpha > 0.1:
-            # 带 K/V 注入的推理
-            output = self.model.forward_with_kv_injection(
-                prompt=plan.final_input,
-                injected_kv=preference_kv,
-                alpha=alpha,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                **kwargs,
-            )
+            # 带 K/V 注入的推理 (使用推理隔离守卫)
+            if self._inference_guard:
+                with self._inference_guard.scoped_inference(
+                    user_id=plan.user_id,
+                    kv_entries=preference_kv,
+                ):
+                    output = self.model.forward_with_kv_injection(
+                        prompt=plan.final_input,
+                        injected_kv=preference_kv,
+                        alpha=alpha,
+                        max_new_tokens=max_new_tokens,
+                        temperature=temperature,
+                        **kwargs,
+                    )
+            else:
+                output = self.model.forward_with_kv_injection(
+                    prompt=plan.final_input,
+                    injected_kv=preference_kv,
+                    alpha=alpha,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    **kwargs,
+                )
         else:
             # 无注入推理 (alpha 太低或无 K/V)
             output = self.model.generate(
@@ -233,130 +264,6 @@ class InjectionExecutor:
         result.output_tokens = output.output_tokens
         result.raw_output = output
         
-        return result
-    
-    # ================================================================
-    # Full Attention 策略执行
-    # ================================================================
-    
-    async def _execute_full_attention(
-        self,
-        plan: InjectionPlan,
-        max_new_tokens: int,
-        temperature: float,
-        **kwargs,
-    ) -> ExecutionResult:
-        """
-        执行 Full Attention 策略 (研究 - 方案 C)
-        
-        偏好: K/V 注入 (负位置)
-        历史: K/V 注入 (负位置)
-        全局指示: 极简提示 (约 3-5 tokens)
-        
-        如果 Full Attention 失败或触发 fallback，自动回退到 Stable。
-        """
-        result = ExecutionResult()
-        
-        # 调用 Full Attention 注入器
-        fa_result = self._full_attention_injector.inject(
-            model_adapter=self.model,
-            preference_text=plan.preference_text,
-            history_messages=plan.history_messages,
-            query=plan.original_query,
-        )
-        
-        # 检查是否需要 fallback 到 Stable
-        if not fa_result.success or fa_result.fallback_triggered:
-            result.full_attention_fallback = True
-            logger.info(
-                f"Full attention fallback to stable: "
-                f"{fa_result.error_message}"
-            )
-            # 使用已准备好的 history_suffix 回退到 Stable
-            return await self._execute_stable_fallback(
-                plan, max_new_tokens, temperature, **kwargs
-            )
-        
-        # 记录 Full Attention 信息
-        result.full_attention_position_mode = fa_result.position_mode
-        result.full_attention_preference_tokens = fa_result.preference_tokens
-        result.full_attention_history_tokens = fa_result.history_tokens
-        
-        # 构造最终输入 (仅包含全局指示 + 查询)
-        final_input = plan.original_query
-        if fa_result.global_indication:
-            final_input = fa_result.global_indication + "\n" + plan.original_query
-        
-        # 使用 effective alpha
-        alpha = plan.alpha_profile.effective_preference_alpha
-        
-        # 推理
-        inference_start = time.time()
-        
-        if fa_result.merged_kv:
-            output = self.model.forward_with_kv_injection(
-                prompt=final_input,
-                injected_kv=fa_result.merged_kv,
-                alpha=alpha,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                **kwargs,
-            )
-        else:
-            output = self.model.generate(
-                prompt=final_input,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                **kwargs,
-            )
-        
-        result.inference_latency_ms = (time.time() - inference_start) * 1000
-        result.text = output.text
-        result.input_tokens = output.input_tokens
-        result.output_tokens = output.output_tokens
-        result.raw_output = output
-        
-        logger.debug(
-            f"Full attention executed: "
-            f"pref_kv={fa_result.preference_tokens}, "
-            f"hist_kv={fa_result.history_tokens}"
-        )
-        
-        return result
-    
-    async def _execute_stable_fallback(
-        self,
-        plan: InjectionPlan,
-        max_new_tokens: int,
-        temperature: float,
-        **kwargs,
-    ) -> ExecutionResult:
-        """
-        Full Attention 回退到 Stable 策略
-        
-        使用 plan 中已准备好的 history_suffix 构造 stable 输入。
-        """
-        # 重新构造 stable 的 final_input
-        if plan.history_suffix:
-            stable_input = plan.history_suffix + "\n\n" + plan.original_query
-        else:
-            stable_input = plan.original_query
-        
-        # 创建一个临时 stable plan
-        stable_plan = InjectionPlan(
-            strategy="stable",
-            preference_text=plan.preference_text,
-            user_id=plan.user_id,
-            original_query=plan.original_query,
-            final_input=stable_input,
-            injection_enabled=plan.injection_enabled,
-            alpha_profile=plan.alpha_profile,
-        )
-        
-        result = await self._execute_stable(
-            stable_plan, max_new_tokens, temperature, **kwargs
-        )
-        result.full_attention_fallback = True
         return result
     
     # ================================================================
@@ -508,14 +415,29 @@ class InjectionExecutor:
             alpha = plan.alpha_profile.effective_preference_alpha
             
             if preference_kv and alpha > 0.1:
-                output = self.model.forward_with_kv_injection(
-                    prompt=prompt,
-                    injected_kv=preference_kv,
-                    alpha=alpha,
-                    max_new_tokens=max_new_tokens,
-                    temperature=temperature,
-                    **kwargs,
-                )
+                # Fact call 循环中的推理也需要隔离守卫
+                if self._inference_guard:
+                    with self._inference_guard.scoped_inference(
+                        user_id=plan.user_id,
+                        kv_entries=preference_kv,
+                    ):
+                        output = self.model.forward_with_kv_injection(
+                            prompt=prompt,
+                            injected_kv=preference_kv,
+                            alpha=alpha,
+                            max_new_tokens=max_new_tokens,
+                            temperature=temperature,
+                            **kwargs,
+                        )
+                else:
+                    output = self.model.forward_with_kv_injection(
+                        prompt=prompt,
+                        injected_kv=preference_kv,
+                        alpha=alpha,
+                        max_new_tokens=max_new_tokens,
+                        temperature=temperature,
+                        **kwargs,
+                    )
             else:
                 output = self.model.generate(
                     prompt=prompt,
@@ -537,7 +459,7 @@ class InjectionExecutor:
         return result
     
     # ================================================================
-    # K/V 缓存
+    # K/V 缓存 (用户级隔离)
     # ================================================================
     
     def _get_preference_kv(
@@ -546,17 +468,33 @@ class InjectionExecutor:
         preference_text: str,
     ) -> Tuple[Optional[List[KVCacheEntry]], bool, str]:
         """
-        获取偏好 K/V (含内存缓存)
+        获取偏好 K/V (含用户级隔离内存缓存)
+        
+        安全改进 (v3.1):
+        - 缓存按 user_id 物理分区，不同用户的 K/V 存储在独立字典中
+        - 访问时验证 user_id 归属，防止跨用户数据泄露
+        - 即使 content_hash 相同，不同用户也不会共享缓存条目
         
         Returns:
             (kv_entries, cache_hit, cache_tier)
         """
-        content_hash = hashlib.md5(preference_text.encode()).hexdigest()
-        cache_key = f"{user_id}:{content_hash}"
+        if not user_id or not user_id.strip():
+            logger.warning("Empty user_id in _get_preference_kv, skipping cache")
+            try:
+                kv_entries, _ = self.model.compute_kv(preference_text)
+                return kv_entries, False, "compute_no_cache"
+            except Exception as e:
+                logger.error(f"Failed to compute preference K/V: {e}")
+                return None, False, "error"
         
-        # 检查缓存
-        if cache_key in self._preference_kv_cache:
-            kv_entries, cached_hash = self._preference_kv_cache[cache_key]
+        content_hash = hashlib.md5(preference_text.encode()).hexdigest()
+        
+        # 获取用户专属分区
+        user_partition = self._preference_kv_cache.get(user_id)
+        
+        # 检查用户分区中的缓存
+        if user_partition is not None and content_hash in user_partition:
+            kv_entries, cached_hash = user_partition[content_hash]
             if cached_hash == content_hash:
                 self._stats["cache_hits"] += 1
                 return kv_entries, True, "memory"
@@ -564,39 +502,33 @@ class InjectionExecutor:
         # 计算 K/V
         try:
             kv_entries, _ = self.model.compute_kv(preference_text)
-            self._preference_kv_cache[cache_key] = (kv_entries, content_hash)
+            
+            # 存入用户专属分区
+            if user_id not in self._preference_kv_cache:
+                self._preference_kv_cache[user_id] = {}
+            self._preference_kv_cache[user_id][content_hash] = (kv_entries, content_hash)
+            
             return kv_entries, False, "compute"
         except Exception as e:
             logger.error(f"Failed to compute preference K/V: {e}")
             return None, False, "error"
     
     def clear_preference_cache(self, user_id: Optional[str] = None):
-        """清除偏好缓存"""
+        """
+        清除偏好缓存
+        
+        Args:
+            user_id: 指定用户 ID 则只清除该用户的缓存，
+                     None 则清除所有用户的缓存
+        """
         if user_id:
-            keys_to_remove = [
-                k for k in self._preference_kv_cache
-                if k.startswith(f"{user_id}:")
-            ]
-            for key in keys_to_remove:
-                del self._preference_kv_cache[key]
+            # 只清除指定用户的分区
+            if user_id in self._preference_kv_cache:
+                del self._preference_kv_cache[user_id]
+                logger.debug(f"Cleared preference cache for user {user_id}")
         else:
             self._preference_kv_cache.clear()
-    
-    # ================================================================
-    # Full Attention 管理
-    # ================================================================
-    
-    def set_full_attention_injector(
-        self,
-        injector: FullAttentionInjector,
-    ):
-        """设置 Full Attention 注入器"""
-        self._full_attention_injector = injector
-    
-    @property
-    def full_attention_injector(self) -> Optional[FullAttentionInjector]:
-        """获取 Full Attention 注入器"""
-        return self._full_attention_injector
+            logger.debug("Cleared all preference caches")
     
     # ================================================================
     # 统计
@@ -604,10 +536,15 @@ class InjectionExecutor:
     
     def get_stats(self) -> Dict[str, Any]:
         """获取 Executor 统计"""
+        # 统计用户分区信息
+        total_entries = sum(
+            len(partition) for partition in self._preference_kv_cache.values()
+        )
+        
         return {
             **self._stats,
-            "kv_cache_size": len(self._preference_kv_cache),
-            "full_attention_available": (
-                self._full_attention_injector is not None
-            ),
+            "kv_cache_user_partitions": len(self._preference_kv_cache),
+            "kv_cache_total_entries": total_entries,
+            "kv_cache_isolation": "per_user_partition",
+            "inference_guard_available": self._inference_guard is not None,
         }

@@ -83,13 +83,8 @@ class SafetyEnvelope:
     - 防止 preference 覆盖 query
     - 限制 K/V token 总量
     """
-    # Stable 策略安全限制
-    stable_max_preference_alpha: float = 0.5
-    stable_history_alpha_must_be: float = 1.0   # suffix 必须为 1.0
-    
-    # Full Attention 策略安全限制
-    full_attention_max_preference_alpha: float = 0.7
-    full_attention_max_history_alpha: float = 0.5
+    # recall_v4 策略安全限制
+    max_preference_alpha: float = 0.7
     
     # 通用限制
     max_total_kv_tokens: int = 600
@@ -103,25 +98,11 @@ class SafetyEnvelope:
         """
         violations = []
         
-        if plan.strategy == "stable":
-            if plan.alpha_profile.preference_alpha > self.stable_max_preference_alpha:
-                violations.append(
-                    f"Stable: preference_alpha={plan.alpha_profile.preference_alpha:.2f} "
-                    f"> max={self.stable_max_preference_alpha:.2f}"
-                )
-        elif plan.strategy == "full_attention":
-            if plan.alpha_profile.preference_alpha > self.full_attention_max_preference_alpha:
-                violations.append(
-                    f"FullAttention: preference_alpha="
-                    f"{plan.alpha_profile.preference_alpha:.2f} "
-                    f"> max={self.full_attention_max_preference_alpha:.2f}"
-                )
-            if plan.alpha_profile.history_alpha > self.full_attention_max_history_alpha:
-                violations.append(
-                    f"FullAttention: history_alpha="
-                    f"{plan.alpha_profile.history_alpha:.2f} "
-                    f"> max={self.full_attention_max_history_alpha:.2f}"
-                )
+        if plan.alpha_profile.preference_alpha > self.max_preference_alpha:
+            violations.append(
+                f"recall_v4: preference_alpha={plan.alpha_profile.preference_alpha:.2f} "
+                f"> max={self.max_preference_alpha:.2f}"
+            )
         
         return violations
 
@@ -176,7 +157,7 @@ class InjectionPlan:
     可独立测试:
     ```python
     plan = InjectionPlan(
-        strategy="stable",
+        strategy="recall_v4",
         injection_enabled=True,
         preference_text="素食主义者",
         alpha_profile=AlphaProfile(preference_alpha=0.3),
@@ -185,7 +166,7 @@ class InjectionPlan:
     ```
     """
     # ============ 策略 ============
-    strategy: str = "stable"          # stable | full_attention | none
+    strategy: str = "recall_v4"       # recall_v4 | none
     
     # ============ 偏好数据 (K/V 注入) ============
     preference_text: str = ""
@@ -193,10 +174,8 @@ class InjectionPlan:
     preference_tokens: int = 0
     
     # ============ 历史数据 ============
-    # Stable: 格式化后的 suffix prompt (始终准备, 用于 fallback)
+    # 格式化后的 suffix prompt (recall_v4 组装 / fallback 平铺)
     history_suffix: str = ""
-    # Full Attention: 原始消息列表 (供 executor 转换为 K/V)
-    history_messages: List[Dict[str, Any]] = field(default_factory=list)
     history_tokens: int = 0
     relevant_history_count: int = 0
     
@@ -224,11 +203,6 @@ class InjectionPlan:
     reference_scope: Optional[str] = None
     recall_limit: int = 10
     
-    # ============ Full Attention 特有 ============
-    global_indication: str = ""
-    full_attention_fallback: bool = False
-    history_kv_tokens: int = 0
-    
     # ============ Recall v4 特有 ============
     # 由 recall_v4 策略生成的组装后缀 (替代 history_suffix)
     assembled_suffix: str = ""
@@ -252,7 +226,6 @@ class InjectionPlan:
             "preferences_count": self.preferences_count,
             "preference_tokens": self.preference_tokens,
             "history_tokens": self.history_tokens,
-            "history_kv_tokens": self.history_kv_tokens,
             "query_tokens": self.query_tokens,
             "total_tokens": self.total_tokens,
             "relevant_history_count": self.relevant_history_count,
@@ -261,7 +234,6 @@ class InjectionPlan:
             "reference_resolved": self.reference_resolved,
             "reference_type": self.reference_type,
             "reference_scope": self.reference_scope,
-            "full_attention_fallback": self.full_attention_fallback,
             "gating_decision": self.gating_decision,
             "safety_violations": self.safety_violations,
             # Recall v4
@@ -297,12 +269,6 @@ class ExecutionResult:
     # 缓存信息 (由 executor 填充)
     preference_cache_hit: bool = False
     preference_cache_tier: str = "none"
-    
-    # Full Attention 执行信息
-    full_attention_fallback: bool = False
-    full_attention_position_mode: str = ""
-    full_attention_preference_tokens: int = 0
-    full_attention_history_tokens: int = 0
     
     # 降级
     fallback_used: bool = False

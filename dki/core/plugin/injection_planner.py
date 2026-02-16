@@ -83,8 +83,15 @@ class InjectionPlanner:
         )
         
         # plan 可以被检查、记录、测试
-        assert plan.strategy == "stable"
+        assert plan.strategy == "recall_v4"
         assert plan.injection_enabled == True
+    
+    注意 (v3.2):
+        stable 和 full_attention 策略已移除。
+        系统统一使用 recall_v4 策略:
+        - 偏好: K/V 注入
+        - 历史: 多信号召回 + 后缀组装
+        - 事实补充: Function Call 循环
     """
     
     # ============ 历史后缀提示词模板 ============
@@ -116,13 +123,13 @@ class InjectionPlanner:
         self,
         config: Optional[Any] = None,
         language: str = "en",
-        injection_strategy: str = "stable",
+        injection_strategy: str = "recall_v4",
         memory_trigger: Optional[MemoryTrigger] = None,
         memory_trigger_config: Optional[MemoryTriggerConfig] = None,
         reference_resolver: Optional[ReferenceResolver] = None,
         reference_resolver_config: Optional[ReferenceResolverConfig] = None,
         safety_envelope: Optional[SafetyEnvelope] = None,
-        # Recall v4 组件 (可选)
+        # Recall v4 组件
         recall_config: Optional[Any] = None,
         multi_signal_recall: Optional[Any] = None,
         suffix_builder: Optional[Any] = None,
@@ -133,7 +140,7 @@ class InjectionPlanner:
         Args:
             config: DKI 配置对象
             language: 语言 ("en" | "cn")
-            injection_strategy: 默认注入策略 ("stable" | "full_attention" | "recall_v4")
+            injection_strategy: 注入策略 (v3.2: 仅支持 "recall_v4")
             memory_trigger: Memory Trigger 实例 (可注入)
             memory_trigger_config: Memory Trigger 配置 (如无实例则用于创建)
             reference_resolver: Reference Resolver 实例 (可注入)
@@ -145,7 +152,7 @@ class InjectionPlanner:
         """
         self.config = config
         self.language = language
-        self._injection_strategy = injection_strategy
+        self._injection_strategy = "recall_v4"  # v3.2: 强制使用 recall_v4
         
         # NLP 组件 (可注入, 可独立测试)
         self._memory_trigger = memory_trigger or MemoryTrigger(
@@ -251,7 +258,7 @@ class InjectionPlanner:
             query: 原始用户输入
             user_id: 用户标识 (用于缓存键)
             preferences: 用户偏好列表
-            relevant_history: 相关历史消息 (用于 stable/full_attention)
+            relevant_history: 相关历史消息 (fallback 平铺用)
             context: 查询分析上下文 (来自 analyze_query)
             force_alpha: 强制 alpha (跳过门控)
             strategy_override: 策略覆盖 (用于测试)
@@ -284,16 +291,8 @@ class InjectionPlanner:
             plan.preferences_count = len(preferences)
             plan.preference_tokens = self._estimate_tokens(plan.preference_text)
         
-        # ============ Step 2: 格式化历史 (策略分支) ============
-        use_recall_v4 = (
-            strategy == "recall_v4"
-            or (strategy == "stable"
-                and self._recall_config
-                and self._recall_config.enabled
-                and self._recall_config.strategy == "summary_with_fact_call")
-        )
-        
-        if use_recall_v4 and self._multi_signal_recall and self._suffix_builder:
+        # ============ Step 2: 历史召回 (recall_v4 统一策略) ============
+        if self._multi_signal_recall and self._suffix_builder:
             # ============ Recall v4: 多信号召回 + 后缀组装 ============
             plan = self._build_recall_v4_plan(
                 plan=plan,
@@ -304,25 +303,12 @@ class InjectionPlanner:
                 db_session=db_session,
             )
         else:
-            # ============ 原有策略: stable / full_attention ============
-            # 始终准备 history_suffix (用于 fallback)
+            # ============ Fallback: recall_v4 组件未初始化时使用平铺历史 ============
             if relevant_history:
                 plan.history_suffix = self._format_history_suffix(relevant_history)
                 plan.relevant_history_count = len(relevant_history)
-            
-            if strategy == "full_attention":
-                # Full Attention: 额外准备原始消息列表
-                plan.history_messages = [
-                    {"role": msg.role, "content": msg.content}
-                    for msg in relevant_history
-                ] if relevant_history else []
-                total_hist_text = " ".join(
-                    m["content"] for m in plan.history_messages
-                )
-                plan.history_tokens = self._estimate_tokens(total_hist_text)
-            else:
-                # Stable: 使用 suffix token 计数
                 plan.history_tokens = self._estimate_tokens(plan.history_suffix)
+                plan.recall_strategy = "flat_history_fallback"
         
         # ============ Step 3: Alpha 计算 (分层) ============
         plan.alpha_profile = self._compute_alpha_profile(
@@ -343,18 +329,14 @@ class InjectionPlanner:
             )
         
         # ============ Step 5: 构造最终输入 ============
-        if use_recall_v4 and plan.assembled_suffix:
+        if plan.assembled_suffix:
             # Recall v4: 已在 _build_recall_v4_plan 中组装好的后缀
             plan.final_input = plan.assembled_suffix
-        elif strategy == "full_attention":
-            # Full Attention: 仅查询 (全局指示由 executor 添加)
-            plan.final_input = query
+        elif plan.history_suffix:
+            # Fallback: 历史后缀 + 查询
+            plan.final_input = plan.history_suffix + "\n\n" + query
         else:
-            # Stable: 历史后缀 + 查询
-            if plan.history_suffix:
-                plan.final_input = plan.history_suffix + "\n\n" + query
-            else:
-                plan.final_input = query
+            plan.final_input = query
         
         plan.query_tokens = self._estimate_tokens(query)
         plan.total_tokens = plan.query_tokens + plan.history_tokens
@@ -509,36 +491,28 @@ class InjectionPlanner:
         """
         计算分层 Alpha
         
-        规则:
+        规则 (v3.2):
         - force_alpha 覆盖所有 (实验用)
-        - Stable: preference 从配置读取, history 固定为 1.0 (suffix)
-        - Full Attention: preference/history 从 full_attention 配置读取
+        - recall_v4: preference 从配置读取, history 固定为 1.0 (后缀组装)
         - 无偏好时 preference_alpha = 0.0
         """
         if force_alpha is not None:
             return AlphaProfile(
                 preference_alpha=force_alpha,
-                history_alpha=1.0 if strategy == "stable" else force_alpha,
+                history_alpha=1.0,
             )
         
-        # 默认值
+        # 默认值: recall_v4 使用 suffix 组装, history_alpha 固定为 1.0
         pref_alpha = 0.4
-        hist_alpha = 1.0 if strategy == "stable" else 0.3
+        hist_alpha = 1.0
         
-        # 从配置读取
+        # 从配置读取偏好 alpha
         if self.config and hasattr(self.config, 'dki'):
             dki_cfg = self.config.dki
-            
-            if strategy == "full_attention":
-                if hasattr(dki_cfg, 'full_attention'):
-                    fa_cfg = dki_cfg.full_attention
-                    if hasattr(fa_cfg, 'preference_alpha'):
-                        pref_alpha = fa_cfg.preference_alpha
-                    if hasattr(fa_cfg, 'history_alpha'):
-                        hist_alpha = fa_cfg.history_alpha
-            else:
-                if hasattr(dki_cfg, 'hybrid_injection'):
-                    pref_alpha = dki_cfg.hybrid_injection.preference.alpha
+            if hasattr(dki_cfg, 'hybrid_injection'):
+                hi_cfg = dki_cfg.hybrid_injection
+                if hasattr(hi_cfg, 'preference') and hasattr(hi_cfg.preference, 'alpha'):
+                    pref_alpha = hi_cfg.preference.alpha
         
         # 没有偏好时，alpha = 0
         if not preferences:
@@ -566,10 +540,13 @@ class InjectionPlanner:
     
     @injection_strategy.setter
     def injection_strategy(self, value: str):
-        if value in ("stable", "full_attention", "recall_v4"):
+        if value == "recall_v4":
             self._injection_strategy = value
         else:
-            logger.warning(f"Invalid strategy: {value}")
+            logger.warning(
+                f"Invalid strategy: {value}. "
+                f"v3.2 only supports 'recall_v4'. Ignoring."
+            )
     
     # ================================================================
     # NLP 组件配置更新 (运行时)

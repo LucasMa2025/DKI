@@ -13,8 +13,13 @@ Key Features:
 - Graceful degradation when Redis unavailable
 - Configurable via YAML
 
+安全特性 (v3.1):
+- 缓存键包含用户身份校验 (user_id 前缀)
+- Redis 键使用用户命名空间隔离
+- 所有操作记录审计日志
+
 Author: AGI Demo Project
-Version: 2.0.0
+Version: 3.1.0
 """
 
 import asyncio
@@ -306,8 +311,10 @@ class PreferenceCacheManager:
         """
         Get preference K/V cache, checking tiers in order.
         
+        安全 (v3.1): user_id 必须非空，用于缓存键隔离
+        
         Args:
-            user_id: User identifier
+            user_id: User identifier (must be non-empty, validated by caller)
             preference_text: Preference text to compute K/V for
             model: Model adapter for K/V computation
             force_recompute: Skip cache and recompute
@@ -318,6 +325,19 @@ class PreferenceCacheManager:
         start_time = time.time()
         self._stats["total_requests"] += 1
         
+        # 用户身份验证 (v3.1)
+        if not user_id or not user_id.strip():
+            logger.warning("Empty user_id in get_preference_kv, computing without cache")
+            kv_entries = await self._compute_kv(preference_text, model)
+            return kv_entries, CacheTierInfo(
+                tier=CacheTier.L3_COMPUTE,
+                latency_ms=(time.time() - start_time) * 1000,
+                hit=False,
+                user_id="<anonymous>",
+                preference_hash="",
+            )
+        
+        user_id = user_id.strip()
         preference_hash = self._compute_preference_hash(preference_text)
         cache_key = self._make_cache_key(user_id, preference_hash)
         
@@ -482,16 +502,23 @@ class PreferenceCacheManager:
         
         Call this when user preferences are updated.
         
+        安全 (v3.1): user_id 必须非空
+        
         Args:
-            user_id: User identifier
+            user_id: User identifier (must be non-empty)
             
         Returns:
             Number of entries invalidated
         """
+        if not user_id or not user_id.strip():
+            logger.warning("Empty user_id in invalidate, skipping")
+            return 0
+        
+        user_id = user_id.strip()
         self._stats["invalidations"] += 1
         count = 0
         
-        # L1: Clear from memory
+        # L1: Clear from memory (仅匹配该用户的前缀)
         prefix = f"{user_id}:"
         l1_count = await self._l1_cache.delete_prefix(prefix)
         count += l1_count

@@ -31,7 +31,7 @@ from dki.experiment.runner import ExperimentRunner, ExperimentConfig
 from dki.experiment.data_generator import ExperimentDataGenerator
 from dki.config.config_loader import ConfigLoader
 from dki.api.routes import create_api_router
-from dki.api.auth_routes import create_auth_router
+from dki.api.auth_routes import create_auth_router, _tokens_db
 from dki.api.session_routes import create_session_router
 from dki.api.preference_routes import create_preference_router
 from dki.api.stats_routes import create_stats_router
@@ -58,6 +58,9 @@ class ChatRequest(BaseModel):
     force_alpha: Optional[float] = None
     max_new_tokens: int = 256
     temperature: float = 0.7
+    # 用户隔离: 通过 token 或 user_id 标识用户
+    token: Optional[str] = None     # Bearer token (优先, 从 auth 系统获取 user_id)
+    user_id: Optional[str] = None   # 显式 user_id (token 不存在时使用)
 
 
 class ChatResponse(BaseModel):
@@ -274,13 +277,41 @@ def create_app() -> FastAPI:
     # Note: /api/health and /api/stats are already defined in stats_routes.py
     # Do not duplicate them here
     
+    def _resolve_user_id(request: ChatRequest) -> str:
+        """
+        从请求中解析 user_id (用户隔离)
+        
+        优先级:
+        1. request.token → 查 _tokens_db 获取 user_id
+        2. request.user_id → 直接使用
+        3. 降级为 "demo_user"
+        """
+        # 1. 从 token 解析
+        if request.token:
+            uid = _tokens_db.get(request.token)
+            if uid:
+                return uid
+            logger.warning(f"Invalid token in chat request, falling back")
+        
+        # 2. 显式 user_id
+        if request.user_id and request.user_id.strip():
+            return request.user_id.strip()
+        
+        # 3. 降级
+        return "demo_user"
+    
     @app.post("/api/chat", response_model=ChatResponse)
     async def chat(request: ChatRequest):
         """
         Chat endpoint supporting DKI, RAG, and baseline modes.
         Also records visualization and statistics data.
+        
+        用户隔离 (v3.1):
+        - 通过 request.token 或 request.user_id 标识用户
+        - DKI/RAG 系统使用解析后的 user_id 进行隔离缓存和推理
         """
         session_id = request.session_id or f"session_{uuid.uuid4().hex[:8]}"
+        resolved_user_id = _resolve_user_id(request)
         
         try:
             if request.mode == "dki":
@@ -288,7 +319,7 @@ def create_app() -> FastAPI:
                 response = dki.chat(
                     query=request.query,
                     session_id=session_id,
-                    user_id="demo_user",  # Demo 使用默认用户
+                    user_id=resolved_user_id,
                     force_alpha=request.force_alpha,
                     max_new_tokens=request.max_new_tokens,
                     temperature=request.temperature,
@@ -306,7 +337,7 @@ def create_app() -> FastAPI:
                         "timestamp": datetime.utcnow().isoformat(),
                         "mode": "dki",
                         "query": request.query,
-                        "user_id": "demo_user",
+                        "user_id": resolved_user_id,
                         "session_id": session_id,
                         "injection_enabled": response.gating_decision.should_inject if response.gating_decision else False,
                         "alpha": response.gating_decision.alpha if response.gating_decision else 0.0,
@@ -357,7 +388,7 @@ def create_app() -> FastAPI:
                 response = rag.chat(
                     query=request.query,
                     session_id=session_id,
-                    user_id="demo_user",
+                    user_id=resolved_user_id,
                     max_new_tokens=request.max_new_tokens,
                     temperature=request.temperature,
                 )
@@ -373,7 +404,7 @@ def create_app() -> FastAPI:
                         "timestamp": datetime.utcnow().isoformat(),
                         "mode": "rag",
                         "query": request.query,
-                        "user_id": "demo_user",
+                        "user_id": resolved_user_id,
                         "session_id": session_id,
                         "injection_enabled": False,
                         "alpha": 0.0,
@@ -1129,6 +1160,9 @@ def get_index_html() -> str:
         let useForceAlpha = false;
         let forceAlphaValue = 0.5;
         let stats = { latencies: [], memoriesUsed: 0, cacheHits: 0, totalQueries: 0, alphas: [] };
+        // 用户隔离: 从 localStorage 读取登录 token (由 auth 系统写入)
+        let authToken = localStorage.getItem('dki_token') || null;
+        let currentUserId = localStorage.getItem('dki_user_id') || 'demo_user';
         
         document.getElementById('sessionId').textContent = sessionId;
         
@@ -1204,7 +1238,9 @@ def get_index_html() -> str:
                     session_id: sessionId,
                     mode: currentMode,
                     max_new_tokens: 256,
-                    temperature: 0.7
+                    temperature: 0.7,
+                    token: authToken,
+                    user_id: currentUserId
                 };
                 
                 // Add force alpha for DKI mode if checkbox would be checked

@@ -1,6 +1,12 @@
 """
 Experiment Runner for DKI System
 Runs comparison experiments between RAG and DKI
+
+用户隔离适配 (v3.1):
+- 实验系统作为内部工具，不需要 token 验证
+- 但使用 UserIsolationContext 确保缓存操作与生产代码路径一致
+- 通过 setup_experiment_users() 创建的用户都在数据库中注册
+- 缓存清除通过公开 API 而非直接操作内部状态
 """
 
 import json
@@ -21,6 +27,13 @@ from dki.database.repository import (
     ExperimentRepository, DemoUserRepository, UserPreferenceRepository, SessionRepository
 )
 from dki.config.config_loader import ConfigLoader
+
+# 用户隔离上下文 (可选导入, 用于实验缓存操作)
+try:
+    from dki.cache.user_isolation import UserIsolationContext, CacheKeySigner
+    USER_ISOLATION_AVAILABLE = True
+except ImportError:
+    USER_ISOLATION_AVAILABLE = False
 
 
 @dataclass
@@ -215,6 +228,14 @@ class ExperimentRunner:
         self.db_manager = DatabaseManager(
             db_path=self.config.database.path,
         )
+        
+        # 用户隔离: 实验系统使用 CacheKeySigner 以确保与生产缓存路径一致
+        self._cache_key_signer: Optional[Any] = None
+        if USER_ISOLATION_AVAILABLE:
+            import os
+            hmac_secret = os.environ.get("DKI_HMAC_SECRET", "")
+            self._cache_key_signer = CacheKeySigner(secret=hmac_secret)
+            logger.debug("ExperimentRunner: user isolation context available")
     
     def _ensure_systems(self):
         """Ensure DKI and RAG systems are initialized."""
@@ -222,6 +243,18 @@ class ExperimentRunner:
             self.dki_system = DKISystem()
         if self.rag_system is None:
             self.rag_system = RAGSystem()
+    
+    def _get_first_experiment_user_id(self) -> str:
+        """
+        获取第一个实验用户 ID (v3.1)。
+        
+        用于替代硬编码的 "experiment_user" 默认值，
+        确保使用数据库中实际存在的用户 ID。
+        """
+        if hasattr(self, '_experiment_user_map') and self._experiment_user_map:
+            first_username = list(self._experiment_user_map.keys())[0]
+            return self._experiment_user_map[first_username]
+        return "experiment_user"
     
     # ========================================================================
     # Experiment User & Preference Management
@@ -407,7 +440,7 @@ class ExperimentRunner:
         简单策略: 计算每个实验用户偏好与 personas 的关键词重叠度。
         """
         if not hasattr(self, '_experiment_user_map') or not self._experiment_user_map:
-            return "experiment_user"
+            return self._get_first_experiment_user_id()
         
         # 获取默认用户配置用于匹配
         default_users = self._get_default_experiment_users()
@@ -470,9 +503,9 @@ class ExperimentRunner:
                         priority=10 - idx,  # 越靠前优先级越高
                     )
                 
-                # 清除 DKI 系统的内存缓存，强制下次从数据库重新加载
-                if self.dki_system and hasattr(self.dki_system, '_user_preferences'):
-                    self.dki_system._user_preferences.pop(user_id, None)
+                # 清除 DKI 系统的内存缓存，强制下次从数据库重新加载 (v3.1: 使用公开 API)
+                if self.dki_system:
+                    self.dki_system.clear_preference_cache(user_id)
                     
         except Exception as e:
             logger.warning(f"Failed to write session preferences for {user_id}: {e}")
@@ -668,9 +701,10 @@ class ExperimentRunner:
         session_id: str,
         item: Dict[str, Any],
         config: ExperimentConfig,
-        user_id: str = "experiment_user",
+        user_id: Optional[str] = None,
     ) -> ExperimentResult:
         """Run a single query and capture injection info."""
+        user_id = user_id or self._get_first_experiment_user_id()
         try:
             if mode == 'dki':
                 response = self.dki_system.chat(
@@ -928,10 +962,7 @@ class ExperimentRunner:
         }
         
         # 使用第一个实验用户 (alpha 实验关注注入强度，用户一致即可)
-        user_id = "experiment_user"
-        if hasattr(self, '_experiment_user_map') and self._experiment_user_map:
-            first_username = list(self._experiment_user_map.keys())[0]
-            user_id = self._experiment_user_map[first_username]
+        user_id = self._get_first_experiment_user_id()
         
         # 每个 alpha 值使用独立 session，避免历史累积
         base_ts = int(time.time())
@@ -1002,11 +1033,8 @@ class ExperimentRunner:
         
         session_id = f"latency_exp_{int(time.time())}"
         
-        # 获取实验用户 ID
-        user_id = "experiment_user"
-        if hasattr(self, '_experiment_user_map') and self._experiment_user_map:
-            first_username = list(self._experiment_user_map.keys())[0]
-            user_id = self._experiment_user_map[first_username]
+        # 获取实验用户 ID (v3.1: 使用数据库中实际存在的用户)
+        user_id = self._get_first_experiment_user_id()
         
         # Add some memories
         memories = [
@@ -1272,11 +1300,8 @@ class ExperimentRunner:
         
         results = {mode: {'samples': [], 'latencies': []} for mode in ablation_configs}
         
-        # 获取实验用户 ID
-        user_id = "experiment_user"
-        if hasattr(self, '_experiment_user_map') and self._experiment_user_map:
-            first_username = list(self._experiment_user_map.keys())[0]
-            user_id = self._experiment_user_map[first_username]
+        # 获取实验用户 ID (v3.1: 使用数据库中实际存在的用户)
+        user_id = self._get_first_experiment_user_id()
         
         for ablation_mode, config in ablation_configs.items():
             logger.info(f"Running ablation: {ablation_mode}")

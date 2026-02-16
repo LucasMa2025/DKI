@@ -68,11 +68,6 @@ from dki.cache import (
     REDIS_AVAILABLE,
 )
 from dki.api.visualization_routes import record_visualization
-from dki.core.injection import (
-    FullAttentionInjector,
-    FullAttentionConfig,
-    InjectionResult as FullAttentionResult,
-)
 
 # 新架构组件
 from dki.core.plugin.injection_plan import (
@@ -93,8 +88,8 @@ class InjectionMetadata:
     injection_enabled: bool = False
     alpha: float = 0.0
     
-    # 注入策略 (stable | full_attention)
-    injection_strategy: str = "stable"
+    # 注入策略 (recall_v4)
+    injection_strategy: str = "recall_v4"
     
     # Token 统计
     preference_tokens: int = 0
@@ -129,10 +124,6 @@ class InjectionMetadata:
     reference_type: Optional[str] = None
     reference_scope: Optional[str] = None
     
-    # Full Attention 策略特有信息
-    full_attention_fallback: bool = False
-    history_kv_tokens: int = 0
-    
     # Alpha Profile (v3.0)
     alpha_profile: Optional[Dict[str, Any]] = None
     
@@ -154,7 +145,6 @@ class InjectionMetadata:
             "tokens": {
                 "preference": self.preference_tokens,
                 "history": self.history_tokens,
-                "history_kv": self.history_kv_tokens,
                 "query": self.query_tokens,
                 "total": self.total_tokens,
             },
@@ -182,9 +172,6 @@ class InjectionMetadata:
                 "resolved": self.reference_resolved,
                 "type": self.reference_type,
                 "scope": self.reference_scope,
-            },
-            "full_attention": {
-                "fallback_triggered": self.full_attention_fallback,
             },
             "safety_violations": self.safety_violations or [],
         }
@@ -300,31 +287,18 @@ class DKIPlugin:
         self._mis: Optional[MemoryInfluenceScaling] = None
         self._gating: Optional[DualFactorGating] = None
         
-        # ============ 注入策略选择 ============
-        injection_strategy = self._get_injection_strategy(config)
-        
         # ============ Planner (纯决策) ============
         self._planner = InjectionPlanner(
             config=self.config,
             language=language,
-            injection_strategy=injection_strategy,
+            injection_strategy="recall_v4",
             memory_trigger_config=memory_trigger_config,
             reference_resolver_config=reference_resolver_config,
         )
         
-        # ============ Full Attention 注入器 ============
-        fa_injector = None
-        if injection_strategy == "full_attention":
-            fa_config = self._get_full_attention_config(config)
-            fa_injector = FullAttentionInjector(
-                config=fa_config,
-                language=language,
-            )
-        
         # ============ Executor (纯执行) ============
         self._executor = InjectionExecutor(
             model_adapter=model_adapter,
-            full_attention_injector=fa_injector,
         )
         
         # ============ 偏好 K/V 缓存 (支持 Redis 分布式) ============
@@ -357,7 +331,7 @@ class DKIPlugin:
         
         logger.info(
             f"DKI Plugin initialized "
-            f"(strategy={injection_strategy}, language={language}, "
+            f"(strategy=recall_v4, language={language}, "
             f"cache={cache_status}, architecture=planner+executor)"
         )
     
@@ -395,27 +369,6 @@ class DKIPlugin:
     # ================================================================
     # 工厂方法
     # ================================================================
-    
-    def _get_injection_strategy(self, config: Any) -> str:
-        """获取注入策略"""
-        if config and hasattr(config, 'dki'):
-            return getattr(config.dki, 'injection_strategy', 'stable')
-        if config and isinstance(config, dict):
-            return config.get('dki', {}).get('injection_strategy', 'stable')
-        return 'stable'
-    
-    def _get_full_attention_config(self, config: Any) -> FullAttentionConfig:
-        """获取 Full Attention 配置"""
-        fa_dict = {}
-        
-        if config and hasattr(config, 'dki') and hasattr(config.dki, 'full_attention'):
-            fa_dict = config.dki.full_attention
-        elif config and isinstance(config, dict):
-            fa_dict = config.get('dki', {}).get('full_attention', {})
-        
-        if fa_dict:
-            return FullAttentionConfig.from_dict(fa_dict)
-        return FullAttentionConfig()
     
     @classmethod
     async def from_config(
@@ -669,10 +622,6 @@ class DKIPlugin:
             metadata.inference_latency_ms = result.inference_latency_ms
             metadata.preference_cache_hit = result.preference_cache_hit
             metadata.preference_cache_tier = result.preference_cache_tier
-            metadata.full_attention_fallback = result.full_attention_fallback
-            metadata.history_kv_tokens = (
-                result.full_attention_history_tokens
-            )
             
             total_execution_ms = (time.time() - injection_start) * 1000
             metadata.injection_latency_ms = (
@@ -922,80 +871,10 @@ class DKIPlugin:
         configs = {
             "memory_trigger": planner_stats.get("memory_trigger", {}),
             "reference_resolver": planner_stats.get("reference_resolver", {}),
-            "injection_strategy": planner_stats.get("strategy", "stable"),
+            "injection_strategy": planner_stats.get("strategy", "recall_v4"),
         }
         
-        fa_injector = self._executor.full_attention_injector
-        if fa_injector:
-            configs["full_attention"] = fa_injector.get_stats()
-        
         return configs
-    
-    def switch_injection_strategy(self, strategy: str) -> bool:
-        """
-        运行时切换注入策略
-        
-        Args:
-            strategy: "stable" | "full_attention"
-            
-        Returns:
-            是否切换成功
-        """
-        if strategy not in ("stable", "full_attention"):
-            logger.error(f"Invalid injection strategy: {strategy}")
-            return False
-        
-        old_strategy = self._planner.injection_strategy
-        self._planner.injection_strategy = strategy
-        
-        # 如果切换到 full_attention 但注入器未初始化，则初始化
-        if strategy == "full_attention" and not self._executor.full_attention_injector:
-            fa_config = self._get_full_attention_config(self.config)
-            fa_injector = FullAttentionInjector(
-                config=fa_config,
-                language=self.language,
-            )
-            self._executor.set_full_attention_injector(fa_injector)
-        
-        logger.info(
-            f"Injection strategy switched: {old_strategy} -> {strategy}"
-        )
-        return True
-    
-    def get_full_attention_stats(self) -> Optional[Dict[str, Any]]:
-        """获取 Full Attention 注入器统计"""
-        fa_injector = self._executor.full_attention_injector
-        if fa_injector:
-            return fa_injector.get_stats()
-        return None
-    
-    def get_full_attention_logs(self, limit: int = 50) -> List[Dict[str, Any]]:
-        """获取 Full Attention attention pattern 日志"""
-        fa_injector = self._executor.full_attention_injector
-        if fa_injector:
-            return fa_injector.get_attention_logs(limit)
-        return []
-    
-    def update_full_attention_config(
-        self,
-        position_mode: Optional[str] = None,
-        preference_alpha: Optional[float] = None,
-        history_alpha: Optional[float] = None,
-        history_position_start: Optional[int] = None,
-        max_total_kv_tokens: Optional[int] = None,
-    ):
-        """运行时更新 Full Attention 配置"""
-        fa_injector = self._executor.full_attention_injector
-        if fa_injector:
-            fa_injector.update_config(
-                position_mode=position_mode,
-                preference_alpha=preference_alpha,
-                history_alpha=history_alpha,
-                history_position_start=history_position_start,
-                max_total_kv_tokens=max_total_kv_tokens,
-            )
-        else:
-            logger.warning("Full attention injector not initialized")
     
     # ================================================================
     # 生命周期

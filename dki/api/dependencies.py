@@ -2,8 +2,10 @@
 API Dependencies
 FastAPI dependency injection for DKI API
 
+安全 (v3.1): 增加用户隔离组件的依赖注入
+
 Author: AGI Demo Project
-Version: 1.0.0
+Version: 3.1.0
 """
 
 from typing import Any, Optional
@@ -15,6 +17,7 @@ _dki_system: Optional[Any] = None
 _user_adapter: Optional[Any] = None
 _preference_cache: Optional[Any] = None
 _non_vectorized_handler: Optional[Any] = None
+_isolated_preference_cache: Optional[Any] = None
 _startup_time: float = 0
 
 
@@ -23,22 +26,30 @@ def init_dependencies(
     user_adapter: Any = None,
     preference_cache: Any = None,
     non_vectorized_handler: Any = None,
+    isolated_preference_cache: Any = None,
 ) -> None:
     """
     Initialize global dependencies.
     
     Called during application startup.
+    
+    安全 (v3.1): 支持 IsolatedPreferenceCacheManager 注入
     """
     import time
-    global _dki_system, _user_adapter, _preference_cache, _non_vectorized_handler, _startup_time
+    global _dki_system, _user_adapter, _preference_cache, _non_vectorized_handler
+    global _isolated_preference_cache, _startup_time
     
     _dki_system = dki_system
     _user_adapter = user_adapter
     _preference_cache = preference_cache
     _non_vectorized_handler = non_vectorized_handler
+    _isolated_preference_cache = isolated_preference_cache
     _startup_time = time.time()
     
-    logger.info("API dependencies initialized")
+    logger.info(
+        f"API dependencies initialized "
+        f"(isolated_cache={'yes' if isolated_preference_cache else 'no'})"
+    )
 
 
 def get_dki_system():
@@ -89,6 +100,26 @@ def get_preference_cache():
     return _preference_cache
 
 
+def get_isolated_preference_cache():
+    """
+    Get isolated preference cache manager instance.
+    
+    FastAPI dependency for user-isolated preference caching (v3.1).
+    Returns IsolatedPreferenceCacheManager if available, otherwise None.
+    """
+    global _isolated_preference_cache
+    if _isolated_preference_cache is None:
+        try:
+            from dki.cache.user_isolation import IsolatedPreferenceCacheManager
+            _isolated_preference_cache = IsolatedPreferenceCacheManager()
+            logger.info("IsolatedPreferenceCacheManager initialized")
+        except ImportError:
+            logger.warning("IsolatedPreferenceCacheManager not available")
+            return None
+    
+    return _isolated_preference_cache
+
+
 def get_non_vectorized_handler():
     """
     Get non-vectorized data handler instance.
@@ -119,6 +150,7 @@ async def cleanup_dependencies() -> None:
     Called during application shutdown.
     """
     global _dki_system, _user_adapter, _preference_cache, _non_vectorized_handler
+    global _isolated_preference_cache
     
     # Disconnect user adapter
     if _user_adapter is not None:
@@ -134,6 +166,16 @@ async def cleanup_dependencies() -> None:
         except Exception as e:
             logger.error(f"Error clearing preference cache: {e}")
     
+    # Clear isolated preference cache (v3.1)
+    if _isolated_preference_cache is not None:
+        try:
+            from dki.cache.user_isolation import UserScopedCacheStore
+            l1_store = getattr(_isolated_preference_cache, '_l1_store', None)
+            if l1_store and isinstance(l1_store, UserScopedCacheStore):
+                await l1_store.clear_all()
+        except Exception as e:
+            logger.error(f"Error clearing isolated preference cache: {e}")
+    
     # Clear non-vectorized handler cache
     if _non_vectorized_handler is not None:
         try:
@@ -145,5 +187,6 @@ async def cleanup_dependencies() -> None:
     _user_adapter = None
     _preference_cache = None
     _non_vectorized_handler = None
+    _isolated_preference_cache = None
     
     logger.info("API dependencies cleaned up")

@@ -10,12 +10,17 @@ from dki.database.models import (
     ExperimentResult,
     AuditLog,
     ModelRegistry,
+    DemoUser,
+    UserPreference,
 )
 from dki.database.repository import (
     SessionRepository,
     MemoryRepository,
     ConversationRepository,
     ExperimentRepository,
+    AuditLogRepository,
+    DemoUserRepository,
+    UserPreferenceRepository,
 )
 from dki.database.connection import DatabaseManager
 
@@ -29,9 +34,14 @@ __all__ = [
     "ExperimentResult",
     "AuditLog",
     "ModelRegistry",
+    "DemoUser",
+    "UserPreference",
     "SessionRepository",
     "MemoryRepository",
     "ConversationRepository",
     "ExperimentRepository",
+    "AuditLogRepository",
+    "DemoUserRepository",
+    "UserPreferenceRepository",
     "DatabaseManager",
 ]
