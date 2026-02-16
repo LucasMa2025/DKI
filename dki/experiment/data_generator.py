@@ -39,7 +39,41 @@ class ExperimentDataGenerator:
         - Persona memories (user preferences, traits)
         - Multi-turn dialogue
         - Expected memory usage
+        - experiment_user: 对应的实验用户名 (用于偏好注入)
         """
+        # 按实验用户分组的 personas
+        user_persona_groups = {
+            "exp_user_vegetarian": [
+                "I prefer vegetarian food and am allergic to seafood.",
+                "I live in Beijing with my family.",
+                "I prefer coffee over tea.",
+                "I usually wake up early around 6 AM.",
+                "I practice yoga every morning.",
+            ],
+            "exp_user_outdoor": [
+                "I love hiking and outdoor activities.",
+                "I enjoy photography as a hobby.",
+                "I have a golden retriever named Max.",
+                "I'm planning a trip to Japan next year.",
+                "I live in Beijing with my family.",
+            ],
+            "exp_user_tech": [
+                "I work as a software engineer at a tech company.",
+                "I'm interested in artificial intelligence.",
+                "I enjoy reading science fiction novels.",
+                "I prefer coffee over tea.",
+                "I usually wake up early around 6 AM.",
+            ],
+            "exp_user_music": [
+                "I'm a fan of classical music.",
+                "I'm learning to play the guitar.",
+                "I collect vintage watches.",
+                "I enjoy photography as a hobby.",
+                "I live in Beijing with my family.",
+            ],
+        }
+        
+        # 所有 personas (保持向后兼容)
         personas = [
             "I love hiking and outdoor activities.",
             "I work as a software engineer at a tech company.",
@@ -72,12 +106,23 @@ class ExperimentDataGenerator:
         ]
         
         data = []
+        user_names = list(user_persona_groups.keys())
         
         for session_idx in range(n_sessions):
             session_id = f"persona_session_{session_idx:04d}"
             
-            # Select random personas for this session
-            session_personas = random.sample(personas, min(n_personas_per_session, len(personas)))
+            # 轮流分配实验用户，确保每个用户有足够的样本
+            assigned_user = user_names[session_idx % len(user_names)]
+            
+            # 从该用户的 persona 组中选择 (优先)，不足时从全局补充
+            user_personas = user_persona_groups[assigned_user]
+            if len(user_personas) >= n_personas_per_session:
+                session_personas = random.sample(user_personas, n_personas_per_session)
+            else:
+                session_personas = list(user_personas)
+                remaining = n_personas_per_session - len(session_personas)
+                extra = [p for p in personas if p not in session_personas]
+                session_personas.extend(random.sample(extra, min(remaining, len(extra))))
             
             # Generate turns
             turns = []
@@ -99,10 +144,12 @@ class ExperimentDataGenerator:
             
             data.append({
                 'session_id': session_id,
+                'experiment_user': assigned_user,  # 对应的实验用户名
                 'personas': session_personas,
                 'turns': turns,
                 'metadata': {
                     'dataset': 'persona_chat',
+                    'experiment_user': assigned_user,
                     'generated_at': datetime.now().isoformat(),
                 },
             })
@@ -360,7 +407,40 @@ class ExperimentDataGenerator:
         - 用户偏好记忆 (中文)
         - 多轮对话
         - 期望用到的记忆
+        - experiment_user: 对应的实验用户名
         """
+        # 按实验用户分组的中文 personas
+        cn_user_persona_groups = {
+            "exp_user_vegetarian": [
+                "我是素食主义者，对海鲜过敏。",
+                "我住在北京，和家人住在一起。",
+                "我喜欢喝咖啡，不太喝茶。",
+                "我通常早上六点起床。",
+                "我每天早上练瑜伽。",
+            ],
+            "exp_user_outdoor": [
+                "我喜欢徒步和户外运动。",
+                "我喜欢摄影，经常拍风景照。",
+                "我养了一只金毛犬，叫小白。",
+                "我计划明年去日本旅行。",
+                "我住在北京，和家人住在一起。",
+            ],
+            "exp_user_tech": [
+                "我是一名软件工程师，在科技公司工作。",
+                "我对人工智能很感兴趣。",
+                "我喜欢阅读科幻小说。",
+                "我喜欢喝咖啡，不太喝茶。",
+                "我通常早上六点起床。",
+            ],
+            "exp_user_music": [
+                "我是古典音乐的爱好者。",
+                "我正在学弹吉他。",
+                "我喜欢收藏古董手表。",
+                "我喜欢摄影，经常拍风景照。",
+                "我住在北京，和家人住在一起。",
+            ],
+        }
+        
         personas = [
             "我喜欢徒步和户外运动。",
             "我是一名软件工程师，在科技公司工作。",
@@ -393,10 +473,23 @@ class ExperimentDataGenerator:
         ]
         
         data = []
+        cn_user_names = list(cn_user_persona_groups.keys())
         
         for session_idx in range(n_sessions):
             session_id = f"cn_persona_session_{session_idx:04d}"
-            session_personas = random.sample(personas, min(n_personas_per_session, len(personas)))
+            
+            # 轮流分配实验用户
+            assigned_user = cn_user_names[session_idx % len(cn_user_names)]
+            
+            # 从该用户的 persona 组中选择
+            user_personas = cn_user_persona_groups[assigned_user]
+            if len(user_personas) >= n_personas_per_session:
+                session_personas = random.sample(user_personas, n_personas_per_session)
+            else:
+                session_personas = list(user_personas)
+                remaining = n_personas_per_session - len(session_personas)
+                extra = [p for p in personas if p not in session_personas]
+                session_personas.extend(random.sample(extra, min(remaining, len(extra))))
             
             turns = []
             used_queries = random.sample(queries, min(n_turns_per_session, len(queries)))
@@ -416,11 +509,13 @@ class ExperimentDataGenerator:
             
             data.append({
                 'session_id': session_id,
+                'experiment_user': assigned_user,
                 'personas': session_personas,
                 'turns': turns,
                 'metadata': {
                     'dataset': 'cn_persona_chat',
                     'language': 'zh',
+                    'experiment_user': assigned_user,
                     'generated_at': datetime.now().isoformat(),
                 },
             })

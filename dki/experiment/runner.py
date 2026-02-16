@@ -17,7 +17,9 @@ from dki.core.dki_system import DKISystem, DKIResponse
 from dki.core.rag_system import RAGSystem, RAGResponse
 from dki.experiment.metrics import MetricsCalculator
 from dki.database.connection import DatabaseManager
-from dki.database.repository import ExperimentRepository
+from dki.database.repository import (
+    ExperimentRepository, DemoUserRepository, UserPreferenceRepository, SessionRepository
+)
 from dki.config.config_loader import ConfigLoader
 
 
@@ -221,10 +223,266 @@ class ExperimentRunner:
         if self.rag_system is None:
             self.rag_system = RAGSystem()
     
+    # ========================================================================
+    # Experiment User & Preference Management
+    # ========================================================================
+    
+    def setup_experiment_users(
+        self,
+        users: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, str]:
+        """
+        为实验创建用户并写入偏好到数据库。
+        
+        这是保证偏好注入可靠性的关键步骤:
+        - DKISystem.chat() 会通过 _load_user_preferences_from_db(user_id) 加载偏好
+        - 偏好必须存在于 user_preferences 表中才能被加载
+        - 之前实验只通过 add_memory 写入 memories 表，偏好表为空
+        
+        Args:
+            users: 用户列表，每个用户包含:
+                - username: 用户名
+                - display_name: 显示名称 (可选)
+                - preferences: 偏好列表，每项包含:
+                    - text: 偏好文本
+                    - type: 偏好类型 (general/style/domain 等)
+                    - priority: 优先级 (0-10)
+                    - category: 分类 (可选)
+                
+        Returns:
+            Dict[username, user_id] 映射
+        
+        Example:
+            users = [
+                {
+                    "username": "exp_vegetarian",
+                    "display_name": "素食实验用户",
+                    "preferences": [
+                        {"text": "我是素食主义者，不吃肉类", "type": "general", "priority": 9},
+                        {"text": "我对海鲜过敏", "type": "general", "priority": 10},
+                    ]
+                },
+            ]
+            user_map = runner.setup_experiment_users(users)
+        """
+        if users is None:
+            users = self._get_default_experiment_users()
+        
+        user_map = {}  # username -> user_id
+        
+        with self.db_manager.session_scope() as db:
+            user_repo = DemoUserRepository(db)
+            pref_repo = UserPreferenceRepository(db)
+            
+            for user_data in users:
+                username = user_data["username"]
+                display_name = user_data.get("display_name", username)
+                
+                # 创建或获取用户
+                user, created = user_repo.get_or_create(
+                    username=username,
+                    display_name=display_name,
+                )
+                user_id = user.id
+                user_map[username] = user_id
+                
+                if created:
+                    logger.info(f"Created experiment user: {username} (id={user_id})")
+                else:
+                    logger.info(f"Found existing experiment user: {username} (id={user_id})")
+                
+                # 写入偏好 (先清除旧的实验偏好，再写入新的)
+                preferences = user_data.get("preferences", [])
+                if preferences:
+                    # 软删除该用户的旧偏好
+                    existing_prefs = pref_repo.get_by_user(user_id)
+                    for old_pref in existing_prefs:
+                        pref_repo.delete(old_pref.id)
+                    
+                    # 写入新偏好
+                    for pref_data in preferences:
+                        pref_repo.create(
+                            user_id=user_id,
+                            preference_text=pref_data["text"],
+                            preference_type=pref_data.get("type", "general"),
+                            priority=pref_data.get("priority", 5),
+                            category=pref_data.get("category"),
+                        )
+                    
+                    logger.info(
+                        f"  Written {len(preferences)} preferences for {username}"
+                    )
+        
+        self._experiment_user_map = user_map
+        logger.info(f"Experiment users setup complete: {len(user_map)} users")
+        return user_map
+    
+    def _get_default_experiment_users(self) -> List[Dict[str, Any]]:
+        """
+        获取默认实验用户配置。
+        
+        从 config.yaml 的 experiment.users 节读取，
+        如果没有配置则使用内置默认值。
+        """
+        # 尝试从配置文件读取
+        exp_config = getattr(self.config, 'experiment', None)
+        if exp_config and hasattr(exp_config, 'users'):
+            config_users = exp_config.users
+            if config_users:
+                return config_users
+        
+        # 内置默认实验用户
+        return [
+            {
+                "username": "exp_user_vegetarian",
+                "display_name": "素食实验用户",
+                "preferences": [
+                    {"text": "我是素食主义者，不吃任何肉类和海鲜", "type": "general", "priority": 10},
+                    {"text": "我对海鲜过敏，请不要推荐任何海鲜相关的食物", "type": "general", "priority": 10},
+                    {"text": "我住在北京海淀区", "type": "general", "priority": 7},
+                ],
+            },
+            {
+                "username": "exp_user_outdoor",
+                "display_name": "户外运动实验用户",
+                "preferences": [
+                    {"text": "我喜欢户外运动，特别是徒步和骑行", "type": "general", "priority": 9},
+                    {"text": "我住在上海浦东", "type": "general", "priority": 7},
+                    {"text": "我养了一只金毛犬叫小白", "type": "general", "priority": 6},
+                ],
+            },
+            {
+                "username": "exp_user_tech",
+                "display_name": "技术实验用户",
+                "preferences": [
+                    {"text": "我是一名数据科学家，擅长Python和机器学习", "type": "technical", "priority": 9},
+                    {"text": "我对人工智能和深度学习很感兴趣", "type": "domain", "priority": 8},
+                    {"text": "我喜欢阅读科幻小说", "type": "general", "priority": 5},
+                ],
+            },
+            {
+                "username": "exp_user_music",
+                "display_name": "音乐爱好实验用户",
+                "preferences": [
+                    {"text": "我是古典音乐的爱好者，特别喜欢贝多芬和莫扎特", "type": "general", "priority": 9},
+                    {"text": "我正在学弹吉他", "type": "general", "priority": 7},
+                    {"text": "我对辣椒过敏，不能吃辣的食物", "type": "general", "priority": 10},
+                    {"text": "我在北京工作", "type": "general", "priority": 6},
+                ],
+            },
+        ]
+    
+    def _get_experiment_user_id(self, item: Dict[str, Any], default: str = "experiment_user") -> str:
+        """
+        从数据项中获取实验用户 ID。
+        
+        优先级:
+        1. item 中显式指定的 user_id
+        2. 通过 item 的 username 从 _experiment_user_map 查找
+        3. 通过 personas 匹配最佳实验用户
+        4. 使用默认值
+        """
+        # 1. 显式指定
+        if 'user_id' in item:
+            return item['user_id']
+        
+        # 2. 通过 username 查找
+        if hasattr(self, '_experiment_user_map'):
+            username = item.get('experiment_user', item.get('username'))
+            if username and username in self._experiment_user_map:
+                return self._experiment_user_map[username]
+        
+        # 3. 通过 personas 匹配 (简单关键词匹配)
+        if hasattr(self, '_experiment_user_map') and self._experiment_user_map:
+            personas = item.get('personas', [])
+            if personas:
+                return self._match_user_by_personas(personas)
+        
+        return default
+    
+    def _match_user_by_personas(self, personas: List[str]) -> str:
+        """
+        根据 personas 关键词匹配最佳实验用户。
+        
+        简单策略: 计算每个实验用户偏好与 personas 的关键词重叠度。
+        """
+        if not hasattr(self, '_experiment_user_map') or not self._experiment_user_map:
+            return "experiment_user"
+        
+        # 获取默认用户配置用于匹配
+        default_users = self._get_default_experiment_users()
+        personas_text = " ".join(personas).lower()
+        
+        best_user = None
+        best_score = 0
+        
+        for user_data in default_users:
+            username = user_data["username"]
+            if username not in self._experiment_user_map:
+                continue
+            
+            score = 0
+            for pref in user_data.get("preferences", []):
+                pref_text = pref["text"].lower()
+                # 简单的关键词重叠计数
+                for word in pref_text:
+                    if word in personas_text:
+                        score += 1
+            
+            if score > best_score:
+                best_score = score
+                best_user = username
+        
+        if best_user:
+            return self._experiment_user_map[best_user]
+        
+        # 返回第一个实验用户作为默认
+        first_username = list(self._experiment_user_map.keys())[0]
+        return self._experiment_user_map[first_username]
+    
+    def _write_session_preferences(self, user_id: str, personas: List[str]) -> None:
+        """
+        为特定 session 的 personas 写入用户偏好表。
+        
+        用于多轮连贯性实验等场景，每个 session 有不同的 personas，
+        需要动态更新该用户的偏好以确保 DKI 偏好注入与当前 session 匹配。
+        
+        注意: 这会覆盖该用户的现有偏好。
+        """
+        if not personas:
+            return
+        
+        try:
+            with self.db_manager.session_scope() as db:
+                pref_repo = UserPreferenceRepository(db)
+                
+                # 软删除旧偏好
+                existing = pref_repo.get_by_user(user_id)
+                for old_pref in existing:
+                    pref_repo.delete(old_pref.id)
+                
+                # 写入新偏好
+                for idx, persona in enumerate(personas):
+                    pref_repo.create(
+                        user_id=user_id,
+                        preference_text=persona,
+                        preference_type="general",
+                        priority=10 - idx,  # 越靠前优先级越高
+                    )
+                
+                # 清除 DKI 系统的内存缓存，强制下次从数据库重新加载
+                if self.dki_system and hasattr(self.dki_system, '_user_preferences'):
+                    self.dki_system._user_preferences.pop(user_id, None)
+                    
+        except Exception as e:
+            logger.warning(f"Failed to write session preferences for {user_id}: {e}")
+    
     def run_experiment(
         self,
         config: ExperimentConfig,
         data_path: Optional[str] = None,
+        setup_users: bool = True,
+        experiment_users: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """
         Run a full experiment.
@@ -232,11 +490,17 @@ class ExperimentRunner:
         Args:
             config: Experiment configuration
             data_path: Path to experiment data (JSON file)
+            setup_users: Whether to setup experiment users and preferences in DB
+            experiment_users: Custom experiment user definitions (optional)
             
         Returns:
             Experiment results dict
         """
         self._ensure_systems()
+        
+        # 设置实验用户和偏好 (写入数据库，确保偏好注入可靠)
+        if setup_users:
+            self.setup_experiment_users(experiment_users)
         
         logger.info(f"Starting experiment: {config.name}")
         
@@ -333,6 +597,8 @@ class ExperimentRunner:
         Each sample uses its own session_id to prevent history accumulation
         across unrelated samples, which would cause prompt length overflow
         (decoder prompt > max_model_len).
+        
+        改进: 每个 sample 使用对应的实验用户 ID，确保偏好从数据库正确加载。
         """
         samples = data[:config.max_samples]
         results = []
@@ -343,6 +609,9 @@ class ExperimentRunner:
         for idx, item in enumerate(tqdm(samples, desc=f"Running {mode}")):
             # Per-sample session: prevents history from accumulating across samples
             session_id = f"exp_{mode}_{base_ts}_{idx}"
+            
+            # 获取该 sample 对应的实验用户 ID (从数据库中匹配)
+            user_id = self._get_experiment_user_id(item)
             
             # Add memories for this sample only
             memories = item.get('personas', []) + item.get('supporting_facts', [])
@@ -364,6 +633,7 @@ class ExperimentRunner:
                     session_id=session_id,
                     item=item,
                     config=config,
+                    user_id=user_id,
                 )
                 results.append(result)
         
@@ -621,13 +891,20 @@ class ExperimentRunner:
         self,
         data_path: Optional[str] = None,
         alpha_values: Optional[List[float]] = None,
+        setup_users: bool = True,
     ) -> Dict[str, Any]:
         """
         Run α sensitivity analysis.
         
         Tests DKI performance across different α values.
+        
+        改进: 使用数据库中的实验用户偏好，确保偏好 K/V 注入在不同 α 下生效。
         """
         self._ensure_systems()
+        
+        # 设置实验用户
+        if setup_users and not hasattr(self, '_experiment_user_map'):
+            self.setup_experiment_users()
         
         alpha_values = alpha_values or [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
         
@@ -650,16 +927,24 @@ class ExperimentRunner:
             'results_by_alpha': {},
         }
         
-        session_id = f"alpha_exp_{int(time.time())}"
+        # 使用第一个实验用户 (alpha 实验关注注入强度，用户一致即可)
+        user_id = "experiment_user"
+        if hasattr(self, '_experiment_user_map') and self._experiment_user_map:
+            first_username = list(self._experiment_user_map.keys())[0]
+            user_id = self._experiment_user_map[first_username]
         
-        # Add memories
-        for item in data[:50]:
-            if 'memory' in item:
-                self.dki_system.add_memory(session_id, item['memory'])
+        # 每个 alpha 值使用独立 session，避免历史累积
+        base_ts = int(time.time())
         
         # Test each alpha
-        for alpha in alpha_values:
+        for alpha_idx, alpha in enumerate(alpha_values):
             alpha_results = []
+            session_id = f"alpha_exp_{base_ts}_{alpha_idx}"
+            
+            # Add memories for this alpha session
+            for item in data[:50]:
+                if 'memory' in item:
+                    self.dki_system.add_memory(session_id, item['memory'])
             
             for item in tqdm(data[:50], desc=f"α={alpha}"):
                 query = item.get('query', '')
@@ -669,7 +954,7 @@ class ExperimentRunner:
                 response = self.dki_system.chat(
                     query=query,
                     session_id=session_id,
-                    user_id="experiment_user",
+                    user_id=user_id,
                     force_alpha=alpha,
                 )
                 
@@ -698,17 +983,30 @@ class ExperimentRunner:
     def run_latency_comparison(
         self,
         n_turns: int = 10,
+        setup_users: bool = True,
     ) -> Dict[str, Any]:
         """
         Run latency comparison between first turn and subsequent turns.
         
         Tests session cache effectiveness.
+        
+        改进: 使用数据库中的实验用户偏好。
         """
         self._ensure_systems()
+        
+        # 设置实验用户
+        if setup_users and not hasattr(self, '_experiment_user_map'):
+            self.setup_experiment_users()
         
         logger.info(f"Running latency comparison with {n_turns} turns")
         
         session_id = f"latency_exp_{int(time.time())}"
+        
+        # 获取实验用户 ID
+        user_id = "experiment_user"
+        if hasattr(self, '_experiment_user_map') and self._experiment_user_map:
+            first_username = list(self._experiment_user_map.keys())[0]
+            user_id = self._experiment_user_map[first_username]
         
         # Add some memories
         memories = [
@@ -737,7 +1035,7 @@ class ExperimentRunner:
             response = self.dki_system.chat(
                 query=query,
                 session_id=session_id,
-                user_id="experiment_user",
+                user_id=user_id,
             )
             results['dki_latencies'].append({
                 'turn': i + 1,
@@ -754,7 +1052,7 @@ class ExperimentRunner:
             response = self.rag_system.chat(
                 query=query,
                 session_id=rag_session_id,
-                user_id="experiment_user",
+                user_id=user_id,
             )
             results['rag_latencies'].append({
                 'turn': i + 1,
@@ -790,14 +1088,21 @@ class ExperimentRunner:
     def run_multi_turn_coherence(
         self,
         data_path: Optional[str] = None,
+        setup_users: bool = True,
     ) -> Dict[str, Any]:
         """
         运行多轮连贯性实验
         
         测试 DKI 和 RAG 在多轮对话中的记忆保持能力。
         每个会话有明确的期望记忆回忆，可以精确衡量记忆召回率。
+        
+        改进: 使用数据库中的实验用户偏好，personas 同时写入偏好表。
         """
         self._ensure_systems()
+        
+        # 设置实验用户
+        if setup_users and not hasattr(self, '_experiment_user_map'):
+            self.setup_experiment_users()
         
         logger.info("Running multi-turn coherence experiment")
         
@@ -827,6 +1132,13 @@ class ExperimentRunner:
             for session_data in tqdm(data[:20], desc=f"Coherence ({mode})"):
                 session_id = f"coherence_{mode}_{session_data['session_id']}"
                 
+                # 获取该 session 对应的实验用户 ID
+                user_id = self._get_experiment_user_id(session_data)
+                
+                # 为该 session 动态写入 personas 作为偏好 (确保 DKI 偏好注入生效)
+                if mode == 'dki':
+                    self._write_session_preferences(user_id, session_data.get('personas', []))
+                
                 # Add memories
                 for mem in session_data['personas']:
                     system.add_memory(session_id, mem)
@@ -840,14 +1152,14 @@ class ExperimentRunner:
                         response = self.dki_system.chat(
                             query=query,
                             session_id=session_id,
-                            user_id="experiment_user",
+                            user_id=user_id,
                         )
                         response_text = response.text
                     else:
                         response = self.rag_system.chat(
                             query=query,
                             session_id=session_id,
-                            user_id="experiment_user",
+                            user_id=user_id,
                         )
                         response_text = response.text
                     
@@ -915,6 +1227,7 @@ class ExperimentRunner:
     def run_ablation_study(
         self,
         data_path: Optional[str] = None,
+        setup_users: bool = True,
     ) -> Dict[str, Any]:
         """
         运行消融实验
@@ -924,8 +1237,14 @@ class ExperimentRunner:
         - no_gating: 无门控 (固定 α=1.0)
         - rag_baseline: RAG 对照
         - no_memory: 无记忆基线
+        
+        改进: 使用数据库中的实验用户偏好。
         """
         self._ensure_systems()
+        
+        # 设置实验用户
+        if setup_users and not hasattr(self, '_experiment_user_map'):
+            self.setup_experiment_users()
         
         logger.info("Running ablation study")
         
@@ -953,6 +1272,12 @@ class ExperimentRunner:
         
         results = {mode: {'samples': [], 'latencies': []} for mode in ablation_configs}
         
+        # 获取实验用户 ID
+        user_id = "experiment_user"
+        if hasattr(self, '_experiment_user_map') and self._experiment_user_map:
+            first_username = list(self._experiment_user_map.keys())[0]
+            user_id = self._experiment_user_map[first_username]
+        
         for ablation_mode, config in ablation_configs.items():
             logger.info(f"Running ablation: {ablation_mode}")
             
@@ -975,7 +1300,7 @@ class ExperimentRunner:
                         response = self.dki_system.chat(
                             query=query,
                             session_id=session_id,
-                            user_id="experiment_user",
+                            user_id=user_id,
                             force_alpha=config.get('force_alpha'),
                             allow_injection=config['use_memory'],
                         )
@@ -985,7 +1310,7 @@ class ExperimentRunner:
                         response = self.rag_system.chat(
                             query=query,
                             session_id=session_id,
-                            user_id="experiment_user",
+                            user_id=user_id,
                         )
                         response_text = response.text
                         latency = response.latency_ms
