@@ -24,24 +24,36 @@ model:
     engines:
         vllm:
             enabled: true
-            model_name: "/opt/ai-demo/models/deepseek-llm-7b-chat"
-            # ============ GPU Parallelism ============
+            model_name: "deepseek-llm-7b-chat"
             # tensor_parallel_size: 模型张量并行度
-            #   - 1: 单 GPU (默认，适合显存充足的场景)
+            #   - 1: 单 GPU (默认)
             #   - 2: 双 GPU (适合 2×V100 32G 等显存受限场景)
-            # 
-            # 2×V100 32G 环境建议:
-            #   tensor_parallel_size: 2  (模型分布到两张 GPU)
-            #   gpu_memory_utilization: 0.85  (留出余量给 K/V cache)
-            #   max_model_len: 4096  (7B/8B 模型足够)
-            #
-            # 注意: 使用 tensor_parallel_size=2 时需要:
-            #   1. 设置 CUDA_VISIBLE_DEVICES=0,1
-            #   2. 确保两张 GPU 通过 NVLink/PCIe 互联
-            #   3. vLLM 会自动处理模型分片和通信
-            tensor_parallel_size: 2
-            max_model_len: 4096
-            gpu_memory_utilization: 0.85
+            # 使用双 GPU 时需设置 CUDA_VISIBLE_DEVICES=0,1
+            tensor_parallel_size: 1
+            max_model_len: 8192
+            gpu_memory_utilization: 0.9
+            trust_remote_code: true
+
+        llama:
+            enabled: true
+            model_name: "meta-llama/Llama-3.2-3B-Instruct"
+            device: "cuda"
+            torch_dtype: "float16"
+            load_in_8bit: false
+            trust_remote_code: true
+
+        deepseek:
+            enabled: true
+            model_name: "deepseek-ai/deepseek-llm-7b-chat"
+            device: "cuda"
+            torch_dtype: "float16"
+            trust_remote_code: true
+
+        glm:
+            enabled: true
+            model_name: "THUDM/glm-4-9b-chat"
+            device: "cuda"
+            torch_dtype: "float16"
             trust_remote_code: true
 
 # ============ Embedding Settings ============
@@ -219,52 +231,6 @@ dki:
         audit_logging: true # Log all injection decisions
         log_path: "./logs/dki_audit.log"
 
-    # ============ 记忆召回策略 (v4) ============
-    # 多信号融合召回 + 逐消息 Summary + Function Call 事实补充
-    # 替代 flat_history 平铺方案, 支持长历史场景
-    recall:
-        enabled: true
-        strategy: "summary_with_fact_call" # summary_with_fact_call | flat_history (旧)
-
-        # 多信号召回
-        signals:
-            keyword_enabled: true       # 关键词+权重检索 (jieba)
-            keyword_topk: 5             # 提取关键词数量
-            keyword_method: "tfidf"     # tfidf | textrank
-            vector_enabled: true        # 向量相似度检索 (FAISS)
-            vector_top_k: 10            # 向量检索返回数
-            vector_threshold: 0.5       # 向量相似度阈值
-            reference_enabled: true     # 指代解析 (已有 ReferenceResolver)
-
-        # 召回分数融合权重 (w1 >= w2, 事实准确优先)
-        score_weights:
-            keyword_weight: 0.4         # w1: 关键词权重
-            vector_weight: 0.35         # w2: 向量相似度权重
-            recency_weight: 0.25        # w3: 时间近度权重
-
-        # 动态 History 预算
-        budget:
-            generation_reserve: 512     # 生成预留 tokens
-            instruction_reserve: 150    # 限定提示预留 tokens
-            min_recent_turns: 2         # 至少补充的近期完整轮次
-            max_recent_turns: 5         # 最多补充的近期完整轮次
-
-        # 逐消息 Summary 阈值
-        summary:
-            per_message_threshold: 200  # 单条消息超过此 token 数 → summary
-            max_tokens_per_summary: 150 # 每条 summary 最大 tokens
-            strategy: "extractive"      # extractive (jieba TextRank) | llm
-
-        # Function Call (事实补充)
-        fact_call:
-            enabled: true
-            max_rounds: 3               # 最大事实补充轮次
-            max_fact_tokens: 800        # 事实段落总 token 上限
-            batch_size: 5               # 每次返回的消息数 (offset+limit)
-
-        # 提示格式化器
-        prompt_formatter: "auto"        # auto | generic | deepseek | glm
-
     # ============ A/B Testing ============
     ab_test:
         enabled: false
@@ -347,10 +313,10 @@ preference_cache:
 # ============ Redis Settings ============
 # Distributed cache for multi-instance deployments
 redis:
-    enabled: true # Set to true for production
+    enabled: false # Set to true for production
     host: "localhost"
     port: 6379
-    password: "hello2026" # Leave empty if no auth
+    password: "" # Leave empty if no auth
     db: 0 # Redis database number
 
     # Connection pool settings
@@ -518,68 +484,6 @@ experiment:
         - "rouge"
 
     # ============ Experiment Users ============
-    # 实验用户及其偏好配置
-    # 实验开始前会自动写入数据库 (demo_users + user_preferences 表)
-    # 确保 DKI 偏好注入通过数据库可靠加载
-    #
-    # 使用方式:
-    #   runner = ExperimentRunner()
-    #   runner.setup_experiment_users()  # 自动从此配置读取
-    #
-    # 也可以通过代码传入自定义用户:
-    #   runner.setup_experiment_users(users=[...])
-    users:
-        - username: "exp_user_vegetarian"
-          display_name: "素食实验用户"
-          preferences:
-              - text: "我是素食主义者，不吃任何肉类和海鲜"
-                type: "general"
-                priority: 10
-              - text: "我对海鲜过敏，请不要推荐任何海鲜相关的食物"
-                type: "general"
-                priority: 10
-              - text: "我住在北京海淀区"
-                type: "general"
-                priority: 7
-
-        - username: "exp_user_outdoor"
-          display_name: "户外运动实验用户"
-          preferences:
-              - text: "我喜欢户外运动，特别是徒步和骑行"
-                type: "general"
-                priority: 9
-              - text: "我住在上海浦东"
-                type: "general"
-                priority: 7
-              - text: "我养了一只金毛犬叫小白"
-                type: "general"
-                priority: 6
-
-        - username: "exp_user_tech"
-          display_name: "技术实验用户"
-          preferences:
-              - text: "我是一名数据科学家，擅长Python和机器学习"
-                type: "technical"
-                priority: 9
-              - text: "我对人工智能和深度学习很感兴趣"
-                type: "domain"
-                priority: 8
-              - text: "我喜欢阅读科幻小说"
-                type: "general"
-                priority: 5
-
-        - username: "exp_user_music"
-          display_name: "音乐爱好实验用户"
-          preferences:
-              - text: "我是古典音乐的爱好者，特别喜欢贝多芬和莫扎特"
-                type: "general"
-                priority: 9
-              - text: "我正在学弹吉他"
-                type: "general"
-                priority: 7
-              - text: "我对辣椒过敏，不能吃辣的食物"
-                type: "general"
-                priority: 10
-              - text: "我在北京工作"
-                type: "general"
-                priority: 6
+    # 实验用户及其偏好配置 (实验开始前自动写入数据库)
+    # 详见 config.yaml 中的完整配置示例
+    users: []  # 留空则使用内置默认实验用户
