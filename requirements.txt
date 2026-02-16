@@ -60,6 +60,11 @@ python-dotenv>=1.0.0
 # BM25 for hybrid search (BM25 + embedding reranking)
 rank-bm25>=0.2.2
 
+# ============ Chinese NLP (Recall v4) ============
+# jieba: Chinese text segmentation + keyword extraction (TF-IDF / TextRank)
+# Used by Recall v4 for multi-signal recall and extractive summarization
+jieba>=0.42.1
+
 # ============ Metrics & Evaluation ============
 rouge-score>=0.1.2
 nltk>=3.8.0
