@@ -198,7 +198,7 @@ class TestMemoryRepository:
                 metadata={"category": "test", "importance": "high"},
             )
             
-            assert memory.metadata['category'] == "test"
+            assert memory.get_metadata()['category'] == "test"
     
     def test_get_memory(self, db_manager, session_id):
         """Test getting memory by ID."""
@@ -424,7 +424,7 @@ class TestAuditLogRepository:
                 metadata={"key": "value", "count": 42},
             )
             
-            assert log.metadata['key'] == "value"
+            assert log.get_extra_metadata()['key'] == "value"
     
     def test_get_by_session(self, db_manager):
         """Test getting logs by session."""
