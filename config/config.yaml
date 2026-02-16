@@ -71,15 +71,16 @@ dki:
     # Use tiered cache instead of simple cache (recommended for production)
     use_tiered_cache: true
 
-    # ============ Injection Strategy Selection ============
-    # Choose between stable (production) and full_attention (research)
-    # - stable: Preferences via K/V, History via suffix prompt (default)
-    # - full_attention: Both Preferences and History via K/V injection (research)
-    injection_strategy: "stable" # stable | full_attention
+    # ============ Injection Strategy ============
+    # 系统统一使用 recall_v4 策略:
+    # - 偏好: K/V 注入 (负位置)
+    # - 历史: 多信号召回 + 后缀组装 (recall_v4)
+    # - 事实补充: Function Call 循环
+    # 
+    # 注: stable 和 full_attention 策略已移除 (v3.2)
+    injection_strategy: "recall_v4"
 
-    # ============ Hybrid Injection Strategy (Paper Section 3.9) ============
-    # Layered approach: Preferences via K/V, History via suffix prompt
-    # Used when injection_strategy = "stable"
+    # ============ Hybrid Injection (偏好 K/V 注入) ============
     hybrid_injection:
         enabled: true
         language: "cn" # en | cn (affects prompt templates)
@@ -92,53 +93,37 @@ dki:
             alpha: 0.4 # Lower α for background influence (0.3-0.5 recommended)
             max_tokens: 100 # Preferences should be short
 
-        # History Injection (Token level, suffix prompt)
-        # Longer, dynamic, explicit reference - like "memory"
+        # History 由 recall_v4 处理, 不再使用 suffix_prompt 方式
         history:
-            enabled: true
-            method: "suffix_prompt" # suffix_prompt | kv_injection
-            max_tokens: 500 # Can be longer than preferences
-            max_messages: 10 # Recent messages to include
-            prompt_template: "default" # default | custom path
+            enabled: false
+            method: "recall_v4" # recall_v4 (新) — 历史由多信号召回处理
+            max_tokens: 500
+            max_messages: 10
 
-    # ============ Full Attention Strategy (Research - Plan C) ============
-    # Both preferences and history injected via K/V at negative positions
-    # Aims for 0% context usage, but may have OOD risks
-    # Used when injection_strategy = "full_attention"
-    full_attention:
+    # ============ 用户隔离配置 (v3.1) ============
+    isolation:
         enabled: true
-
-        # Position configuration
-        # C1: Fixed negative position for all injected K/V
-        position_mode: "fixed_negative" # fixed_negative | constant | nope
-
-        # Preference K/V (same as stable strategy)
-        preference:
-            position_start: -100 # Starting position for preference K/V
-            alpha: 0.4 # α for preference injection
-            max_tokens: 100
-
-        # History K/V (NEW: injected via K/V instead of suffix)
-        history:
-            position_start: -500 # Starting position for history K/V
-            alpha: 0.3 # Lower α for history (more tokens, more risk)
-            max_tokens: 400 # Max tokens for history K/V
-            max_messages: 10 # Max messages to convert to K/V
-
-        # Global indication (minimal context usage)
-        # A short hint to guide model attention to negative positions
-        global_indication:
-            enabled: true
-            text_en: "[Memory Context Available]"
-            text_cn: "[记忆上下文可用]"
-            # This is the ONLY context usage in full_attention mode
-            # Approximately 3-5 tokens
-
-        # Safety settings for research
-        safety:
-            max_total_kv_tokens: 600 # Hard limit on total K/V tokens
-            fallback_to_stable: true # Fall back to stable if K/V too large
-            log_attention_patterns: true # Log attention for analysis
+        # HMAC 签名密钥 (生产环境必须从环境变量 DKI_HMAC_SECRET 读取)
+        cache_key_secret: ""
+        # 安全级别: strict | standard | relaxed
+        security_level: "strict"
+        # 验证 session 归属
+        verify_session_ownership: true
+        # 审计日志
+        audit_enabled: true
+        audit_max_entries: 10000
+        # 推理上下文隔离
+        enable_inference_guard: true
+    
+    # ============ 偏好缓存配置 ============
+    preference_store:
+        max_users: 1000
+        ttl_seconds: 3600
+    
+    # ============ Executor 缓存配置 ============
+    executor_cache:
+        max_total: 10000
+        max_per_user: 100
 
     # ============ Memory Source Configuration ============
     # Connect to external memory database
