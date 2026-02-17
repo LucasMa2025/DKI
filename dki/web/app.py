@@ -43,7 +43,7 @@ from dki.api.dki_routes import create_dki_router, set_dki_plugin
 from dki.api.dependencies import init_dependencies, cleanup_dependencies
 from dki.api.visualization_routes import record_visualization, get_visualization_history
 from dki.api.stats_routes import record_dki_request
-from dki.adapters import AdapterFactory, AdapterConfig, AdapterType
+from dki.adapters import ExampleAdapter
 from dki.cache import (
     PreferenceCacheManager,
     CacheConfig,
@@ -143,16 +143,20 @@ def create_app() -> FastAPI:
             _systems['rag'] = RAGSystem()
         return _systems['rag']
     
-    # Initialize user data adapter from config
+    # Initialize user data adapter (ExampleAdapter for demo/dev, ConfigDrivenAdapter for production)
     def get_user_adapter():
         if 'user_adapter' not in _systems:
             adapter_config = getattr(config, 'user_adapter', None)
-            if adapter_config:
-                _systems['user_adapter'] = AdapterFactory.create_from_dict(
+            if adapter_config and getattr(adapter_config, 'type', 'memory') != 'memory':
+                # Production: use ConfigDrivenAdapter
+                from dki.adapters import ConfigDrivenAdapter, ConfigDrivenAdapterConfig
+                cda_config = ConfigDrivenAdapterConfig.from_dict(
                     adapter_config.__dict__ if hasattr(adapter_config, '__dict__') else {}
                 )
+                _systems['user_adapter'] = ConfigDrivenAdapter(cda_config)
             else:
-                _systems['user_adapter'] = AdapterFactory.create_memory()
+                # Demo/dev: use ExampleAdapter (in-memory)
+                _systems['user_adapter'] = ExampleAdapter()
         return _systems['user_adapter']
     
     def get_preference_cache() -> Optional[PreferenceCacheManager]:
