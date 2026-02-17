@@ -206,6 +206,9 @@ class KVInjectionOptimizer:
             softmax_scale=self.config.fa2.softmax_scale,
         )
         
+        # 释放拼接后的中间张量
+        del full_key, full_value
+        
         # Alpha 混合
         if alpha < 1.0 and self.config.kv_injection.alpha_blending:
             # 计算原始输出 (无注入)
@@ -221,6 +224,7 @@ class KVInjectionOptimizer:
             
             # 混合
             output = alpha * injected_output + (1 - alpha) * original_output
+            del injected_output, original_output
         else:
             output = injected_output
         
@@ -274,8 +278,11 @@ class KVInjectionOptimizer:
                 alpha,
             )
         
-        # 分块处理 - 使用 log-sum-exp 正确合并
-        # 将所有 memory chunks 拼接到 input K/V，然后分块计算
+        # 分块处理:
+        # 分块计算 memory K/V 的注意力分数, 然后与 input K/V 的分数拼接,
+        # 统一做 softmax + matmul, 确保数学等价于完整拼接的注入结果。
+        # 注意: 此实现保证数学正确性, 但内存峰值与不分块相同。
+        # 如需真正降低内存峰值, 需使用 online softmax (log-sum-exp) 技巧。
         num_chunks = (seq_m + chunk_size - 1) // chunk_size
         batch_size, seq_q, num_heads, head_dim = query.shape
         scale = 1.0 / math.sqrt(head_dim)
@@ -292,10 +299,10 @@ class KVInjectionOptimizer:
         # scores_input: [batch, heads, seq_q, seq_k]
         scores_input = torch.matmul(q, k_input.transpose(-2, -1)) * scale
         
-        # 累积所有 chunk 的注意力
-        # 使用 online softmax: 维护 running max 和 running sum
-        all_scores_list = [scores_input]
-        all_values_list = [v_input]
+        # 累积所有 memory chunk 的注意力分数和值
+        # 注意: memory chunks 在前 (prepend), input 在后
+        all_scores_list = []
+        all_values_list = []
         
         for i in range(num_chunks):
             start_idx = i * chunk_size
@@ -310,15 +317,24 @@ class KVInjectionOptimizer:
             all_scores_list.append(scores_chunk)
             all_values_list.append(chunk_v)
         
+        # memory chunks 在前, input 在后 (prepend 语义)
+        all_scores_list.append(scores_input)
+        all_values_list.append(v_input)
+        
         # 拼接所有分数和值
         # all_scores: [batch, heads, seq_q, seq_m + seq_k]
         all_scores = torch.cat(all_scores_list, dim=-1)
         # all_values: [batch, heads, seq_m + seq_k, head_dim]
         all_values = torch.cat(all_values_list, dim=2)
         
+        # 释放中间列表
+        del all_scores_list, all_values_list, scores_input
+        
         # 标准 softmax + matmul
         attn_weights = torch.softmax(all_scores, dim=-1)
+        del all_scores
         output = torch.matmul(attn_weights, all_values)
+        del attn_weights, all_values
         
         # 转换回 FlashAttention 格式 [batch, seq_q, heads, head_dim]
         output = output.transpose(1, 2)
