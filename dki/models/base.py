@@ -54,10 +54,22 @@ class KVCacheEntry:
         )
     
     def to_bytes(self) -> Tuple[bytes, bytes]:
-        """Serialize to bytes for storage."""
+        """Serialize to bytes for storage.
+        
+        Note: bfloat16 tensors cannot be directly converted to numpy.
+        We convert to float32 first, then serialize. The from_bytes()
+        method handles the reverse conversion using the dtype parameter.
+        """
+        key_cpu = self.key.cpu()
+        value_cpu = self.value.cpu()
+        # bfloat16 has no numpy equivalent; convert to float32 for serialization
+        if key_cpu.dtype == torch.bfloat16:
+            key_cpu = key_cpu.float()
+        if value_cpu.dtype == torch.bfloat16:
+            value_cpu = value_cpu.float()
         return (
-            self.key.cpu().numpy().tobytes(),
-            self.value.cpu().numpy().tobytes(),
+            key_cpu.numpy().tobytes(),
+            value_cpu.numpy().tobytes(),
         )
     
     @classmethod
@@ -84,7 +96,7 @@ class KVCacheEntry:
             torch.float16: np.float16,
             torch.float32: np.float32,
             torch.float64: np.float64,
-            torch.bfloat16: np.float16,  # bfloat16 has no numpy equivalent, store as float16
+            torch.bfloat16: np.float32,  # bfloat16 serialized as float32 in to_bytes()
         }
         np_dtype = _torch_to_numpy.get(dtype, np.float16)
         

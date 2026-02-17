@@ -147,7 +147,12 @@ class LlamaAdapter(BaseModelAdapter):
                 return_dict=True,
             )
             hidden_states = outputs.hidden_states[-1]
-            embeddings = hidden_states.mean(dim=1)
+            embeddings = hidden_states.mean(dim=1).detach().cpu()
+        
+        # Free GPU memory
+        del outputs
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         
         return embeddings
     
@@ -170,21 +175,26 @@ class LlamaAdapter(BaseModelAdapter):
                 return_dict=True,
             )
         
-        # Extract K/V cache
+        # Extract K/V cache — detach and move to CPU to prevent GPU memory leak
         kv_entries = []
         past_kv = outputs.past_key_values
         
         for layer_idx, (key, value) in enumerate(past_kv):
             entry = KVCacheEntry(
-                key=key,
-                value=value,
+                key=key.detach().cpu(),
+                value=value.detach().cpu(),
                 layer_idx=layer_idx,
             )
             kv_entries.append(entry)
         
         hidden_states = None
         if return_hidden and outputs.hidden_states is not None:
-            hidden_states = outputs.hidden_states[-1]
+            hidden_states = outputs.hidden_states[-1].detach().cpu()
+        
+        # Explicitly delete outputs to free GPU memory
+        del outputs
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         
         return kv_entries, hidden_states
     
@@ -246,14 +256,21 @@ class LlamaAdapter(BaseModelAdapter):
         end_time = time.perf_counter()
         
         new_tokens = outputs[0][input_ids.shape[1]:]
-        output_text = self.decode(new_tokens)
+        output_text = self.decode(new_tokens.cpu())
+        output_token_list = new_tokens.cpu().tolist()
+        input_len = input_ids.shape[1]
+        
+        # Cleanup: free GPU memory from intermediate tensors
+        del past_kv, outputs, scaled_kv, input_ids, attention_mask
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         
         return ModelOutput(
             text=output_text,
-            tokens=new_tokens.tolist(),
+            tokens=output_token_list,
             latency_ms=(end_time - start_time) * 1000,
-            input_tokens=input_ids.shape[1],
-            output_tokens=len(new_tokens),
+            input_tokens=input_len,
+            output_tokens=len(output_token_list),
             metadata={'alpha': alpha, 'mem_len': mem_len},
         )
     
