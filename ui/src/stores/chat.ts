@@ -29,11 +29,11 @@ export const useChatStore = defineStore('chat', () => {
   // Create new session
   async function createSession(title?: string): Promise<Session | null> {
     try {
-      const session = await api.sessions.create(title || '新对话')
+      const session = await api.sessions.create(title || 'New Chat')
       sessions.value.unshift(session)
       return session
     } catch (e) {
-      error.value = '创建会话失败'
+      error.value = 'Failed to create session'
       return null
     }
   }
@@ -49,7 +49,7 @@ export const useChatStore = defineStore('chat', () => {
       loading.value = true
       messages.value = await api.sessions.getMessages(sessionId)
     } catch (e) {
-      error.value = '加载消息失败'
+      error.value = 'Failed to load messages'
     } finally {
       loading.value = false
     }
@@ -66,7 +66,7 @@ export const useChatStore = defineStore('chat', () => {
         messages.value = []
       }
     } catch (e) {
-      error.value = '删除会话失败'
+      error.value = 'Failed to delete session'
     }
   }
   
@@ -79,7 +79,7 @@ export const useChatStore = defineStore('chat', () => {
         session.title = title
       }
     } catch (e) {
-      error.value = '重命名失败'
+      error.value = 'Failed to rename session'
     }
   }
   
@@ -166,7 +166,7 @@ export const useChatStore = defineStore('chat', () => {
       }
       
     } catch (e) {
-      error.value = e instanceof Error ? e.message : '发送消息失败'
+      error.value = e instanceof Error ? e.message : 'Failed to send message'
       // Remove the placeholder message on error
       messages.value.pop()
     } finally {

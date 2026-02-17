@@ -2,7 +2,7 @@
   <div class="chat-input">
     <div class="input-container">
       <!-- Attachment button (optional) -->
-      <el-tooltip content="添加附件" v-if="showAttachment">
+      <el-tooltip content="Add Attachment" v-if="showAttachment">
         <el-button :icon="Paperclip" text class="attachment-btn" />
       </el-tooltip>
       
@@ -35,10 +35,10 @@
     <div class="input-footer" v-if="showFooter">
       <span class="input-hint">
         <template v-if="sendOnEnter">
-          Enter 发送，Shift+Enter 换行
+          Enter to send, Shift+Enter for new line
         </template>
         <template v-else>
-          Ctrl+Enter 发送
+          Ctrl+Enter to send
         </template>
       </span>
       <span class="char-count" v-if="showCharCount">
@@ -65,7 +65,7 @@ const props = withDefaults(defineProps<{
   maxLength?: number
 }>(), {
   modelValue: '',
-  placeholder: '输入消息...',
+  placeholder: 'Type a message...',
   loading: false,
   disabled: false,
   sendOnEnter: true,

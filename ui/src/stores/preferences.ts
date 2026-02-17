@@ -16,7 +16,7 @@ export const usePreferencesStore = defineStore('preferences', () => {
   const preferencesByCategory = computed(() => {
     const grouped: Record<string, UserPreference[]> = {}
     for (const pref of preferences.value) {
-      const category = pref.category || '未分类'
+      const category = pref.category || 'Uncategorized'
       if (!grouped[category]) {
         grouped[category] = []
       }
@@ -35,7 +35,7 @@ export const usePreferencesStore = defineStore('preferences', () => {
       error.value = null
       preferences.value = await api.preferences.list(authStore.user.id)
     } catch (e) {
-      error.value = '加载偏好失败'
+      error.value = 'Failed to load preferences'
     } finally {
       loading.value = false
     }
@@ -58,7 +58,7 @@ export const usePreferencesStore = defineStore('preferences', () => {
       preferences.value.push(newPref)
       return newPref
     } catch (e) {
-      error.value = '创建偏好失败'
+      error.value = 'Failed to create preference'
       return null
     } finally {
       loading.value = false
@@ -78,7 +78,7 @@ export const usePreferencesStore = defineStore('preferences', () => {
       }
       return updated
     } catch (e) {
-      error.value = '更新偏好失败'
+      error.value = 'Failed to update preference'
       return null
     } finally {
       loading.value = false
@@ -95,7 +95,7 @@ export const usePreferencesStore = defineStore('preferences', () => {
       preferences.value = preferences.value.filter(p => p.id !== id)
       return true
     } catch (e) {
-      error.value = '删除偏好失败'
+      error.value = 'Failed to delete preference'
       return false
     } finally {
       loading.value = false

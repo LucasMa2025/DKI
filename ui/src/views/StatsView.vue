@@ -4,15 +4,15 @@
     <div v-if="!isAuthenticated" class="auth-gate">
       <div class="auth-card">
         <el-icon class="auth-icon"><Lock /></el-icon>
-        <h2>访问受限</h2>
-        <p>统计页面需要管理员权限</p>
+        <h2>Access Restricted</h2>
+        <p>The statistics page requires admin privileges</p>
         
         <el-form @submit.prevent="handleAuth">
           <el-form-item>
             <el-input
               v-model="authPassword"
               type="password"
-              placeholder="请输入管理密码"
+              placeholder="Enter admin password"
               show-password
               size="large"
               @keyup.enter="handleAuth"
@@ -26,7 +26,7 @@
               @click="handleAuth"
               style="width: 100%"
             >
-              验证
+              Verify
             </el-button>
           </el-form-item>
         </el-form>
@@ -46,16 +46,16 @@
       <!-- Header -->
       <header class="page-header">
         <div class="header-content">
-          <h1>系统统计</h1>
-          <p>DKI 系统运行状态和性能指标</p>
+          <h1>System Statistics</h1>
+          <p>DKI system runtime status and performance metrics</p>
         </div>
         <div class="header-actions">
           <el-button :icon="Refresh" @click="refreshStats" :loading="loading">
-            刷新
+            Refresh
           </el-button>
           <el-button @click="handleLogout">
             <el-icon><SwitchButton /></el-icon>
-            退出统计
+            Exit Stats
           </el-button>
         </div>
       </header>
@@ -64,8 +64,8 @@
       <el-alert
         v-if="statsError"
         type="warning"
-        :title="'统计数据获取失败: ' + statsError"
-        description="请确认 DKI 服务正在运行并可访问。下方数据为当前会话的实时统计。"
+        :title="'Failed to fetch statistics: ' + statsError"
+        description="Please confirm the DKI service is running and accessible. Data below shows real-time statistics from the current session."
         show-icon
         closable
         style="margin-bottom: 16px;"
@@ -76,19 +76,19 @@
       <div class="overview-cards">
         <div class="overview-card">
           <div class="card-header">
-            <span class="card-title">总请求数</span>
+            <span class="card-title">Total Requests</span>
             <el-icon class="card-icon"><DataAnalysis /></el-icon>
           </div>
           <div class="card-value">{{ stats?.dkiStats?.totalRequests || 0 }}</div>
           <div class="card-trend positive">
             <el-icon><TrendCharts /></el-icon>
-            <span>+12.5% 较昨日</span>
+            <span>+12.5% vs yesterday</span>
           </div>
         </div>
         
         <div class="overview-card">
           <div class="card-header">
-            <span class="card-title">缓存命中率</span>
+            <span class="card-title">Cache Hit Rate</span>
             <el-icon class="card-icon success"><CircleCheck /></el-icon>
           </div>
           <div class="card-value">{{ cacheHitRate }}%</div>
@@ -100,23 +100,23 @@
         
         <div class="overview-card">
           <div class="card-header">
-            <span class="card-title">注入率</span>
+            <span class="card-title">Injection Rate</span>
             <el-icon class="card-icon warning"><Lightning /></el-icon>
           </div>
           <div class="card-value">{{ injectionRate }}%</div>
           <div class="card-trend">
-            <span>平均 Alpha: {{ avgAlpha }}</span>
+            <span>Avg Alpha: {{ avgAlpha }}</span>
           </div>
         </div>
         
         <div class="overview-card">
           <div class="card-header">
-            <span class="card-title">运行时间</span>
+            <span class="card-title">Uptime</span>
             <el-icon class="card-icon info"><Timer /></el-icon>
           </div>
           <div class="card-value">{{ formatUptime(stats?.uptimeSeconds || 0) }}</div>
           <div class="card-trend">
-            <span>{{ stats?.adapterStats?.type || 'N/A' }} 适配器</span>
+            <span>{{ stats?.adapterStats?.type || 'N/A' }} Adapter</span>
           </div>
         </div>
       </div>
@@ -125,13 +125,13 @@
       <div class="charts-row">
         <!-- Cache Distribution -->
         <div class="chart-card">
-          <h3>缓存层级分布</h3>
+          <h3>Cache Tier Distribution</h3>
           <v-chart :option="cacheChartOption" autoresize style="height: 300px" />
         </div>
         
         <!-- Request Trend -->
         <div class="chart-card">
-          <h3>请求趋势</h3>
+          <h3>Request Trend</h3>
           <v-chart :option="trendChartOption" autoresize style="height: 300px" />
         </div>
       </div>
@@ -139,42 +139,42 @@
       <!-- Detailed Stats -->
       <div class="detailed-stats">
         <div class="stats-card">
-          <h3>DKI 统计</h3>
+          <h3>DKI Statistics</h3>
           <el-descriptions :column="2" border>
-            <el-descriptions-item label="总请求数">
+            <el-descriptions-item label="Total Requests">
               {{ stats?.dkiStats?.totalRequests || 0 }}
             </el-descriptions-item>
-            <el-descriptions-item label="L1 命中">
+            <el-descriptions-item label="L1 Hits">
               {{ stats?.dkiStats?.l1Hits || 0 }}
             </el-descriptions-item>
-            <el-descriptions-item label="L2 命中">
+            <el-descriptions-item label="L2 Hits">
               {{ stats?.dkiStats?.l2Hits || 0 }}
             </el-descriptions-item>
-            <el-descriptions-item label="L3 计算">
+            <el-descriptions-item label="L3 Computes">
               {{ stats?.dkiStats?.l3Computes || 0 }}
             </el-descriptions-item>
-            <el-descriptions-item label="平均 Alpha">
+            <el-descriptions-item label="Avg Alpha">
               {{ stats?.dkiStats?.avgAlpha?.toFixed(4) || 'N/A' }}
             </el-descriptions-item>
-            <el-descriptions-item label="注入率">
+            <el-descriptions-item label="Injection Rate">
               {{ (stats?.dkiStats?.injectionRate * 100)?.toFixed(1) || 0 }}%
             </el-descriptions-item>
           </el-descriptions>
         </div>
         
         <div class="stats-card">
-          <h3>缓存统计</h3>
+          <h3>Cache Statistics</h3>
           <el-descriptions :column="2" border>
-            <el-descriptions-item label="L1 大小">
+            <el-descriptions-item label="L1 Size">
               {{ stats?.cacheStats?.l1Size || 0 }} / {{ stats?.cacheStats?.l1MaxSize || 0 }}
             </el-descriptions-item>
-            <el-descriptions-item label="L1 命中率">
+            <el-descriptions-item label="L1 Hit Rate">
               {{ (stats?.cacheStats?.l1HitRate * 100)?.toFixed(1) || 0 }}%
             </el-descriptions-item>
-            <el-descriptions-item label="L2 命中率">
+            <el-descriptions-item label="L2 Hit Rate">
               {{ (stats?.cacheStats?.l2HitRate * 100)?.toFixed(1) || 0 }}%
             </el-descriptions-item>
-            <el-descriptions-item label="L1 使用率">
+            <el-descriptions-item label="L1 Usage">
               <el-progress
                 :percentage="l1UsagePercent"
                 :stroke-width="8"
@@ -185,17 +185,17 @@
         </div>
         
         <div class="stats-card">
-          <h3>适配器状态</h3>
+          <h3>Adapter Status</h3>
           <el-descriptions :column="2" border>
-            <el-descriptions-item label="类型">
+            <el-descriptions-item label="Type">
               <el-tag>{{ stats?.adapterStats?.type || 'N/A' }}</el-tag>
             </el-descriptions-item>
-            <el-descriptions-item label="连接状态">
+            <el-descriptions-item label="Connection">
               <el-tag :type="stats?.adapterStats?.connected ? 'success' : 'danger'">
-                {{ stats?.adapterStats?.connected ? '已连接' : '未连接' }}
+                {{ stats?.adapterStats?.connected ? 'Connected' : 'Disconnected' }}
               </el-tag>
             </el-descriptions-item>
-            <el-descriptions-item label="运行时间">
+            <el-descriptions-item label="Uptime">
               {{ formatUptime(stats?.uptimeSeconds || 0) }}
             </el-descriptions-item>
           </el-descriptions>
@@ -313,7 +313,7 @@ const cacheChartOption = computed(() => ({
       data: [
         {
           value: stats.value?.dkiStats?.l1Hits || 0,
-          name: 'L1 (内存)',
+          name: 'L1 (Memory)',
           itemStyle: { color: '#10b981' },
         },
         {
@@ -323,7 +323,7 @@ const cacheChartOption = computed(() => ({
         },
         {
           value: stats.value?.dkiStats?.l3Computes || 0,
-          name: 'L3 (计算)',
+          name: 'L3 (Compute)',
           itemStyle: { color: '#f59e0b' },
         },
       ],
@@ -367,7 +367,7 @@ const trendChartOption = computed(() => ({
   },
   series: [
     {
-      name: '请求数',
+      name: 'Requests',
       type: 'line',
       smooth: true,
       areaStyle: {
@@ -401,17 +401,17 @@ function formatUptime(seconds: number): string {
   const minutes = Math.floor((seconds % 3600) / 60)
   
   if (days > 0) {
-    return `${days}天 ${hours}小时`
+    return `${days}d ${hours}h`
   } else if (hours > 0) {
-    return `${hours}小时 ${minutes}分钟`
+    return `${hours}h ${minutes}m`
   } else {
-    return `${minutes}分钟`
+    return `${minutes}m`
   }
 }
 
 async function handleAuth() {
   if (!authPassword.value) {
-    authError.value = '请输入密码'
+    authError.value = 'Please enter password'
     return
   }
   
@@ -421,10 +421,10 @@ async function handleAuth() {
   try {
     const success = statsAuthStore.authenticate(authPassword.value)
     if (success) {
-      ElMessage.success('验证成功')
+      ElMessage.success('Verification successful')
       await refreshStats()
     } else {
-      authError.value = '密码错误'
+      authError.value = 'Incorrect password'
     }
   } finally {
     authLoading.value = false
@@ -443,7 +443,7 @@ async function refreshStats() {
     stats.value = await api.stats.getSystemStats()
     statsError.value = ''
   } catch (error: any) {
-    statsError.value = error?.message || '获取统计数据失败'
+    statsError.value = error?.message || 'Failed to fetch statistics'
     // Show zero-state instead of mock data
     stats.value = {
       dkiStats: {

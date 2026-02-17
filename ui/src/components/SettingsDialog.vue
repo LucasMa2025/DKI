@@ -2,46 +2,46 @@
   <el-dialog
     :model-value="modelValue"
     @update:model-value="$emit('update:modelValue', $event)"
-    title="设置"
+    title="Settings"
     width="700px"
     :close-on-click-modal="false"
     class="settings-dialog"
   >
     <el-tabs v-model="activeTab" tab-position="left">
       <!-- General Settings -->
-      <el-tab-pane label="通用" name="general">
+      <el-tab-pane label="General" name="general">
         <div class="settings-section">
-          <h3>界面设置</h3>
+          <h3>Interface Settings</h3>
           
-          <el-form label-position="left" label-width="120px">
-            <el-form-item label="语言">
+          <el-form label-position="left" label-width="140px">
+            <el-form-item label="Language">
               <el-select v-model="settings.language" style="width: 200px">
                 <el-option label="简体中文" value="zh-CN" />
                 <el-option label="English" value="en-US" />
               </el-select>
             </el-form-item>
             
-            <el-form-item label="主题">
+            <el-form-item label="Theme">
               <el-radio-group v-model="settings.theme">
                 <el-radio-button value="light">
-                  <el-icon><Sunny /></el-icon> 浅色
+                  <el-icon><Sunny /></el-icon> Light
                 </el-radio-button>
                 <el-radio-button value="dark">
-                  <el-icon><Moon /></el-icon> 深色
+                  <el-icon><Moon /></el-icon> Dark
                 </el-radio-button>
                 <el-radio-button value="system">
-                  <el-icon><Monitor /></el-icon> 跟随系统
+                  <el-icon><Monitor /></el-icon> System
                 </el-radio-button>
               </el-radio-group>
             </el-form-item>
             
-            <el-form-item label="字体大小">
+            <el-form-item label="Font Size">
               <el-slider
                 v-model="settings.fontSize"
                 :min="12"
                 :max="20"
                 :step="1"
-                :marks="{ 12: '小', 14: '默认', 18: '大' }"
+                :marks="{ 12: 'Small', 14: 'Default', 18: 'Large' }"
                 style="width: 200px"
               />
             </el-form-item>
@@ -51,33 +51,33 @@
         <el-divider />
         
         <div class="settings-section">
-          <h3>聊天设置</h3>
+          <h3>Chat Settings</h3>
           
-          <el-form label-position="left" label-width="120px">
-            <el-form-item label="Enter 发送">
+          <el-form label-position="left" label-width="140px">
+            <el-form-item label="Send on Enter">
               <el-switch v-model="settings.sendOnEnter" />
-              <span class="setting-hint">按 Enter 发送消息，Shift+Enter 换行</span>
+              <span class="setting-hint">Press Enter to send, Shift+Enter for new line</span>
             </el-form-item>
             
-            <el-form-item label="显示时间戳">
+            <el-form-item label="Show Timestamps">
               <el-switch v-model="settings.showTimestamps" />
             </el-form-item>
             
-            <el-form-item label="紧凑模式">
+            <el-form-item label="Compact Mode">
               <el-switch v-model="settings.compactMode" />
-              <span class="setting-hint">减少消息间距</span>
+              <span class="setting-hint">Reduce message spacing</span>
             </el-form-item>
           </el-form>
         </div>
       </el-tab-pane>
       
       <!-- Model Settings -->
-      <el-tab-pane label="模型" name="model">
+      <el-tab-pane label="Model" name="model">
         <div class="settings-section">
-          <h3>模型配置</h3>
+          <h3>Model Configuration</h3>
           
-          <el-form label-position="left" label-width="120px">
-            <el-form-item label="默认模型">
+          <el-form label-position="left" label-width="140px">
+            <el-form-item label="Default Model">
               <el-select v-model="settings.defaultModel" style="width: 200px">
                 <el-option label="DKI Default" value="dki-default" />
                 <el-option label="GPT-4" value="gpt-4" />
@@ -86,19 +86,19 @@
               </el-select>
             </el-form-item>
             
-            <el-form-item label="温度">
+            <el-form-item label="Temperature">
               <el-slider
                 v-model="settings.temperature"
                 :min="0"
                 :max="2"
                 :step="0.1"
-                :marks="{ 0: '精确', 0.7: '平衡', 2: '创意' }"
+                :marks="{ 0: 'Precise', 0.7: 'Balanced', 2: 'Creative' }"
                 style="width: 300px"
               />
               <span class="setting-value">{{ settings.temperature }}</span>
             </el-form-item>
             
-            <el-form-item label="最大 Tokens">
+            <el-form-item label="Max Tokens">
               <el-input-number
                 v-model="settings.maxTokens"
                 :min="256"
@@ -124,7 +124,7 @@
       <!-- DKI Settings -->
       <el-tab-pane label="DKI" name="dki">
         <div class="settings-section">
-          <h3>DKI 注入设置</h3>
+          <h3>DKI Injection Settings</h3>
           
           <el-alert
             type="info"
@@ -132,42 +132,42 @@
             show-icon
             style="margin-bottom: 20px"
           >
-            DKI (Dynamic KV Injection) 通过注入用户偏好和会话历史来增强模型响应的个性化程度。
+            DKI (Dynamic KV Injection) enhances model response personalization by injecting user preferences and conversation history.
           </el-alert>
           
-          <el-form label-position="left" label-width="140px">
-            <el-form-item label="启用 DKI">
+          <el-form label-position="left" label-width="160px">
+            <el-form-item label="Enable DKI">
               <el-switch v-model="settings.dkiEnabled" />
-              <span class="setting-hint">启用动态 K/V 注入</span>
+              <span class="setting-hint">Enable dynamic K/V injection</span>
             </el-form-item>
             
-            <el-form-item label="默认 Alpha">
+            <el-form-item label="Default Alpha">
               <el-slider
                 v-model="settings.dkiDefaultAlpha"
                 :min="0"
                 :max="1"
                 :step="0.05"
-                :marks="{ 0: '无影响', 0.3: '推荐', 1: '最大' }"
+                :marks="{ 0: 'None', 0.3: 'Recommended', 1: 'Max' }"
                 style="width: 300px"
                 :disabled="!settings.dkiEnabled"
               />
               <span class="setting-value">{{ settings.dkiDefaultAlpha }}</span>
             </el-form-item>
             
-            <el-form-item label="混合注入">
+            <el-form-item label="Hybrid Injection">
               <el-switch
                 v-model="settings.dkiUseHybrid"
                 :disabled="!settings.dkiEnabled"
               />
-              <span class="setting-hint">使用偏好 K/V 注入 + 历史后缀提示词</span>
+              <span class="setting-hint">Use preference K/V injection + history suffix prompting</span>
             </el-form-item>
             
-            <el-form-item label="调试模式">
+            <el-form-item label="Debug Mode">
               <el-switch
                 v-model="settings.dkiDebugMode"
                 :disabled="!settings.dkiEnabled"
               />
-              <span class="setting-hint">显示 DKI 注入详情和元数据</span>
+              <span class="setting-hint">Show DKI injection details and metadata</span>
             </el-form-item>
           </el-form>
         </div>
@@ -175,17 +175,17 @@
         <el-divider />
         
         <div class="settings-section">
-          <h3>注入策略说明</h3>
+          <h3>Injection Strategy Details</h3>
           
           <el-descriptions :column="1" border size="small">
-            <el-descriptions-item label="偏好注入">
-              K/V 注入（负位置），50-200 tokens，可缓存
+            <el-descriptions-item label="Preference Injection">
+              K/V injection (negative positions), 50-200 tokens, cacheable
             </el-descriptions-item>
-            <el-descriptions-item label="历史注入">
-              后缀提示词（正位置），100-4000 tokens，动态
+            <el-descriptions-item label="History Injection">
+              Suffix prompting (positive positions), 100-4000 tokens, dynamic
             </el-descriptions-item>
-            <el-descriptions-item label="Alpha 值">
-              控制注入强度，0 = 无影响，1 = 最大影响
+            <el-descriptions-item label="Alpha Value">
+              Controls injection strength, 0 = no effect, 1 = maximum effect
             </el-descriptions-item>
           </el-descriptions>
         </div>
@@ -194,10 +194,10 @@
       <!-- API Settings -->
       <el-tab-pane label="API" name="api">
         <div class="settings-section">
-          <h3>API 配置</h3>
+          <h3>API Configuration</h3>
           
-          <el-form label-position="left" label-width="120px">
-            <el-form-item label="API 地址">
+          <el-form label-position="left" label-width="140px">
+            <el-form-item label="API URL">
               <el-input
                 v-model="settings.apiBaseUrl"
                 placeholder="http://localhost:8080/api"
@@ -209,20 +209,20 @@
               <el-input
                 v-model="settings.apiKey"
                 type="password"
-                placeholder="可选"
+                placeholder="Optional"
                 show-password
                 style="width: 300px"
               />
             </el-form-item>
             
-            <el-form-item label="超时时间">
+            <el-form-item label="Timeout">
               <el-input-number
                 v-model="settings.apiTimeout"
                 :min="5000"
                 :max="120000"
                 :step="1000"
               />
-              <span class="setting-hint">毫秒</span>
+              <span class="setting-hint">milliseconds</span>
             </el-form-item>
           </el-form>
         </div>
@@ -230,14 +230,14 @@
         <el-divider />
         
         <div class="settings-section">
-          <h3>连接测试</h3>
+          <h3>Connection Test</h3>
           
           <el-button
             type="primary"
             :loading="testing"
             @click="testConnection"
           >
-            测试连接
+            Test Connection
           </el-button>
           
           <el-tag
@@ -245,37 +245,37 @@
             :type="connectionStatus === 'success' ? 'success' : 'danger'"
             style="margin-left: 12px"
           >
-            {{ connectionStatus === 'success' ? '连接成功' : '连接失败' }}
+            {{ connectionStatus === 'success' ? 'Connected' : 'Connection Failed' }}
           </el-tag>
         </div>
       </el-tab-pane>
       
       <!-- About -->
-      <el-tab-pane label="关于" name="about">
+      <el-tab-pane label="About" name="about">
         <div class="settings-section about-section">
           <div class="about-logo">
             <img src="/logo.svg" alt="DKI" />
           </div>
           
           <h2>DKI Chat</h2>
-          <p class="version">版本 1.0.0</p>
+          <p class="version">Version 1.0.0</p>
           
           <p class="description">
-            Dynamic KV Injection (DKI) 是一种注意力级记忆增强技术，
-            通过动态注入用户偏好和会话历史来提供个性化的 AI 对话体验。
+            Dynamic KV Injection (DKI) is an attention-level memory augmentation technique
+            that provides personalized AI conversation experiences by dynamically injecting user preferences and conversation history.
           </p>
           
           <el-divider />
           
           <div class="about-links">
             <el-link type="primary" :underline="false">
-              <el-icon><Document /></el-icon> 文档
+              <el-icon><Document /></el-icon> Documentation
             </el-link>
             <el-link type="primary" :underline="false">
               <el-icon><Link /></el-icon> GitHub
             </el-link>
             <el-link type="primary" :underline="false">
-              <el-icon><ChatDotRound /></el-icon> 反馈
+              <el-icon><ChatDotRound /></el-icon> Feedback
             </el-link>
           </div>
           
@@ -289,9 +289,9 @@
     </el-tabs>
     
     <template #footer>
-      <el-button @click="handleReset">恢复默认</el-button>
-      <el-button @click="$emit('update:modelValue', false)">取消</el-button>
-      <el-button type="primary" @click="handleSave">保存</el-button>
+      <el-button @click="handleReset">Reset Defaults</el-button>
+      <el-button @click="$emit('update:modelValue', false)">Cancel</el-button>
+      <el-button type="primary" @click="handleSave">Save</el-button>
     </template>
   </el-dialog>
 </template>
@@ -379,24 +379,24 @@ async function testConnection() {
   try {
     await api.health.check()
     connectionStatus.value = 'success'
-    ElMessage.success('连接成功')
+    ElMessage.success('Connection successful')
   } catch {
     connectionStatus.value = 'error'
-    ElMessage.error('连接失败')
+    ElMessage.error('Connection failed')
   } finally {
     testing.value = false
   }
 }
 
 async function handleReset() {
-  await ElMessageBox.confirm('确定要恢复所有设置为默认值吗？', '恢复默认', {
+  await ElMessageBox.confirm('Are you sure you want to reset all settings to defaults?', 'Reset Defaults', {
     type: 'warning',
-    confirmButtonText: '确定',
-    cancelButtonText: '取消',
+    confirmButtonText: 'OK',
+    cancelButtonText: 'Cancel',
   })
   
   settingsStore.resetToDefaults()
-  ElMessage.success('已恢复默认设置')
+  ElMessage.success('Settings restored to defaults')
 }
 
 function handleSave() {
@@ -429,7 +429,7 @@ function handleSave() {
     timeout: settings.apiTimeout,
   })
   
-  ElMessage.success('设置已保存')
+  ElMessage.success('Settings saved')
   emit('update:modelValue', false)
 }
 </script>

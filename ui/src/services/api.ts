@@ -269,6 +269,7 @@ export const api = {
     },
 
     // Visualization
+    // User isolation is handled server-side via Bearer token (auth interceptor)
     visualization: {
         async getLatest(): Promise<any> {
             return http.get("/v1/dki/visualization/latest");
@@ -284,12 +285,19 @@ export const api = {
             page_size: number;
         }> {
             return http.get("/v1/dki/visualization/history", {
-                params: { page, page_size: pageSize },
+                params: {
+                    page,
+                    page_size: pageSize,
+                },
             });
         },
 
         async getDetail(requestId: string): Promise<any> {
             return http.get(`/v1/dki/visualization/detail/${requestId}`);
+        },
+
+        async getDetailWithFC(requestId: string): Promise<any> {
+            return http.get(`/v1/dki/visualization/detail-with-fc/${requestId}`);
         },
 
         async getFlowDiagram(): Promise<any> {
@@ -298,6 +306,35 @@ export const api = {
 
         async clearHistory(): Promise<{ message: string; success: boolean }> {
             return http.delete("/v1/dki/visualization/history");
+        },
+
+        // Function Call 日志 API (v3.2)
+        async getFunctionCalls(
+            sessionId: string,
+            includePrompts: boolean = false,
+            limit: number = 100
+        ): Promise<{
+            session_id: string;
+            function_calls: any[];
+            total: number;
+            include_prompts: boolean;
+        }> {
+            return http.get(`/v1/dki/visualization/function-calls/${sessionId}`, {
+                params: { include_prompts: includePrompts, limit },
+            });
+        },
+
+        async getFunctionCallStats(sessionId: string): Promise<{
+            session_id: string;
+            stats: {
+                total: number;
+                success: number;
+                error: number;
+                budget_exceeded: number;
+                success_rate: number;
+            };
+        }> {
+            return http.get(`/v1/dki/visualization/function-calls/${sessionId}/stats`);
         },
     },
 };

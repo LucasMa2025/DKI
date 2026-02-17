@@ -3,16 +3,16 @@
     <!-- Chat Header -->
     <header class="chat-header">
       <div class="header-left">
-        <h2 class="session-title">{{ currentSession?.title || '新对话' }}</h2>
+        <h2 class="session-title">{{ currentSession?.title || 'New Chat' }}</h2>
         <el-tag v-if="settingsStore.dkiEnabled" type="success" size="small">
-          DKI 已启用
+          DKI Enabled
         </el-tag>
       </div>
       <div class="header-right">
-        <el-tooltip content="DKI 调试信息" v-if="settingsStore.dkiDebugMode">
+        <el-tooltip content="DKI Debug Info" v-if="settingsStore.dkiDebugMode">
           <el-button :icon="InfoFilled" text @click="showDebugPanel = !showDebugPanel" />
         </el-tooltip>
-        <el-tooltip content="清空对话">
+        <el-tooltip content="Clear Chat">
           <el-button :icon="Delete" text @click="handleClearChat" />
         </el-tooltip>
       </div>
@@ -23,8 +23,8 @@
       <!-- Empty state -->
       <div v-if="messages.length === 0" class="empty-state">
         <img src="/logo.svg" alt="DKI" class="empty-logo" />
-        <h3>开始新对话</h3>
-        <p>输入您的问题，DKI 将根据您的偏好和历史提供个性化回答</p>
+        <h3>Start a New Chat</h3>
+        <p>Ask your questions, DKI will provide personalized answers based on your preferences and history</p>
         <div class="quick-prompts">
           <el-button
             v-for="prompt in quickPrompts"
@@ -109,7 +109,7 @@
           type="textarea"
           :rows="1"
           :autosize="{ minRows: 1, maxRows: 6 }"
-          placeholder="输入消息... (Enter 发送, Shift+Enter 换行)"
+          placeholder="Type a message... (Enter to send, Shift+Enter for new line)"
           resize="none"
           @keydown="handleKeydown"
         />
@@ -123,8 +123,8 @@
       </div>
       <div class="input-footer">
         <span class="input-hint">
-          DKI {{ settingsStore.dkiEnabled ? '已启用' : '已禁用' }} · 
-          {{ settingsStore.dkiUseHybrid ? '混合注入' : '标准注入' }}
+          DKI {{ settingsStore.dkiEnabled ? 'Enabled' : 'Disabled' }} · 
+          {{ settingsStore.dkiUseHybrid ? 'Hybrid Injection' : 'Standard Injection' }}
         </span>
       </div>
     </div>
@@ -132,73 +132,73 @@
     <!-- Debug Panel -->
     <el-drawer
       v-model="showDebugPanel"
-      title="DKI 调试信息"
+      title="DKI Debug Info"
       direction="rtl"
       size="400px"
     >
       <div class="debug-panel">
         <el-descriptions :column="1" border>
-          <el-descriptions-item label="DKI 状态">
+          <el-descriptions-item label="DKI Status">
             <el-tag :type="settingsStore.dkiEnabled ? 'success' : 'danger'">
-              {{ settingsStore.dkiEnabled ? '已启用' : '已禁用' }}
+              {{ settingsStore.dkiEnabled ? 'Enabled' : 'Disabled' }}
             </el-tag>
           </el-descriptions-item>
-          <el-descriptions-item label="注入模式">
-            {{ settingsStore.dkiUseHybrid ? '混合注入' : '标准注入' }}
+          <el-descriptions-item label="Injection Mode">
+            {{ settingsStore.dkiUseHybrid ? 'Hybrid Injection' : 'Standard Injection' }}
           </el-descriptions-item>
-          <el-descriptions-item label="默认 Alpha">
+          <el-descriptions-item label="Default Alpha">
             {{ settingsStore.dkiDefaultAlpha }}
           </el-descriptions-item>
-          <el-descriptions-item label="当前会话">
-            {{ currentSession?.id || '无' }}
+          <el-descriptions-item label="Current Session">
+            {{ currentSession?.id || 'None' }}
           </el-descriptions-item>
-          <el-descriptions-item label="消息数量">
+          <el-descriptions-item label="Message Count">
             {{ messages.length }}
           </el-descriptions-item>
         </el-descriptions>
         
-        <h4>最近注入详情</h4>
+        <h4>Latest Injection Details</h4>
         <div v-if="lastDkiMetadata" class="last-injection">
           <el-descriptions :column="1" border size="small">
-            <el-descriptions-item label="注入启用">
-              {{ lastDkiMetadata.injectionEnabled ? '是' : '否' }}
+            <el-descriptions-item label="Injection Enabled">
+              {{ lastDkiMetadata.injectionEnabled ? 'Yes' : 'No' }}
             </el-descriptions-item>
-            <el-descriptions-item label="Alpha 值">
+            <el-descriptions-item label="Alpha Value">
               {{ lastDkiMetadata.alpha?.toFixed(4) }}
             </el-descriptions-item>
-            <el-descriptions-item label="偏好 Tokens">
+            <el-descriptions-item label="Preference Tokens">
               {{ lastDkiMetadata.preferenceTokens }}
             </el-descriptions-item>
-            <el-descriptions-item label="历史 Tokens">
+            <el-descriptions-item label="History Tokens">
               {{ lastDkiMetadata.historyTokens }}
             </el-descriptions-item>
-            <el-descriptions-item label="缓存层级">
+            <el-descriptions-item label="Cache Tier">
               {{ lastDkiMetadata.cacheTier || 'N/A' }}
             </el-descriptions-item>
-            <el-descriptions-item label="延迟">
+            <el-descriptions-item label="Latency">
               {{ lastDkiMetadata.latencyMs }}ms
             </el-descriptions-item>
           </el-descriptions>
           
           <div v-if="lastDkiMetadata.gatingDecision" class="gating-info">
-            <h5>门控决策</h5>
+            <h5>Gating Decision</h5>
             <el-descriptions :column="1" border size="small">
-              <el-descriptions-item label="是否注入">
-                {{ lastDkiMetadata.gatingDecision.shouldInject ? '是' : '否' }}
+              <el-descriptions-item label="Should Inject">
+                {{ lastDkiMetadata.gatingDecision.shouldInject ? 'Yes' : 'No' }}
               </el-descriptions-item>
-              <el-descriptions-item label="相关性分数">
+              <el-descriptions-item label="Relevance Score">
                 {{ lastDkiMetadata.gatingDecision.relevanceScore?.toFixed(4) }}
               </el-descriptions-item>
-              <el-descriptions-item label="熵值">
+              <el-descriptions-item label="Entropy">
                 {{ lastDkiMetadata.gatingDecision.entropy?.toFixed(4) }}
               </el-descriptions-item>
-              <el-descriptions-item label="决策原因">
+              <el-descriptions-item label="Reasoning">
                 {{ lastDkiMetadata.gatingDecision.reasoning }}
               </el-descriptions-item>
             </el-descriptions>
           </div>
         </div>
-        <el-empty v-else description="暂无注入数据" />
+        <el-empty v-else description="No injection data yet" />
       </div>
     </el-drawer>
   </div>
@@ -235,10 +235,10 @@ const lastDkiMetadata = computed(() => {
 })
 
 const quickPrompts = [
-  '介绍一下 DKI 系统的工作原理',
-  '如何优化我的用户偏好设置？',
-  '解释混合注入策略的优势',
-  '帮我分析一段代码',
+  'Explain how the DKI system works',
+  'How can I optimize my user preferences?',
+  'Explain the advantages of hybrid injection strategy',
+  'Help me analyze a piece of code',
 ]
 
 function formatTime(timestamp: string) {
@@ -278,10 +278,10 @@ function handleQuickPrompt(prompt: string) {
 async function handleClearChat() {
   if (messages.value.length === 0) return
   
-  await ElMessageBox.confirm('确定要清空当前对话吗？', '清空对话', {
+  await ElMessageBox.confirm('Are you sure you want to clear the current chat?', 'Clear Chat', {
     type: 'warning',
-    confirmButtonText: '清空',
-    cancelButtonText: '取消',
+    confirmButtonText: 'Clear',
+    cancelButtonText: 'Cancel',
   })
   
   chatStore.clearMessages()

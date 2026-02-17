@@ -21,7 +21,7 @@ export const useAuthStore = defineStore('auth', () => {
       user.value = response.user
       return true
     } catch (e) {
-      error.value = e instanceof Error ? e.message : '登录失败'
+      error.value = e instanceof Error ? e.message : 'Login failed'
       return false
     } finally {
       loading.value = false

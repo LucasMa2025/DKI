@@ -3,11 +3,11 @@
     <!-- Header -->
     <header class="page-header">
       <div class="header-content">
-        <h1>偏好设置</h1>
-        <p>管理您的个性化偏好，DKI 将根据这些偏好为您提供定制化的回答</p>
+        <h1>Preferences</h1>
+        <p>Manage your personalized preferences. DKI will use them to provide customized responses.</p>
       </div>
       <el-button type="primary" :icon="Plus" @click="showCreateDialog = true">
-        添加偏好
+        Add Preference
       </el-button>
     </header>
     
@@ -19,7 +19,7 @@
         </div>
         <div class="stat-info">
           <span class="stat-value">{{ preferences.length }}</span>
-          <span class="stat-label">总偏好数</span>
+          <span class="stat-label">Total Preferences</span>
         </div>
       </div>
       <div class="stat-card">
@@ -28,7 +28,7 @@
         </div>
         <div class="stat-info">
           <span class="stat-value">{{ activePreferences.length }}</span>
-          <span class="stat-label">已启用</span>
+          <span class="stat-label">Enabled</span>
         </div>
       </div>
       <div class="stat-card">
@@ -37,14 +37,14 @@
         </div>
         <div class="stat-info">
           <span class="stat-value">{{ Object.keys(preferencesByCategory).length }}</span>
-          <span class="stat-label">分类数</span>
+          <span class="stat-label">Categories</span>
         </div>
       </div>
     </div>
     
     <!-- Category Tabs -->
     <el-tabs v-model="activeCategory" class="category-tabs">
-      <el-tab-pane label="全部" name="all" />
+      <el-tab-pane label="All" name="all" />
       <el-tab-pane
         v-for="(prefs, category) in preferencesByCategory"
         :key="category"
@@ -55,8 +55,8 @@
     
     <!-- Preferences List -->
     <div class="preferences-list" v-loading="loading">
-      <el-empty v-if="filteredPreferences.length === 0" description="暂无偏好设置">
-        <el-button type="primary" @click="showCreateDialog = true">添加偏好</el-button>
+      <el-empty v-if="filteredPreferences.length === 0" description="No preferences set">
+        <el-button type="primary" @click="showCreateDialog = true">Add Preference</el-button>
       </el-empty>
       
       <div
@@ -85,13 +85,13 @@
               <template #dropdown>
                 <el-dropdown-menu>
                   <el-dropdown-item command="edit">
-                    <el-icon><Edit /></el-icon>编辑
+                    <el-icon><Edit /></el-icon>Edit
                   </el-dropdown-item>
                   <el-dropdown-item command="duplicate">
-                    <el-icon><CopyDocument /></el-icon>复制
+                    <el-icon><CopyDocument /></el-icon>Duplicate
                   </el-dropdown-item>
                   <el-dropdown-item command="delete" divided>
-                    <el-icon><Delete /></el-icon>删除
+                    <el-icon><Delete /></el-icon>Delete
                   </el-dropdown-item>
                 </el-dropdown-menu>
               </template>
@@ -105,10 +105,10 @@
         
         <div class="pref-footer">
           <span class="pref-priority">
-            优先级: {{ pref.priority }}
+            Priority: {{ pref.priority }}
           </span>
           <span class="pref-date" v-if="pref.updatedAt">
-            更新于 {{ formatDate(pref.updatedAt) }}
+            Updated {{ formatDate(pref.updatedAt) }}
           </span>
         </div>
       </div>
@@ -117,7 +117,7 @@
     <!-- Create/Edit Dialog -->
     <el-dialog
       v-model="showCreateDialog"
-      :title="editingPref ? '编辑偏好' : '添加偏好'"
+      :title="editingPref ? 'Edit Preference' : 'Add Preference'"
       width="600px"
       :close-on-click-modal="false"
       @close="resetForm"
@@ -128,21 +128,21 @@
         :rules="rules"
         label-position="top"
       >
-        <el-form-item label="偏好类型" prop="preferenceType">
-          <el-select v-model="form.preferenceType" placeholder="选择类型" style="width: 100%">
-            <el-option label="通用偏好" value="general" />
-            <el-option label="语言风格" value="style" />
-            <el-option label="技术偏好" value="technical" />
-            <el-option label="格式偏好" value="format" />
-            <el-option label="领域知识" value="domain" />
-            <el-option label="其他" value="other" />
+        <el-form-item label="Preference Type" prop="preferenceType">
+          <el-select v-model="form.preferenceType" placeholder="Select type" style="width: 100%">
+            <el-option label="General" value="general" />
+            <el-option label="Language Style" value="style" />
+            <el-option label="Technical" value="technical" />
+            <el-option label="Format" value="format" />
+            <el-option label="Domain Knowledge" value="domain" />
+            <el-option label="Other" value="other" />
           </el-select>
         </el-form-item>
         
-        <el-form-item label="分类" prop="category">
+        <el-form-item label="Category" prop="category">
           <el-select
             v-model="form.category"
-            placeholder="选择或输入分类"
+            placeholder="Select or enter category"
             filterable
             allow-create
             style="width: 100%"
@@ -156,18 +156,18 @@
           </el-select>
         </el-form-item>
         
-        <el-form-item label="偏好内容" prop="preferenceText">
+        <el-form-item label="Preference Content" prop="preferenceText">
           <el-input
             v-model="form.preferenceText"
             type="textarea"
             :rows="4"
-            placeholder="描述您的偏好，例如：我喜欢简洁的代码风格，偏好使用 TypeScript"
+            placeholder="Describe your preference, e.g.: I prefer concise code style, favor TypeScript"
             maxlength="500"
             show-word-limit
           />
         </el-form-item>
         
-        <el-form-item label="优先级" prop="priority">
+        <el-form-item label="Priority" prop="priority">
           <el-slider
             v-model="form.priority"
             :min="0"
@@ -178,15 +178,15 @@
           />
         </el-form-item>
         
-        <el-form-item label="状态">
-          <el-switch v-model="form.isActive" active-text="启用" inactive-text="禁用" />
+        <el-form-item label="Status">
+          <el-switch v-model="form.isActive" active-text="Enabled" inactive-text="Disabled" />
         </el-form-item>
       </el-form>
       
       <template #footer>
-        <el-button @click="showCreateDialog = false">取消</el-button>
+        <el-button @click="showCreateDialog = false">Cancel</el-button>
         <el-button type="primary" :loading="saving" @click="handleSave">
-          {{ editingPref ? '保存' : '添加' }}
+          {{ editingPref ? 'Save' : 'Add' }}
         </el-button>
       </template>
     </el-dialog>
@@ -228,18 +228,18 @@ const form = reactive({
 
 const rules: FormRules = {
   preferenceType: [
-    { required: true, message: '请选择偏好类型', trigger: 'change' },
+    { required: true, message: 'Please select preference type', trigger: 'change' },
   ],
   preferenceText: [
-    { required: true, message: '请输入偏好内容', trigger: 'blur' },
-    { min: 5, max: 500, message: '偏好内容长度为 5-500 个字符', trigger: 'blur' },
+    { required: true, message: 'Please enter preference content', trigger: 'blur' },
+    { min: 5, max: 500, message: 'Preference content must be 5-500 characters', trigger: 'blur' },
   ],
 }
 
 const priorityMarks = {
-  0: '低',
-  5: '中',
-  10: '高',
+  0: 'Low',
+  5: 'Med',
+  10: 'High',
 }
 
 const loading = computed(() => preferencesStore.loading)
@@ -248,7 +248,7 @@ const activePreferences = computed(() => preferencesStore.activePreferences)
 const preferencesByCategory = computed(() => preferencesStore.preferencesByCategory)
 
 const existingCategories = computed(() => {
-  return Object.keys(preferencesByCategory.value).filter(c => c !== '未分类')
+  return Object.keys(preferencesByCategory.value).filter(c => c !== 'Uncategorized')
 })
 
 const filteredPreferences = computed(() => {
@@ -286,7 +286,7 @@ function resetForm() {
 
 async function handleToggle(pref: UserPreference) {
   await preferencesStore.updatePreference(pref.id!, { isActive: pref.isActive })
-  ElMessage.success(pref.isActive ? '偏好已启用' : '偏好已禁用')
+  ElMessage.success(pref.isActive ? 'Preference enabled' : 'Preference disabled')
 }
 
 function handleCommand(command: string, pref: UserPreference) {
@@ -311,15 +311,15 @@ function handleCommand(command: string, pref: UserPreference) {
 }
 
 async function handleDelete(pref: UserPreference) {
-  await ElMessageBox.confirm('确定要删除这个偏好吗？', '删除偏好', {
+  await ElMessageBox.confirm('Are you sure you want to delete this preference?', 'Delete Preference', {
     type: 'warning',
-    confirmButtonText: '删除',
-    cancelButtonText: '取消',
+    confirmButtonText: 'Delete',
+    cancelButtonText: 'Cancel',
   })
   
   const success = await preferencesStore.deletePreference(pref.id!)
   if (success) {
-    ElMessage.success('偏好已删除')
+    ElMessage.success('Preference deleted')
   }
 }
 
@@ -340,7 +340,7 @@ async function handleSave() {
           priority: form.priority,
           isActive: form.isActive,
         })
-        ElMessage.success('偏好已更新')
+        ElMessage.success('Preference updated')
       } else {
         await preferencesStore.createPreference({
           preferenceType: form.preferenceType,
@@ -349,7 +349,7 @@ async function handleSave() {
           priority: form.priority,
           isActive: form.isActive,
         })
-        ElMessage.success('偏好已添加')
+        ElMessage.success('Preference added')
       }
       
       showCreateDialog.value = false

@@ -17,15 +17,15 @@
           <div class="brand-features">
             <div class="feature-item">
               <el-icon><Lightning /></el-icon>
-              <span>注意力级记忆增强</span>
+              <span>Attention-Level Memory Enhancement</span>
             </div>
             <div class="feature-item">
               <el-icon><User /></el-icon>
-              <span>个性化用户偏好</span>
+              <span>Personalized User Preferences</span>
             </div>
             <div class="feature-item">
               <el-icon><Connection /></el-icon>
-              <span>会话历史智能注入</span>
+              <span>Smart History Injection</span>
             </div>
           </div>
         </div>
@@ -34,8 +34,8 @@
       <!-- Right side - Login form -->
       <div class="form-section">
         <div class="form-container">
-          <h2 class="form-title">欢迎回来</h2>
-          <p class="form-subtitle">登录您的账户以继续</p>
+          <h2 class="form-title">Welcome Back</h2>
+          <p class="form-subtitle">Sign in to your account to continue</p>
           
           <el-form
             ref="formRef"
@@ -47,7 +47,7 @@
             <el-form-item prop="username">
               <el-input
                 v-model="form.username"
-                placeholder="用户名"
+                placeholder="Username"
                 size="large"
                 :prefix-icon="User"
               />
@@ -57,7 +57,7 @@
               <el-input
                 v-model="form.password"
                 type="password"
-                placeholder="密码"
+                placeholder="Password"
                 size="large"
                 :prefix-icon="Lock"
                 show-password
@@ -66,8 +66,8 @@
             </el-form-item>
             
             <div class="form-options">
-              <el-checkbox v-model="form.remember">记住我</el-checkbox>
-              <el-link type="primary" :underline="false">忘记密码？</el-link>
+              <el-checkbox v-model="form.remember">Remember me</el-checkbox>
+              <el-link type="primary" :underline="false">Forgot password?</el-link>
             </div>
             
             <el-form-item>
@@ -78,28 +78,28 @@
                 :loading="loading"
                 @click="handleLogin"
               >
-                登录
+                Sign In
               </el-button>
             </el-form-item>
           </el-form>
           
           <div class="form-footer">
-            <span>还没有账户？</span>
+            <span>Don't have an account?</span>
             <el-link type="primary" :underline="false" @click="showRegister = true">
-              立即注册
+              Register Now
             </el-link>
           </div>
           
           <!-- Demo login hint -->
           <div class="demo-hint">
             <el-alert
-              title="演示模式"
+              title="Demo Mode"
               type="info"
               :closable="false"
               show-icon
             >
               <template #default>
-                使用任意用户名和密码登录（演示模式）
+                Use any username and password to log in (demo mode)
               </template>
             </el-alert>
           </div>
@@ -110,7 +110,7 @@
     <!-- Register Dialog -->
     <el-dialog
       v-model="showRegister"
-      title="创建账户"
+      title="Create Account"
       width="400px"
       :close-on-click-modal="false"
     >
@@ -120,33 +120,33 @@
         :rules="registerRules"
         label-position="top"
       >
-        <el-form-item label="用户名" prop="username">
-          <el-input v-model="registerForm.username" placeholder="请输入用户名" />
+        <el-form-item label="Username" prop="username">
+          <el-input v-model="registerForm.username" placeholder="Enter username" />
         </el-form-item>
-        <el-form-item label="邮箱" prop="email">
-          <el-input v-model="registerForm.email" placeholder="请输入邮箱（可选）" />
+        <el-form-item label="Email" prop="email">
+          <el-input v-model="registerForm.email" placeholder="Enter email (optional)" />
         </el-form-item>
-        <el-form-item label="密码" prop="password">
+        <el-form-item label="Password" prop="password">
           <el-input
             v-model="registerForm.password"
             type="password"
-            placeholder="请输入密码"
+            placeholder="Enter password"
             show-password
           />
         </el-form-item>
-        <el-form-item label="确认密码" prop="confirmPassword">
+        <el-form-item label="Confirm Password" prop="confirmPassword">
           <el-input
             v-model="registerForm.confirmPassword"
             type="password"
-            placeholder="请再次输入密码"
+            placeholder="Re-enter password"
             show-password
           />
         </el-form-item>
       </el-form>
       <template #footer>
-        <el-button @click="showRegister = false">取消</el-button>
+        <el-button @click="showRegister = false">Cancel</el-button>
         <el-button type="primary" :loading="registerLoading" @click="handleRegister">
-          注册
+          Register
         </el-button>
       </template>
     </el-dialog>
@@ -185,33 +185,33 @@ const registerForm = reactive({
 
 const rules: FormRules = {
   username: [
-    { required: true, message: '请输入用户名', trigger: 'blur' },
-    { min: 2, max: 20, message: '用户名长度为 2-20 个字符', trigger: 'blur' },
+    { required: true, message: 'Please enter username', trigger: 'blur' },
+    { min: 2, max: 20, message: 'Username must be 2-20 characters', trigger: 'blur' },
   ],
   password: [
-    { required: true, message: '请输入密码', trigger: 'blur' },
-    { min: 4, max: 50, message: '密码长度为 4-50 个字符', trigger: 'blur' },
+    { required: true, message: 'Please enter password', trigger: 'blur' },
+    { min: 4, max: 50, message: 'Password must be 4-50 characters', trigger: 'blur' },
   ],
 }
 
 const registerRules: FormRules = {
   username: [
-    { required: true, message: '请输入用户名', trigger: 'blur' },
-    { min: 2, max: 20, message: '用户名长度为 2-20 个字符', trigger: 'blur' },
+    { required: true, message: 'Please enter username', trigger: 'blur' },
+    { min: 2, max: 20, message: 'Username must be 2-20 characters', trigger: 'blur' },
   ],
   email: [
-    { type: 'email', message: '请输入有效的邮箱地址', trigger: 'blur' },
+    { type: 'email', message: 'Please enter a valid email address', trigger: 'blur' },
   ],
   password: [
-    { required: true, message: '请输入密码', trigger: 'blur' },
-    { min: 6, max: 50, message: '密码长度为 6-50 个字符', trigger: 'blur' },
+    { required: true, message: 'Please enter password', trigger: 'blur' },
+    { min: 6, max: 50, message: 'Password must be 6-50 characters', trigger: 'blur' },
   ],
   confirmPassword: [
-    { required: true, message: '请确认密码', trigger: 'blur' },
+    { required: true, message: 'Please confirm password', trigger: 'blur' },
     {
       validator: (_rule, value, callback) => {
         if (value !== registerForm.password) {
-          callback(new Error('两次输入的密码不一致'))
+          callback(new Error('Passwords do not match'))
         } else {
           callback()
         }
@@ -239,7 +239,7 @@ async function handleLogin() {
       })
       
       if (success) {
-        ElMessage.success('登录成功')
+        ElMessage.success('Login successful')
         const redirect = route.query.redirect as string || '/'
         router.push(redirect)
       } else {
@@ -249,7 +249,7 @@ async function handleLogin() {
           username: form.username,
         }
         authStore.token = `demo-token-${Date.now()}`
-        ElMessage.success('登录成功（演示模式）')
+        ElMessage.success('Login successful (demo mode)')
         const redirect = route.query.redirect as string || '/'
         router.push(redirect)
       }
@@ -260,7 +260,7 @@ async function handleLogin() {
         username: form.username,
       }
       authStore.token = `demo-token-${Date.now()}`
-      ElMessage.success('登录成功（演示模式）')
+      ElMessage.success('Login successful (demo mode)')
       const redirect = route.query.redirect as string || '/'
       router.push(redirect)
     } finally {
@@ -279,7 +279,7 @@ async function handleRegister() {
     
     try {
       // Demo mode: just close dialog and show success
-      ElMessage.success('注册成功，请登录')
+      ElMessage.success('Registration successful, please sign in')
       showRegister.value = false
       form.username = registerForm.username
     } finally {

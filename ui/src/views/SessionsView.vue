@@ -3,19 +3,19 @@
     <!-- Header -->
     <header class="page-header">
       <div class="header-content">
-        <h1>会话管理</h1>
-        <p>查看和管理您的所有对话记录</p>
+        <h1>Session Management</h1>
+        <p>View and manage all your conversation records</p>
       </div>
       <div class="header-actions">
         <el-input
           v-model="searchQuery"
-          placeholder="搜索会话..."
+          placeholder="Search sessions..."
           :prefix-icon="Search"
           clearable
           style="width: 240px"
         />
         <el-button type="primary" :icon="Plus" @click="handleNewSession">
-          新建会话
+          New Session
         </el-button>
       </div>
     </header>
@@ -24,15 +24,15 @@
     <div class="stats-row">
       <div class="stat-item">
         <span class="stat-value">{{ sessions.length }}</span>
-        <span class="stat-label">总会话数</span>
+        <span class="stat-label">Total Sessions</span>
       </div>
       <div class="stat-item">
         <span class="stat-value">{{ totalMessages }}</span>
-        <span class="stat-label">总消息数</span>
+        <span class="stat-label">Total Messages</span>
       </div>
       <div class="stat-item">
         <span class="stat-value">{{ todaySessions }}</span>
-        <span class="stat-label">今日会话</span>
+        <span class="stat-label">Today's Sessions</span>
       </div>
     </div>
     
@@ -47,7 +47,7 @@
       >
         <el-table-column type="selection" width="50" />
         
-        <el-table-column label="会话标题" min-width="200">
+        <el-table-column label="Session Title" min-width="200">
           <template #default="{ row }">
             <div class="session-title-cell">
               <el-icon class="session-icon"><ChatDotRound /></el-icon>
@@ -57,49 +57,49 @@
                 type="success"
                 size="small"
               >
-                当前
+                Current
               </el-tag>
             </div>
           </template>
         </el-table-column>
         
-        <el-table-column label="消息数" width="100" align="center">
+        <el-table-column label="Messages" width="100" align="center">
           <template #default="{ row }">
             <span class="message-count">{{ row.messageCount }}</span>
           </template>
         </el-table-column>
         
-        <el-table-column label="预览" min-width="200">
+        <el-table-column label="Preview" min-width="200">
           <template #default="{ row }">
-            <span class="session-preview">{{ row.preview || '暂无内容' }}</span>
+            <span class="session-preview">{{ row.preview || 'No content yet' }}</span>
           </template>
         </el-table-column>
         
-        <el-table-column label="创建时间" width="160">
+        <el-table-column label="Created" width="160">
           <template #default="{ row }">
             {{ formatDate(row.createdAt) }}
           </template>
         </el-table-column>
         
-        <el-table-column label="更新时间" width="160">
+        <el-table-column label="Updated" width="160">
           <template #default="{ row }">
             {{ formatDate(row.updatedAt) }}
           </template>
         </el-table-column>
         
-        <el-table-column label="操作" width="150" fixed="right">
+        <el-table-column label="Actions" width="150" fixed="right">
           <template #default="{ row }">
             <el-button-group>
-              <el-tooltip content="打开">
+              <el-tooltip content="Open">
                 <el-button :icon="View" text @click.stop="handleOpen(row)" />
               </el-tooltip>
-              <el-tooltip content="重命名">
+              <el-tooltip content="Rename">
                 <el-button :icon="Edit" text @click.stop="handleRename(row)" />
               </el-tooltip>
-              <el-tooltip content="导出">
+              <el-tooltip content="Export">
                 <el-button :icon="Download" text @click.stop="handleExport(row)" />
               </el-tooltip>
-              <el-tooltip content="删除">
+              <el-tooltip content="Delete">
                 <el-button :icon="Delete" text type="danger" @click.stop="handleDelete(row)" />
               </el-tooltip>
             </el-button-group>
@@ -123,27 +123,27 @@
     <!-- Session Detail Drawer -->
     <el-drawer
       v-model="showDetail"
-      :title="selectedSession?.title || '会话详情'"
+      :title="selectedSession?.title || 'Session Details'"
       direction="rtl"
       size="500px"
     >
       <div v-if="selectedSession">
         <el-descriptions :column="1" border>
-          <el-descriptions-item label="会话 ID">
+          <el-descriptions-item label="Session ID">
             {{ selectedSession.id }}
           </el-descriptions-item>
-          <el-descriptions-item label="消息数量">
+          <el-descriptions-item label="Message Count">
             {{ selectedSession.messageCount }}
           </el-descriptions-item>
-          <el-descriptions-item label="创建时间">
+          <el-descriptions-item label="Created">
             {{ formatDate(selectedSession.createdAt) }}
           </el-descriptions-item>
-          <el-descriptions-item label="更新时间">
+          <el-descriptions-item label="Updated">
             {{ formatDate(selectedSession.updatedAt) }}
           </el-descriptions-item>
         </el-descriptions>
         
-        <h4>消息预览</h4>
+        <h4>Message Preview</h4>
         <div class="messages-preview" v-loading="loadingMessages">
           <div
             v-for="msg in previewMessages"
@@ -151,19 +151,19 @@
             class="preview-message"
             :class="[`message-${msg.role}`]"
           >
-            <div class="message-role">{{ msg.role === 'user' ? '用户' : '助手' }}</div>
+            <div class="message-role">{{ msg.role === 'user' ? 'User' : 'Assistant' }}</div>
             <div class="message-content">{{ msg.content }}</div>
             <div class="message-time">{{ formatTime(msg.timestamp) }}</div>
           </div>
-          <el-empty v-if="previewMessages.length === 0" description="暂无消息" />
+          <el-empty v-if="previewMessages.length === 0" description="No messages" />
         </div>
       </div>
-      <el-empty v-else description="请选择一个会话" />
+      <el-empty v-else description="Please select a session" />
       
       <template #footer>
-        <el-button @click="showDetail = false">关闭</el-button>
+        <el-button @click="showDetail = false">Close</el-button>
         <el-button type="primary" @click="handleOpenFromDetail" :disabled="!selectedSession">
-          打开会话
+          Open Session
         </el-button>
       </template>
     </el-drawer>
@@ -270,15 +270,15 @@ function handleOpenFromDetail() {
 }
 
 async function handleRename(session: Session) {
-  const { value } = await ElMessageBox.prompt('请输入新名称', '重命名会话', {
+  const { value } = await ElMessageBox.prompt('Enter new name', 'Rename Session', {
     inputValue: session.title,
-    confirmButtonText: '确定',
-    cancelButtonText: '取消',
+    confirmButtonText: 'OK',
+    cancelButtonText: 'Cancel',
   })
   
   if (value) {
     await chatStore.renameSession(session.id, value)
-    ElMessage.success('重命名成功')
+    ElMessage.success('Renamed successfully')
   }
 }
 
@@ -297,22 +297,22 @@ function handleExport(session: Session) {
   a.click()
   URL.revokeObjectURL(url)
   
-  ElMessage.success('导出成功')
+  ElMessage.success('Export successful')
 }
 
 async function handleDelete(session: Session) {
   await ElMessageBox.confirm(
-    `确定要删除会话 "${session.title}" 吗？此操作不可恢复。`,
-    '删除会话',
+    `Are you sure you want to delete session "${session.title}"? This action cannot be undone.`,
+    'Delete Session',
     {
       type: 'warning',
-      confirmButtonText: '删除',
-      cancelButtonText: '取消',
+      confirmButtonText: 'Delete',
+      cancelButtonText: 'Cancel',
     }
   )
   
   await chatStore.deleteSession(session.id)
-  ElMessage.success('会话已删除')
+  ElMessage.success('Session deleted')
 }
 
 onMounted(() => {

@@ -52,25 +52,25 @@
       
       <!-- DKI Metadata -->
       <div v-if="message.dkiMetadata && showMetadata" class="dki-metadata">
-        <el-tooltip content="缓存层级">
+        <el-tooltip content="Cache Tier">
           <el-tag size="small" :type="message.dkiMetadata.cacheHit ? 'success' : 'info'">
             {{ message.dkiMetadata.cacheTier || 'COMPUTE' }}
           </el-tag>
         </el-tooltip>
-        <el-tooltip content="注入强度">
+        <el-tooltip content="Injection Strength">
           <el-tag size="small">α={{ message.dkiMetadata.alpha?.toFixed(2) }}</el-tag>
         </el-tooltip>
-        <el-tooltip content="响应延迟">
+        <el-tooltip content="Response Latency">
           <el-tag size="small">{{ message.dkiMetadata.latencyMs }}ms</el-tag>
         </el-tooltip>
-        <el-tooltip v-if="message.dkiMetadata.preferenceTokens" content="偏好 Tokens">
+        <el-tooltip v-if="message.dkiMetadata.preferenceTokens" content="Preference Tokens">
           <el-tag size="small" type="warning">
-            偏好: {{ message.dkiMetadata.preferenceTokens }}
+            Pref: {{ message.dkiMetadata.preferenceTokens }}
           </el-tag>
         </el-tooltip>
-        <el-tooltip v-if="message.dkiMetadata.historyTokens" content="历史 Tokens">
+        <el-tooltip v-if="message.dkiMetadata.historyTokens" content="History Tokens">
           <el-tag size="small" type="info">
-            历史: {{ message.dkiMetadata.historyTokens }}
+            History: {{ message.dkiMetadata.historyTokens }}
           </el-tag>
         </el-tooltip>
       </div>
@@ -78,10 +78,10 @@
       <!-- Actions -->
       <div class="message-actions" v-if="showActions && !isLoading">
         <el-button-group size="small">
-          <el-tooltip content="复制">
+          <el-tooltip content="Copy">
             <el-button :icon="CopyDocument" text @click="handleCopy" />
           </el-tooltip>
-          <el-tooltip content="重新生成" v-if="message.role === 'assistant'">
+          <el-tooltip content="Regenerate" v-if="message.role === 'assistant'">
             <el-button :icon="Refresh" text @click="$emit('regenerate')" />
           </el-tooltip>
         </el-button-group>
@@ -136,9 +136,9 @@ function formatTime(timestamp: string) {
 async function handleCopy() {
   try {
     await navigator.clipboard.writeText(props.message.content)
-    ElMessage.success('已复制到剪贴板')
+    ElMessage.success('Copied to clipboard')
   } catch {
-    ElMessage.error('复制失败')
+    ElMessage.error('Copy failed')
   }
 }
 </script>

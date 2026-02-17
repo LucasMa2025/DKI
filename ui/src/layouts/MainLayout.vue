@@ -23,7 +23,7 @@
           :icon="Plus"
           @click="handleNewChat"
         >
-          <span v-if="!sidebarCollapsed">新对话</span>
+          <span v-if="!sidebarCollapsed">New Chat</span>
         </el-button>
         
         <!-- Navigation -->
@@ -43,7 +43,7 @@
         <!-- Session List -->
         <div class="session-list" v-if="!sidebarCollapsed">
           <div class="session-list-header">
-            <span>最近对话</span>
+            <span>Recent Chats</span>
           </div>
           <div class="session-items">
             <div
@@ -60,10 +60,10 @@
                 <template #dropdown>
                   <el-dropdown-menu>
                     <el-dropdown-item command="rename">
-                      <el-icon><Edit /></el-icon>重命名
+                      <el-icon><Edit /></el-icon>Rename
                     </el-dropdown-item>
                     <el-dropdown-item command="delete" divided>
-                      <el-icon><Delete /></el-icon>删除
+                      <el-icon><Delete /></el-icon>Delete
                     </el-dropdown-item>
                   </el-dropdown-menu>
                 </template>
@@ -86,14 +86,14 @@
           <template #dropdown>
             <el-dropdown-menu>
               <el-dropdown-item command="settings">
-                <el-icon><Setting /></el-icon>设置
+                <el-icon><Setting /></el-icon>Settings
               </el-dropdown-item>
               <el-dropdown-item command="theme">
                 <el-icon><Moon v-if="theme === 'light'" /><Sunny v-else /></el-icon>
-                {{ theme === 'light' ? '深色模式' : '浅色模式' }}
+                {{ theme === 'light' ? 'Dark Mode' : 'Light Mode' }}
               </el-dropdown-item>
               <el-dropdown-item command="logout" divided>
-                <el-icon><SwitchButton /></el-icon>退出登录
+                <el-icon><SwitchButton /></el-icon>Log Out
               </el-dropdown-item>
             </el-dropdown-menu>
           </template>
@@ -149,11 +149,11 @@ const recentSessions = computed(() => chatStore.sessions.slice(0, 10))
 const currentSessionId = computed(() => chatStore.currentSessionId)
 
 const navItems = [
-  { path: '/', icon: ChatDotRound, label: '聊天' },
-  { path: '/sessions', icon: Document, label: '会话管理' },
-  { path: '/preferences', icon: Setting, label: '偏好设置' },
-  { path: '/visualization', icon: View, label: '注入可视化' },
-  { path: '/stats', icon: DataAnalysis, label: '系统统计' },
+  { path: '/', icon: ChatDotRound, label: 'Chat' },
+  { path: '/sessions', icon: Document, label: 'Sessions' },
+  { path: '/preferences', icon: Setting, label: 'Preferences' },
+  { path: '/visualization', icon: View, label: 'Visualization' },
+  { path: '/stats', icon: DataAnalysis, label: 'Statistics' },
 ]
 
 function isActive(path: string) {
@@ -185,20 +185,20 @@ async function handleSessionCommand(command: string, sessionId: string) {
     const session = chatStore.sessions.find(s => s.id === sessionId)
     if (!session) return
     
-    const { value } = await ElMessageBox.prompt('请输入新名称', '重命名会话', {
+    const { value } = await ElMessageBox.prompt('Enter a new name', 'Rename Session', {
       inputValue: session.title,
-      confirmButtonText: '确定',
-      cancelButtonText: '取消',
+      confirmButtonText: 'OK',
+      cancelButtonText: 'Cancel',
     })
     
     if (value) {
       await chatStore.renameSession(sessionId, value)
     }
   } else if (command === 'delete') {
-    await ElMessageBox.confirm('确定要删除这个会话吗？', '删除会话', {
+    await ElMessageBox.confirm('Are you sure you want to delete this session?', 'Delete Session', {
       type: 'warning',
-      confirmButtonText: '删除',
-      cancelButtonText: '取消',
+      confirmButtonText: 'Delete',
+      cancelButtonText: 'Cancel',
     })
     
     await chatStore.deleteSession(sessionId)
@@ -211,15 +211,15 @@ async function handleUserCommand(command: string) {
   } else if (command === 'theme') {
     settingsStore.theme = theme.value === 'light' ? 'dark' : 'light'
   } else if (command === 'logout') {
-    await ElMessageBox.confirm('确定要退出登录吗？', '退出登录', {
+    await ElMessageBox.confirm('Are you sure you want to log out?', 'Log Out', {
       type: 'warning',
-      confirmButtonText: '退出',
-      cancelButtonText: '取消',
+      confirmButtonText: 'Log Out',
+      cancelButtonText: 'Cancel',
     })
     
     await authStore.logout()
     router.push('/login')
-    ElMessage.success('已退出登录')
+    ElMessage.success('Logged out successfully')
   }
 }
 
