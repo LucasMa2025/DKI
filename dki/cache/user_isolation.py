@@ -515,49 +515,50 @@ class UserScopedCacheStore:
         Returns:
             缓存数据或 None
         """
-        self._stats["total_gets"] += 1
-        signed_key = ctx.sign_cache_key(content_hash)
-        
-        # 校验: 用户分区存在性
-        partition = self._partitions.get(ctx.user_id)
-        if partition is None:
-            self._stats["total_misses"] += 1
-            return None
-        
-        # 校验: 键存在性
-        if signed_key not in partition:
-            self._stats["total_misses"] += 1
-            return None
-        
-        # 校验: HMAC 签名验证
-        if not ctx.verify_cache_key(signed_key):
-            self._stats["total_denials"] += 1
+        async with self._global_lock:
+            self._stats["total_gets"] += 1
+            signed_key = ctx.sign_cache_key(content_hash)
+            
+            # 校验: 用户分区存在性
+            partition = self._partitions.get(ctx.user_id)
+            if partition is None:
+                self._stats["total_misses"] += 1
+                return None
+            
+            # 校验: 键存在性
+            if signed_key not in partition:
+                self._stats["total_misses"] += 1
+                return None
+            
+            # 校验: HMAC 签名验证
+            if not ctx.verify_cache_key(signed_key):
+                self._stats["total_denials"] += 1
+                if self._config.enable_audit_log:
+                    self._audit.record(
+                        user_id=ctx.user_id,
+                        action="get",
+                        cache_key=signed_key,
+                        cache_tier="L1_memory",
+                        success=False,
+                        denial_reason="HMAC signature verification failed",
+                    )
+                return None
+            
+            # 访问成功
+            entry = partition[signed_key]
+            partition.move_to_end(signed_key)  # LRU 更新
+            self._stats["total_hits"] += 1
+            
             if self._config.enable_audit_log:
                 self._audit.record(
                     user_id=ctx.user_id,
                     action="get",
                     cache_key=signed_key,
                     cache_tier="L1_memory",
-                    success=False,
-                    denial_reason="HMAC signature verification failed",
+                    success=True,
                 )
-            return None
-        
-        # 访问成功
-        entry = partition[signed_key]
-        partition.move_to_end(signed_key)  # LRU 更新
-        self._stats["total_hits"] += 1
-        
-        if self._config.enable_audit_log:
-            self._audit.record(
-                user_id=ctx.user_id,
-                action="get",
-                cache_key=signed_key,
-                cache_tier="L1_memory",
-                success=True,
-            )
-        
-        return entry
+            
+            return entry
     
     async def put(
         self,
@@ -576,30 +577,31 @@ class UserScopedCacheStore:
         Returns:
             是否存储成功
         """
-        self._stats["total_puts"] += 1
-        signed_key = ctx.sign_cache_key(content_hash)
-        
-        partition = self._get_or_create_partition(ctx.user_id)
-        
-        # 容量检查: 单用户上限
-        if signed_key not in partition and len(partition) >= self._config.per_user_max_entries:
-            # 驱逐此用户最旧的条目
-            partition.popitem(last=False)
-            self._stats["total_evictions"] += 1
-        
-        partition[signed_key] = data
-        partition.move_to_end(signed_key)
-        
-        if self._config.enable_audit_log:
-            self._audit.record(
-                user_id=ctx.user_id,
-                action="put",
-                cache_key=signed_key,
-                cache_tier="L1_memory",
-                success=True,
-            )
-        
-        return True
+        async with self._global_lock:
+            self._stats["total_puts"] += 1
+            signed_key = ctx.sign_cache_key(content_hash)
+            
+            partition = self._get_or_create_partition(ctx.user_id)
+            
+            # 容量检查: 单用户上限
+            if signed_key not in partition and len(partition) >= self._config.per_user_max_entries:
+                # 驱逐此用户最旧的条目
+                partition.popitem(last=False)
+                self._stats["total_evictions"] += 1
+            
+            partition[signed_key] = data
+            partition.move_to_end(signed_key)
+            
+            if self._config.enable_audit_log:
+                self._audit.record(
+                    user_id=ctx.user_id,
+                    action="put",
+                    cache_key=signed_key,
+                    cache_tier="L1_memory",
+                    success=True,
+                )
+            
+            return True
     
     async def delete(
         self,
@@ -968,8 +970,6 @@ class IsolatedPreferenceCacheManager:
             try:
                 redis_ns = ctx.make_redis_namespace()
                 redis_key = f"{redis_ns}:{content_hash}"
-                # 签名验证在 Redis 键中嵌入
-                signed_redis_key = self._signer.sign_key(ctx.user_id, f"redis:{content_hash}")
                 
                 cached_data = await self._redis_client.get_raw(redis_key)
                 if cached_data:
@@ -1020,10 +1020,19 @@ class IsolatedPreferenceCacheManager:
             with torch.no_grad():
                 if hasattr(model, 'compute_kv'):
                     kv_entries, _ = model.compute_kv(preference_text)
+                    # Defensive GPU memory cleanup
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
                     return kv_entries
                 return []
         except Exception as e:
             logger.error(f"K/V computation error: {e}")
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except ImportError:
+                pass
             return []
     
     def _serialize_kv(self, kv_entries: Any) -> bytes:
@@ -1031,11 +1040,20 @@ class IsolatedPreferenceCacheManager:
         import pickle
         import zlib
         try:
+            import torch
             import numpy as np
             serializable = []
             for entry in kv_entries:
-                key_np = entry.key.cpu().numpy()
-                value_np = entry.value.cpu().numpy()
+                key_cpu = entry.key.cpu()
+                value_cpu = entry.value.cpu()
+                original_dtype = str(key_cpu.dtype)
+                # bfloat16 → float32 for numpy compatibility
+                if key_cpu.dtype == torch.bfloat16:
+                    key_cpu = key_cpu.float()
+                if value_cpu.dtype == torch.bfloat16:
+                    value_cpu = value_cpu.float()
+                key_np = key_cpu.numpy()
+                value_np = value_cpu.numpy()
                 serializable.append({
                     'key': key_np.tobytes(),
                     'value': value_np.tobytes(),
@@ -1044,6 +1062,7 @@ class IsolatedPreferenceCacheManager:
                     'value_shape': list(value_np.shape),
                     'key_dtype': str(key_np.dtype),
                     'value_dtype': str(value_np.dtype),
+                    'original_dtype': original_dtype,
                 })
             return zlib.compress(pickle.dumps(serializable))
         except Exception as e:
@@ -1058,6 +1077,14 @@ class IsolatedPreferenceCacheManager:
             import numpy as np
             import torch
             from dki.models.base import KVCacheEntry
+            
+            # Torch dtype name → torch.dtype mapping
+            _dtype_map = {
+                'torch.float16': torch.float16,
+                'torch.float32': torch.float32,
+                'torch.float64': torch.float64,
+                'torch.bfloat16': torch.bfloat16,
+            }
             
             decompressed = zlib.decompress(data)
             serializable = pickle.loads(decompressed)
@@ -1075,6 +1102,14 @@ class IsolatedPreferenceCacheManager:
                 value = torch.from_numpy(
                     np.frombuffer(item['value'], dtype=value_dtype).reshape(value_shape).copy()
                 )
+                
+                # Restore original dtype if it was bfloat16 (serialized as float32)
+                original_dtype_str = item.get('original_dtype', '')
+                if original_dtype_str in _dtype_map:
+                    target_dtype = _dtype_map[original_dtype_str]
+                    key = key.to(target_dtype)
+                    value = value.to(target_dtype)
+                
                 kv_entries.append(KVCacheEntry(key=key, value=value, layer_idx=item['layer_idx']))
             return kv_entries
         except Exception as e:

@@ -100,9 +100,10 @@ class CacheConfig:
 
 class LRUCache:
     """
-    Thread-safe LRU cache with size limit.
+    Async-safe LRU cache with size limit.
     
     Uses OrderedDict for O(1) operations.
+    Note: Uses asyncio.Lock for coroutine-level safety. NOT thread-safe.
     """
     
     def __init__(self, maxsize: int = 1000):
@@ -446,12 +447,18 @@ class PreferenceCacheManager:
             with torch.no_grad():
                 if hasattr(model, 'compute_kv'):
                     kv_entries, _ = model.compute_kv(preference_text)
+                    # Defensive GPU memory cleanup
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
                     return kv_entries
                 else:
                     logger.warning("Model does not support compute_kv")
                     return []
         except Exception as e:
             logger.error(f"Error computing K/V: {e}")
+            # Cleanup on error path too
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             return []
     
     async def _store_in_caches(
@@ -524,6 +531,10 @@ class PreferenceCacheManager:
         count += l1_count
         
         # L2: Clear from Redis
+        # Note: delete_pattern internally calls _make_key which adds the
+        # global key_prefix (e.g. "dki:"). The l2_key_prefix here matches
+        # the _make_redis_key format used during storage, so the double
+        # prefix is consistent.
         if self._is_l2_available():
             try:
                 pattern = f"{user_id}:*"
@@ -562,10 +573,20 @@ class PreferenceCacheManager:
             import numpy as np
             
             # Convert to CPU and serialize
+            # Note: bfloat16 tensors cannot be directly converted to numpy,
+            # so we convert them to float32 first.
             serializable = []
             for entry in kv_entries:
-                key_np = entry.key.cpu().numpy()
-                value_np = entry.value.cpu().numpy()
+                key_cpu = entry.key.cpu()
+                value_cpu = entry.value.cpu()
+                original_dtype = str(key_cpu.dtype)
+                # bfloat16 → float32 for numpy compatibility
+                if key_cpu.dtype == torch.bfloat16:
+                    key_cpu = key_cpu.float()
+                if value_cpu.dtype == torch.bfloat16:
+                    value_cpu = value_cpu.float()
+                key_np = key_cpu.numpy()
+                value_np = value_cpu.numpy()
                 serializable.append({
                     'key': key_np.tobytes(),
                     'value': value_np.tobytes(),
@@ -574,6 +595,7 @@ class PreferenceCacheManager:
                     'value_shape': list(value_np.shape),
                     'key_dtype': str(key_np.dtype),
                     'value_dtype': str(value_np.dtype),
+                    'original_dtype': original_dtype,
                 })
             
             data = pickle.dumps(serializable)
@@ -599,6 +621,14 @@ class PreferenceCacheManager:
             
             serializable = pickle.loads(data)
             
+            # Torch dtype name → torch.dtype mapping
+            _dtype_map = {
+                'torch.float16': torch.float16,
+                'torch.float32': torch.float32,
+                'torch.float64': torch.float64,
+                'torch.bfloat16': torch.bfloat16,
+            }
+            
             kv_entries = []
             for item in serializable:
                 # Support both old format (single 'shape'+'dtype') and
@@ -614,6 +644,13 @@ class PreferenceCacheManager:
                 value = torch.from_numpy(
                     np.frombuffer(item['value'], dtype=value_dtype).reshape(value_shape).copy()
                 )
+                
+                # Restore original dtype if it was bfloat16 (serialized as float32)
+                original_dtype_str = item.get('original_dtype', '')
+                if original_dtype_str in _dtype_map:
+                    target_dtype = _dtype_map[original_dtype_str]
+                    key = key.to(target_dtype)
+                    value = value.to(target_dtype)
                 
                 kv_entries.append(KVCacheEntry(
                     key=key,
