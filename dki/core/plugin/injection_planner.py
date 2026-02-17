@@ -83,15 +83,13 @@ class InjectionPlanner:
         )
         
         # plan 可以被检查、记录、测试
-        assert plan.strategy == "recall_v4"
+        assert plan.strategy in ("recall_v4", "stable")
         assert plan.injection_enabled == True
     
-    注意 (v3.2):
-        stable 和 full_attention 策略已移除。
-        系统统一使用 recall_v4 策略:
-        - 偏好: K/V 注入
-        - 历史: 多信号召回 + 后缀组装
-        - 事实补充: Function Call 循环
+    策略 (v3.2):
+        - recall_v4 (默认): 多信号召回 + 后缀组装 + Fact Call
+        - stable (回退): recall_v4 失败时自动降级到 stable (偏好 K/V + 平铺历史后缀)
+        - full_attention 已移除
     """
     
     # ============ 历史后缀提示词模板 ============
@@ -140,7 +138,7 @@ class InjectionPlanner:
         Args:
             config: DKI 配置对象
             language: 语言 ("en" | "cn")
-            injection_strategy: 注入策略 (v3.2: 仅支持 "recall_v4")
+            injection_strategy: 注入策略 (v3.2: "recall_v4" 或 "stable")
             memory_trigger: Memory Trigger 实例 (可注入)
             memory_trigger_config: Memory Trigger 配置 (如无实例则用于创建)
             reference_resolver: Reference Resolver 实例 (可注入)
@@ -152,7 +150,11 @@ class InjectionPlanner:
         """
         self.config = config
         self.language = language
-        self._injection_strategy = "recall_v4"  # v3.2: 强制使用 recall_v4
+        # v3.2: 默认 recall_v4, 支持 stable 作为回退策略
+        if injection_strategy in ("recall_v4", "stable"):
+            self._injection_strategy = injection_strategy
+        else:
+            self._injection_strategy = "recall_v4"
         
         # NLP 组件 (可注入, 可独立测试)
         self._memory_trigger = memory_trigger or MemoryTrigger(
@@ -291,8 +293,8 @@ class InjectionPlanner:
             plan.preferences_count = len(preferences)
             plan.preference_tokens = self._estimate_tokens(plan.preference_text)
         
-        # ============ Step 2: 历史召回 (recall_v4 统一策略) ============
-        if self._multi_signal_recall and self._suffix_builder:
+        # ============ Step 2: 历史召回 ============
+        if strategy == "recall_v4" and self._multi_signal_recall and self._suffix_builder:
             # ============ Recall v4: 多信号召回 + 后缀组装 ============
             plan = self._build_recall_v4_plan(
                 plan=plan,
@@ -302,13 +304,23 @@ class InjectionPlanner:
                 context_window=context_window,
                 db_session=db_session,
             )
-        else:
-            # ============ Fallback: recall_v4 组件未初始化时使用平铺历史 ============
+            # 如果 recall_v4 失败 (recall_strategy == "flat_history_fallback"),
+            # 回退到 stable 策略
+            if plan.recall_strategy == "flat_history_fallback":
+                logger.info("Recall v4 failed, falling back to stable strategy")
+                plan.strategy = "stable"
+                if relevant_history:
+                    plan.history_suffix = self._format_history_suffix(relevant_history)
+                    plan.relevant_history_count = len(relevant_history)
+                    plan.history_tokens = self._estimate_tokens(plan.history_suffix)
+        elif strategy == "stable" or not (self._multi_signal_recall and self._suffix_builder):
+            # ============ Stable 策略: 平铺历史后缀 ============
+            plan.strategy = "stable"
             if relevant_history:
                 plan.history_suffix = self._format_history_suffix(relevant_history)
                 plan.relevant_history_count = len(relevant_history)
                 plan.history_tokens = self._estimate_tokens(plan.history_suffix)
-                plan.recall_strategy = "flat_history_fallback"
+                plan.recall_strategy = "flat_history"
         
         # ============ Step 3: Alpha 计算 (分层) ============
         plan.alpha_profile = self._compute_alpha_profile(
@@ -339,7 +351,7 @@ class InjectionPlanner:
             plan.final_input = query
         
         plan.query_tokens = self._estimate_tokens(query)
-        plan.total_tokens = plan.query_tokens + plan.history_tokens
+        plan.total_tokens = plan.query_tokens + plan.history_tokens + plan.preference_tokens
         
         # ============ Step 6: 门控决策记录 ============
         plan.gating_decision = {
@@ -456,6 +468,15 @@ class InjectionPlanner:
         
         return "\n".join(lines)
     
+    # 注入标记列表 (assistant 消息中包含这些标记时应过滤)
+    _INJECTION_MARKERS = [
+        "[会话历史参考]",
+        "[Session History Reference]",
+        "[会话历史结束]",
+        "[End of Session History]",
+        "[AI助手]",
+    ]
+    
     def _format_history_suffix(
         self,
         messages: List[AdapterChatMessage],
@@ -473,11 +494,21 @@ class InjectionPlanner:
         
         lines = []
         for msg in messages:
+            content = msg.content
+            
+            # 过滤包含注入标记的 assistant 消息 (防止递归注入)
+            if msg.role == "assistant":
+                if any(marker in content for marker in self._INJECTION_MARKERS):
+                    continue
+            
             if self.language == "cn":
                 role_label = "用户" if msg.role == "user" else "助手"
             else:
                 role_label = "User" if msg.role == "user" else "Assistant"
-            lines.append(f"{role_label}: {msg.content}")
+            lines.append(f"{role_label}: {content}")
+        
+        if not lines:
+            return ""
         
         return prefix + "\n".join(lines) + suffix
     
@@ -540,12 +571,12 @@ class InjectionPlanner:
     
     @injection_strategy.setter
     def injection_strategy(self, value: str):
-        if value == "recall_v4":
+        if value in ("recall_v4", "stable"):
             self._injection_strategy = value
         else:
             logger.warning(
                 f"Invalid strategy: {value}. "
-                f"v3.2 only supports 'recall_v4'. Ignoring."
+                f"v3.2 supports 'recall_v4' and 'stable'. Ignoring."
             )
     
     # ================================================================

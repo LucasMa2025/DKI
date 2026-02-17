@@ -2,7 +2,7 @@
 DKI Injection Executor - 注入计划执行器
 
 职责: 只做执行, 不做决策
-- 根据 InjectionPlan 执行 recall_v4 策略
+- 根据 InjectionPlan 执行 recall_v4 或 stable 策略
 - 计算偏好 K/V (含缓存)
 - 调用模型推理 (带 K/V 注入)
 - 执行 Fact Call 循环 (事实补充)
@@ -21,9 +21,10 @@ DKI Injection Executor - 注入计划执行器
 - 每次缓存访问都验证 user_id 归属权
 - 推理前后有上下文隔离检查，防止 K/V 残留泄露
 
-注意 (v3.2):
-- stable 和 full_attention 策略已移除
-- 系统统一使用 recall_v4 (偏好 K/V + 后缀组装 + Fact Call)
+策略 (v3.2):
+- recall_v4 (默认): 偏好 K/V + 后缀组装 + Fact Call
+- stable (回退): recall_v4 失败时自动降级到 stable (偏好 K/V + 平铺历史后缀)
+- full_attention 已移除
 
 Author: AGI Demo Project
 Version: 3.2.0
@@ -33,6 +34,7 @@ import time
 import hashlib
 from typing import Any, Dict, List, Optional, Tuple
 
+import torch
 from loguru import logger
 
 from dki.models.base import BaseModelAdapter, ModelOutput, KVCacheEntry
@@ -66,7 +68,9 @@ class InjectionExecutor:
     注入计划执行器 (v3.2)
     
     纯执行层，根据 InjectionPlan 调用模型。
-    统一使用 recall_v4 策略: 偏好 K/V 注入 + 后缀组装 + Fact Call 循环。
+    支持 recall_v4 和 stable 两种策略:
+    - recall_v4: 偏好 K/V 注入 + 后缀组装 + Fact Call 循环
+    - stable: 偏好 K/V 注入 + 平铺历史后缀 (recall_v4 失败时的回退策略)
     
     不变量:
     - Key tensor 永远不被 alpha 缩放 (保护 attention addressing)
@@ -94,6 +98,8 @@ class InjectionExecutor:
         fact_retriever: Optional[Any] = None,
         prompt_formatter: Optional[Any] = None,
         recall_config: Optional[Any] = None,
+        # Function Call 日志记录器 (v3.2)
+        function_call_logger: Optional[Any] = None,
     ):
         """
         初始化执行器
@@ -103,6 +109,7 @@ class InjectionExecutor:
             fact_retriever: 事实检索器 (Recall v4)
             prompt_formatter: 提示格式化器 (Recall v4)
             recall_config: 召回配置 (Recall v4)
+            function_call_logger: Function Call 日志记录器 (可选)
         """
         self.model = model_adapter
         
@@ -110,6 +117,9 @@ class InjectionExecutor:
         self._fact_retriever = fact_retriever
         self._prompt_formatter = prompt_formatter
         self._recall_config = recall_config
+        
+        # Function Call 日志记录器
+        self._fc_logger = function_call_logger
         
         # ============ 用户级隔离的偏好 K/V 缓存 ============
         # 改进: 从全局 Dict 改为用户级分区 Dict
@@ -144,11 +154,13 @@ class InjectionExecutor:
         **kwargs,
     ) -> ExecutionResult:
         """
-        执行注入计划 (v3.2: 统一 recall_v4 策略)
+        执行注入计划 (v3.2: recall_v4 + stable 回退)
         
         执行路径:
-        - 有偏好 + 注入启用: K/V 注入推理 + Fact Call 循环
+        - recall_v4 + 有偏好 + 注入启用: K/V 注入推理 + Fact Call 循环
+        - stable + 有偏好 + 注入启用: K/V 注入推理 (偏好 + 历史后缀)
         - 无偏好 / 无注入: 直接生成
+        - 异常: 降级到 stable → 再失败则降级到无注入
         
         Args:
             plan: 注入计划 (来自 Planner)
@@ -162,12 +174,13 @@ class InjectionExecutor:
         
         try:
             if plan.injection_enabled and plan.preference_text:
-                # recall_v4: 偏好 K/V 注入 + 后缀组装
+                # K/V 注入推理 (recall_v4 和 stable 共用)
                 result = await self._execute_with_kv_injection(
                     plan, max_new_tokens, temperature, **kwargs
                 )
-                # Fact Call 循环 (事实补充)
-                if (plan.has_fact_call_instruction
+                # Fact Call 循环 (仅 recall_v4 策略)
+                if (plan.strategy == "recall_v4"
+                        and plan.has_fact_call_instruction
                         and self._fact_retriever
                         and self._prompt_formatter
                         and self._recall_config
@@ -175,7 +188,12 @@ class InjectionExecutor:
                     result = await self._execute_fact_call_loop(
                         plan, result, max_new_tokens, temperature, **kwargs
                     )
-                self._stats["recall_v4_executions"] += 1
+                
+                if plan.strategy == "recall_v4":
+                    self._stats["recall_v4_executions"] += 1
+                else:
+                    self._stats.setdefault("stable_executions", 0)
+                    self._stats["stable_executions"] += 1
             else:
                 result = await self._execute_plain(
                     plan, max_new_tokens, temperature, **kwargs
@@ -185,7 +203,19 @@ class InjectionExecutor:
             return result
             
         except Exception as e:
-            logger.error(f"Execution failed, falling back: {e}")
+            logger.error(f"Execution failed: {e}")
+            
+            # 第一级降级: 尝试 stable 策略 (如果当前是 recall_v4)
+            if plan.strategy == "recall_v4" and plan.preference_text:
+                logger.info("Falling back to stable strategy")
+                try:
+                    return await self._execute_stable_fallback(
+                        plan, max_new_tokens, temperature, str(e), **kwargs
+                    )
+                except Exception as stable_error:
+                    logger.error(f"Stable fallback also failed: {stable_error}")
+            
+            # 第二级降级: 无注入推理
             return await self._execute_fallback(
                 plan, max_new_tokens, temperature, str(e), **kwargs
             )
@@ -297,7 +327,96 @@ class InjectionExecutor:
         return result
     
     # ================================================================
-    # 降级执行
+    # Stable 策略降级 (recall_v4 失败时的第一级降级)
+    # ================================================================
+    
+    async def _execute_stable_fallback(
+        self,
+        plan: InjectionPlan,
+        max_new_tokens: int,
+        temperature: float,
+        error_message: str,
+        **kwargs,
+    ) -> ExecutionResult:
+        """
+        Stable 策略降级: 使用偏好 K/V + 平铺历史后缀
+        
+        当 recall_v4 执行失败时, 回退到 stable 策略:
+        - 偏好: K/V 注入 (不变)
+        - 历史: 使用 plan.history_suffix (平铺历史后缀)
+        """
+        self._stats.setdefault("stable_fallbacks", 0)
+        self._stats["stable_fallbacks"] += 1
+        
+        result = ExecutionResult()
+        result.fallback_used = True
+        result.error_message = f"stable_fallback: {error_message}"
+        
+        # 构造 stable 输入: 历史后缀 + 原始查询
+        # 注意: recall_v4 会将 assembled_suffix 同步到 history_suffix,
+        # stable 降级应使用历史后缀 (即使它等于 assembled_suffix)
+        if plan.history_suffix:
+            stable_input = plan.history_suffix + "\n\n" + plan.original_query
+        else:
+            stable_input = plan.original_query
+        
+        # 获取偏好 K/V
+        preference_kv, cache_hit, cache_tier = self._get_preference_kv(
+            user_id=plan.user_id,
+            preference_text=plan.preference_text,
+        )
+        result.preference_cache_hit = cache_hit
+        result.preference_cache_tier = cache_tier
+        
+        alpha = plan.alpha_profile.effective_preference_alpha
+        
+        inference_start = time.time()
+        
+        if preference_kv and alpha > 0.1:
+            if self._inference_guard:
+                with self._inference_guard.scoped_inference(
+                    user_id=plan.user_id,
+                    kv_entries=preference_kv,
+                ):
+                    output = self.model.forward_with_kv_injection(
+                        prompt=stable_input,
+                        injected_kv=preference_kv,
+                        alpha=alpha,
+                        max_new_tokens=max_new_tokens,
+                        temperature=temperature,
+                        **kwargs,
+                    )
+            else:
+                output = self.model.forward_with_kv_injection(
+                    prompt=stable_input,
+                    injected_kv=preference_kv,
+                    alpha=alpha,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    **kwargs,
+                )
+        else:
+            output = self.model.generate(
+                prompt=stable_input,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                **kwargs,
+            )
+        
+        result.inference_latency_ms = (time.time() - inference_start) * 1000
+        result.text = output.text
+        result.input_tokens = output.input_tokens
+        result.output_tokens = output.output_tokens
+        result.raw_output = output
+        
+        self._stats.setdefault("stable_executions", 0)
+        self._stats["stable_executions"] += 1
+        
+        logger.info("Stable fallback executed successfully")
+        return result
+    
+    # ================================================================
+    # 降级执行 (无注入)
     # ================================================================
     
     async def _execute_fallback(
@@ -373,16 +492,65 @@ class InjectionExecutor:
                 f"offset={fact_request.offset}"
             )
             
+            # ============ Function Call 日志: 记录调用前状态 ============
+            fc_start_time = time.time()
+            prompt_before_call = prompt
+            model_output_before_call = result.text
+            fc_arguments = {
+                "trace_id": fact_request.trace_id,
+                "offset": fact_request.offset,
+                "limit": fact_request.limit,
+            }
+            fc_status = "success"
+            fc_error = None
+            
             # 检索事实
-            fact_response = self._fact_retriever.retrieve(
-                trace_id=fact_request.trace_id,
-                session_id=plan.session_id,
-                offset=fact_request.offset,
-                limit=fact_request.limit,
-            )
+            try:
+                fact_response = self._fact_retriever.retrieve(
+                    trace_id=fact_request.trace_id,
+                    session_id=plan.session_id,
+                    offset=fact_request.offset,
+                    limit=fact_request.limit,
+                )
+            except Exception as retrieve_err:
+                fc_status = "error"
+                fc_error = str(retrieve_err)
+                # 记录失败日志
+                self._log_function_call(
+                    session_id=plan.session_id,
+                    user_id=plan.user_id,
+                    round_index=round_idx,
+                    function_name="retrieve_fact",
+                    arguments=fc_arguments,
+                    response_text=None,
+                    response_tokens=0,
+                    status="error",
+                    error_message=fc_error,
+                    prompt_before=prompt_before_call,
+                    prompt_after=prompt,
+                    model_output_before=model_output_before_call,
+                    latency_ms=(time.time() - fc_start_time) * 1000,
+                )
+                logger.warning(f"Fact retrieval failed: {retrieve_err}")
+                break
             
             if not fact_response.messages:
                 logger.warning(f"No facts found for trace_id={fact_request.trace_id}")
+                # 记录空结果日志
+                self._log_function_call(
+                    session_id=plan.session_id,
+                    user_id=plan.user_id,
+                    round_index=round_idx,
+                    function_name="retrieve_fact",
+                    arguments=fc_arguments,
+                    response_text="(no facts found)",
+                    response_tokens=0,
+                    status="success",
+                    prompt_before=prompt_before_call,
+                    prompt_after=prompt,
+                    model_output_before=model_output_before_call,
+                    latency_ms=(time.time() - fc_start_time) * 1000,
+                )
                 break
             
             # 格式化事实段落
@@ -394,6 +562,23 @@ class InjectionExecutor:
             
             if total_fact_tokens > max_fact_tokens:
                 logger.info(f"Fact token budget exhausted: {total_fact_tokens} > {max_fact_tokens}")
+                fc_status = "budget_exceeded"
+                # 记录超限日志
+                self._log_function_call(
+                    session_id=plan.session_id,
+                    user_id=plan.user_id,
+                    round_index=round_idx,
+                    function_name="retrieve_fact",
+                    arguments=fc_arguments,
+                    response_text=fact_text,
+                    response_tokens=fact_tokens,
+                    status="budget_exceeded",
+                    error_message=f"Total fact tokens {total_fact_tokens} > max {max_fact_tokens}",
+                    prompt_before=prompt_before_call,
+                    prompt_after=prompt,
+                    model_output_before=model_output_before_call,
+                    latency_ms=(time.time() - fc_start_time) * 1000,
+                )
                 break
             
             # 追加事实段落到 prompt, 继续推理
@@ -403,6 +588,23 @@ class InjectionExecutor:
                 continuation = "Please answer based on the supplementary facts above."
             
             prompt = prompt + "\n\n" + fact_text + "\n\n" + continuation
+            
+            # ============ Function Call 日志: 记录成功调用 ============
+            fc_latency_ms = (time.time() - fc_start_time) * 1000
+            self._log_function_call(
+                session_id=plan.session_id,
+                user_id=plan.user_id,
+                round_index=round_idx,
+                function_name="retrieve_fact",
+                arguments=fc_arguments,
+                response_text=fact_text,
+                response_tokens=fact_tokens,
+                status="success",
+                prompt_before=prompt_before_call,
+                prompt_after=prompt,
+                model_output_before=model_output_before_call,
+                latency_ms=fc_latency_ms,
+            )
             
             # 重新推理
             inference_start = time.time()
@@ -458,6 +660,45 @@ class InjectionExecutor:
         
         return result
     
+    def _log_function_call(
+        self,
+        session_id: str,
+        user_id: str,
+        round_index: int,
+        function_name: str,
+        arguments: Dict[str, Any],
+        response_text: Optional[str],
+        response_tokens: int = 0,
+        status: str = "success",
+        error_message: Optional[str] = None,
+        prompt_before: Optional[str] = None,
+        prompt_after: Optional[str] = None,
+        model_output_before: Optional[str] = None,
+        latency_ms: float = 0,
+    ) -> None:
+        """记录 function call 日志 (委托给 FunctionCallLogger)"""
+        if not self._fc_logger:
+            return
+        
+        try:
+            self._fc_logger.log(
+                session_id=session_id,
+                user_id=user_id,
+                round_index=round_index,
+                function_name=function_name,
+                arguments=arguments,
+                response_text=response_text,
+                response_tokens=response_tokens,
+                status=status,
+                error_message=error_message,
+                prompt_before=prompt_before,
+                prompt_after=prompt_after,
+                model_output_before=model_output_before,
+                latency_ms=latency_ms,
+            )
+        except Exception as log_err:
+            logger.warning(f"Failed to log function call: {log_err}")
+    
     # ================================================================
     # K/V 缓存 (用户级隔离)
     # ================================================================
@@ -497,16 +738,46 @@ class InjectionExecutor:
             kv_entries, cached_hash = user_partition[content_hash]
             if cached_hash == content_hash:
                 self._stats["cache_hits"] += 1
+                # 将 CPU 缓存的 K/V 移回模型设备
+                device = getattr(self.model, 'device', 'cpu')
+                if device != "cpu" and kv_entries and isinstance(kv_entries, list):
+                    try:
+                        kv_entries = [
+                            KVCacheEntry(
+                                key=e.key.to(device), value=e.value.to(device),
+                                layer_idx=e.layer_idx,
+                            )
+                            for e in kv_entries
+                        ]
+                    except Exception:
+                        pass  # fallback: 保持原样, model 会自行处理
                 return kv_entries, True, "memory"
         
         # 计算 K/V
         try:
             kv_entries, _ = self.model.compute_kv(preference_text)
             
-            # 存入用户专属分区
+            # 将 K/V tensor 移到 CPU 缓存, 防止 GPU 显存无限增长
+            cpu_kv_entries = kv_entries
+            if kv_entries and isinstance(kv_entries, list):
+                try:
+                    cpu_kv_entries = [
+                        KVCacheEntry(
+                            key=e.key.cpu(), value=e.value.cpu(), layer_idx=e.layer_idx
+                        )
+                        for e in kv_entries
+                    ]
+                except Exception:
+                    cpu_kv_entries = kv_entries  # fallback: 保持原样
+            
+            # 存入用户专属分区 (CPU tensor)
             if user_id not in self._preference_kv_cache:
                 self._preference_kv_cache[user_id] = {}
-            self._preference_kv_cache[user_id][content_hash] = (kv_entries, content_hash)
+            self._preference_kv_cache[user_id][content_hash] = (cpu_kv_entries, content_hash)
+            
+            # 释放 GPU 显存
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             
             return kv_entries, False, "compute"
         except Exception as e:
@@ -543,6 +814,8 @@ class InjectionExecutor:
         
         return {
             **self._stats,
+            "stable_executions": self._stats.get("stable_executions", 0),
+            "stable_fallbacks": self._stats.get("stable_fallbacks", 0),
             "kv_cache_user_partitions": len(self._preference_kv_cache),
             "kv_cache_total_entries": total_entries,
             "kv_cache_isolation": "per_user_partition",

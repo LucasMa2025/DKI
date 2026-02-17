@@ -83,8 +83,9 @@ class SafetyEnvelope:
     - 防止 preference 覆盖 query
     - 限制 K/V token 总量
     """
-    # recall_v4 策略安全限制
+    # recall_v4 / stable 策略安全限制
     max_preference_alpha: float = 0.7
+    stable_max_preference_alpha: float = 0.5
     
     # 通用限制
     max_total_kv_tokens: int = 600
@@ -98,7 +99,13 @@ class SafetyEnvelope:
         """
         violations = []
         
-        if plan.alpha_profile.preference_alpha > self.max_preference_alpha:
+        if plan.strategy == "stable":
+            if plan.alpha_profile.preference_alpha > self.stable_max_preference_alpha:
+                violations.append(
+                    f"stable: preference_alpha={plan.alpha_profile.preference_alpha:.2f} "
+                    f"> max={self.stable_max_preference_alpha:.2f}"
+                )
+        elif plan.alpha_profile.preference_alpha > self.max_preference_alpha:
             violations.append(
                 f"recall_v4: preference_alpha={plan.alpha_profile.preference_alpha:.2f} "
                 f"> max={self.max_preference_alpha:.2f}"
@@ -166,7 +173,7 @@ class InjectionPlan:
     ```
     """
     # ============ 策略 ============
-    strategy: str = "recall_v4"       # recall_v4 | none
+    strategy: str = "recall_v4"       # recall_v4 | stable (fallback) | none
     
     # ============ 偏好数据 (K/V 注入) ============
     preference_text: str = ""

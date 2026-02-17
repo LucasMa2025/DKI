@@ -3,19 +3,25 @@ DKI Injection Visualization API Routes
 
 DKI 注入可视化 API 路由
 
-提供注入过程的详细可视化数据，用于调试和理解 DKI 的工作机制
+提供注入过程的详细可视化数据，用于调试和理解 DKI 的工作机制。
+
+v3.2 新增:
+- Function Call 日志 API (获取会话的 function call 记录)
+- 可视化详情中包含 function call 信息
 
 Author: AGI Demo Project
-Version: 1.0.0
+Version: 3.2.0
 """
 
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 from dataclasses import dataclass, field
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from loguru import logger
+
+from dki.api.auth_routes import get_current_user, require_auth
 
 
 # ============ Visualization Data Models ============
@@ -93,6 +99,14 @@ class InjectionVisualizationResponse(BaseModel):
     rag_prompt_text: str = Field("", description="RAG 完整提示词")
     rag_context_text: str = Field("", description="RAG 检索上下文")
     
+    # Recall v4 信息
+    recall_v4_enabled: bool = Field(False, description="是否使用 recall_v4")
+    recall_strategy: str = Field("", description="召回策略")
+    recall_trace_ids: List[str] = Field(default_factory=list, description="召回的 trace IDs")
+    recall_fact_rounds: int = Field(0, description="fact call 轮次")
+    recall_summary_count: int = Field(0, description="summary 条目数")
+    recall_message_count: int = Field(0, description="原文消息数")
+    
     # 性能指标
     total_latency_ms: float = Field(0.0, description="总延迟 (ms)")
     injection_overhead_ms: float = Field(0.0, description="注入开销 (ms)")
@@ -154,17 +168,22 @@ def create_visualization_router() -> APIRouter:
     @router.get(
         "/history",
         response_model=InjectionHistoryResponse,
-        summary="获取注入历史",
-        description="获取最近的 DKI 注入历史记录",
+        summary="Get injection history",
+        description="Get recent DKI injection history records, filtered by authenticated user",
     )
     async def get_injection_history(
-        page: int = Query(1, ge=1, description="页码"),
-        page_size: int = Query(20, ge=1, le=100, description="每页数量"),
+        page: int = Query(1, ge=1, description="Page number"),
+        page_size: int = Query(20, ge=1, le=100, description="Page size"),
+        user: Optional[dict] = Depends(get_current_user),
     ):
-        """获取注入历史"""
+        """Get injection history filtered by authenticated user."""
         history = get_visualization_history()
         
-        # 分页
+        # User-level isolation: filter by authenticated user_id
+        if user and user.get("id"):
+            history = [h for h in history if h.get("user_id") == user["id"]]
+        
+        # Pagination
         total = len(history)
         start = (page - 1) * page_size
         end = start + page_size
@@ -194,15 +213,21 @@ def create_visualization_router() -> APIRouter:
     @router.get(
         "/detail/{request_id}",
         response_model=InjectionVisualizationResponse,
-        summary="获取注入详情",
-        description="获取指定请求的详细注入可视化数据",
+        summary="Get injection detail",
+        description="Get detailed injection visualization data for a specific request",
     )
-    async def get_injection_detail(request_id: str):
-        """获取注入详情"""
+    async def get_injection_detail(
+        request_id: str,
+        user: Optional[dict] = Depends(get_current_user),
+    ):
+        """Get injection detail with user-level access check."""
         history = get_visualization_history()
         
         for item in history:
             if item.get("request_id") == request_id:
+                # User isolation: verify ownership via authenticated user
+                if user and user.get("id") and item.get("user_id") != user["id"]:
+                    raise HTTPException(status_code=403, detail="Access denied: this record belongs to another user")
                 return build_visualization_response(item)
         
         raise HTTPException(status_code=404, detail=f"Request {request_id} not found")
@@ -210,12 +235,18 @@ def create_visualization_router() -> APIRouter:
     @router.get(
         "/latest",
         response_model=InjectionVisualizationResponse,
-        summary="获取最新注入详情",
-        description="获取最近一次 DKI 注入的详细可视化数据",
+        summary="Get latest injection detail",
+        description="Get the most recent DKI injection visualization data, filtered by authenticated user",
     )
-    async def get_latest_injection():
-        """获取最新注入详情"""
+    async def get_latest_injection(
+        user: Optional[dict] = Depends(get_current_user),
+    ):
+        """Get latest injection detail filtered by authenticated user."""
         history = get_visualization_history()
+        
+        # User-level isolation: filter by authenticated user_id
+        if user and user.get("id"):
+            history = [h for h in history if h.get("user_id") == user["id"]]
         
         if not history:
             raise HTTPException(status_code=404, detail="No injection history available")
@@ -224,55 +255,55 @@ def create_visualization_router() -> APIRouter:
     
     @router.get(
         "/flow-diagram",
-        summary="获取注入流程图数据",
-        description="获取 DKI 注入流程的图表数据",
+        summary="Get injection flow diagram data",
+        description="Get DKI injection flow chart data",
     )
     async def get_flow_diagram():
-        """获取注入流程图数据"""
+        """Get injection flow diagram data."""
         return {
             "nodes": [
-                {"id": "input", "label": "用户输入", "type": "input"},
-                {"id": "adapter", "label": "外部数据适配器", "type": "process"},
-                {"id": "preferences", "label": "用户偏好", "type": "data"},
-                {"id": "history", "label": "历史消息", "type": "data"},
+                {"id": "input", "label": "User Input", "type": "input"},
+                {"id": "adapter", "label": "External Data Adapter", "type": "process"},
+                {"id": "preferences", "label": "User Preferences", "type": "data"},
+                {"id": "history", "label": "History Messages", "type": "data"},
                 {"id": "memory_trigger", "label": "Memory Trigger", "type": "process"},
                 {"id": "reference_resolver", "label": "Reference Resolver", "type": "process"},
-                {"id": "kv_injection", "label": "K/V 注入 (负位置)", "type": "injection"},
-                {"id": "suffix_injection", "label": "后缀注入 (正位置)", "type": "injection"},
-                {"id": "llm", "label": "LLM 推理", "type": "process"},
-                {"id": "output", "label": "输出响应", "type": "output"},
+                {"id": "kv_injection", "label": "K/V Injection (neg pos)", "type": "injection"},
+                {"id": "suffix_injection", "label": "Suffix Injection (pos pos)", "type": "injection"},
+                {"id": "llm", "label": "LLM Inference", "type": "process"},
+                {"id": "output", "label": "Output Response", "type": "output"},
             ],
             "edges": [
                 {"from": "input", "to": "adapter", "label": "query + user_id"},
-                {"from": "adapter", "to": "preferences", "label": "读取偏好"},
-                {"from": "adapter", "to": "history", "label": "检索历史"},
-                {"from": "input", "to": "memory_trigger", "label": "检测触发"},
-                {"from": "input", "to": "reference_resolver", "label": "解析指代"},
-                {"from": "preferences", "to": "kv_injection", "label": "编码 K/V"},
-                {"from": "history", "to": "suffix_injection", "label": "格式化后缀"},
-                {"from": "kv_injection", "to": "llm", "label": "注入 K/V"},
-                {"from": "suffix_injection", "to": "llm", "label": "拼接输入"},
-                {"from": "input", "to": "llm", "label": "原始查询"},
-                {"from": "llm", "to": "output", "label": "生成响应"},
+                {"from": "adapter", "to": "preferences", "label": "Load preferences"},
+                {"from": "adapter", "to": "history", "label": "Retrieve history"},
+                {"from": "input", "to": "memory_trigger", "label": "Detect trigger"},
+                {"from": "input", "to": "reference_resolver", "label": "Resolve references"},
+                {"from": "preferences", "to": "kv_injection", "label": "Encode K/V"},
+                {"from": "history", "to": "suffix_injection", "label": "Format suffix"},
+                {"from": "kv_injection", "to": "llm", "label": "Inject K/V"},
+                {"from": "suffix_injection", "to": "llm", "label": "Append input"},
+                {"from": "input", "to": "llm", "label": "Original query"},
+                {"from": "llm", "to": "output", "label": "Generate response"},
             ],
             "description": {
-                "title": "DKI 注入流程",
-                "summary": "DKI 通过混合注入策略将用户记忆融入 LLM 推理",
+                "title": "DKI Injection Flow",
+                "summary": "DKI integrates user memory into LLM inference via hybrid injection strategy",
                 "layers": [
                     {
-                        "name": "L1 - 偏好层",
-                        "method": "K/V 注入 (负位置)",
-                        "description": "短期稳定的用户偏好，通过 K/V 缓存注入到注意力计算中",
+                        "name": "L1 - Preference Layer",
+                        "method": "K/V Injection (negative positions)",
+                        "description": "Short-term stable user preferences, injected into attention computation via K/V cache",
                     },
                     {
-                        "name": "L2 - 历史层",
-                        "method": "后缀提示词 (正位置)",
-                        "description": "动态的会话历史，作为后缀拼接到输入中",
+                        "name": "L2 - History Layer",
+                        "method": "Suffix Prompting (positive positions)",
+                        "description": "Dynamic conversation history, appended to input as a suffix",
                     },
                     {
-                        "name": "L3 - 查询层",
-                        "method": "原始输入",
-                        "description": "用户当前的查询输入",
+                        "name": "L3 - Query Layer",
+                        "method": "Original Input",
+                        "description": "The user's current query input",
                     },
                 ],
             },
@@ -288,7 +319,184 @@ def create_visualization_router() -> APIRouter:
         clear_visualization_history()
         return {"message": "History cleared", "success": True}
     
+    # ================================================================
+    # Function Call 日志 API (v3.2)
+    # ================================================================
+    
+    @router.get(
+        "/function-calls/{session_id}",
+        summary="获取会话的 Function Call 日志",
+        description="""
+        获取指定会话的所有 Function Call 日志记录。
+        
+        返回每次 function call 的:
+        - 函数名、参数、返回文本
+        - 调用前后的 prompt 快照
+        - 触发 function call 的模型输出
+        - 调用状态 (success/error/budget_exceeded)
+        - 耗时统计
+        
+        用于可视化和调试 recall_v4 的 fact call 循环。
+        """,
+    )
+    async def get_session_function_calls(
+        session_id: str,
+        include_prompts: bool = Query(False, description="是否包含完整 prompt (大文本)"),
+        limit: int = Query(100, ge=1, le=500, description="最大返回数量"),
+    ):
+        """获取会话的 Function Call 日志"""
+        fc_logger = _get_function_call_logger()
+        
+        if fc_logger:
+            try:
+                logs = fc_logger.get_by_session(
+                    session_id=session_id,
+                    limit=limit,
+                    include_prompts=include_prompts,
+                )
+                return {
+                    "session_id": session_id,
+                    "function_calls": logs,
+                    "total": len(logs),
+                    "include_prompts": include_prompts,
+                }
+            except Exception as e:
+                logger.error(f"Failed to get function call logs: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+        
+        # 无 FunctionCallLogger — 尝试从数据库直接查询
+        try:
+            db_logs = _query_function_calls_from_db(session_id, limit)
+            return {
+                "session_id": session_id,
+                "function_calls": db_logs,
+                "total": len(db_logs),
+                "include_prompts": include_prompts,
+            }
+        except Exception as e:
+            logger.warning(f"Failed to query function call logs from DB: {e}")
+            return {
+                "session_id": session_id,
+                "function_calls": [],
+                "total": 0,
+                "include_prompts": include_prompts,
+                "message": "Function call logging not available",
+            }
+    
+    @router.get(
+        "/function-calls/{session_id}/stats",
+        summary="获取会话 Function Call 统计",
+        description="获取指定会话的 Function Call 统计数据",
+    )
+    async def get_session_function_call_stats(session_id: str):
+        """获取会话 Function Call 统计"""
+        try:
+            db_manager = _get_db_manager()
+            if db_manager:
+                from dki.database.repository import FunctionCallLogRepository
+                with db_manager.session_scope() as db:
+                    repo = FunctionCallLogRepository(db)
+                    stats = repo.get_stats(session_id=session_id)
+                    return {
+                        "session_id": session_id,
+                        "stats": stats,
+                    }
+        except Exception as e:
+            logger.warning(f"Failed to get function call stats: {e}")
+        
+        return {
+            "session_id": session_id,
+            "stats": {
+                "total": 0,
+                "success": 0,
+                "error": 0,
+                "budget_exceeded": 0,
+                "success_rate": 0,
+            },
+        }
+    
+    @router.get(
+        "/detail-with-fc/{request_id}",
+        summary="获取注入详情 (含 Function Call)",
+        description="获取指定请求的详细注入可视化数据，包含 function call 日志",
+    )
+    async def get_injection_detail_with_fc(request_id: str):
+        """获取注入详情 (含 Function Call 日志)"""
+        history = get_visualization_history()
+        
+        viz_data = None
+        for item in history:
+            if item.get("request_id") == request_id:
+                viz_data = item
+                break
+        
+        if not viz_data:
+            raise HTTPException(status_code=404, detail=f"Request {request_id} not found")
+        
+        response = build_visualization_response(viz_data)
+        
+        # 附加 function call 日志
+        session_id = viz_data.get("session_id", "")
+        fc_logs = []
+        
+        fc_logger = _get_function_call_logger()
+        if fc_logger and session_id:
+            try:
+                fc_logs = fc_logger.get_by_session(
+                    session_id=session_id,
+                    include_prompts=True,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to get FC logs for detail: {e}")
+        
+        # 转为 dict 并附加 fc_logs
+        response_dict = response.dict()
+        response_dict["function_calls"] = fc_logs
+        
+        return response_dict
+    
     return router
+
+
+# ============ Function Call Logger 辅助函数 ============
+
+_function_call_logger = None
+_db_manager_ref = None
+
+
+def set_function_call_logger(fc_logger):
+    """设置全局 FunctionCallLogger 引用 (由 app 启动时调用)"""
+    global _function_call_logger
+    _function_call_logger = fc_logger
+
+
+def set_db_manager(db_manager):
+    """设置全局 DatabaseManager 引用 (由 app 启动时调用)"""
+    global _db_manager_ref
+    _db_manager_ref = db_manager
+
+
+def _get_function_call_logger():
+    """获取 FunctionCallLogger"""
+    return _function_call_logger
+
+
+def _get_db_manager():
+    """获取 DatabaseManager"""
+    return _db_manager_ref
+
+
+def _query_function_calls_from_db(session_id: str, limit: int = 100) -> List[Dict[str, Any]]:
+    """从数据库直接查询 function call 日志"""
+    db_manager = _get_db_manager()
+    if not db_manager:
+        return []
+    
+    from dki.database.repository import FunctionCallLogRepository
+    with db_manager.session_scope() as db:
+        repo = FunctionCallLogRepository(db)
+        logs = repo.get_by_session(session_id, limit=limit)
+        return [log.to_dict() for log in logs]
 
 
 def build_visualization_response(data: Dict[str, Any]) -> InjectionVisualizationResponse:
@@ -420,6 +628,15 @@ def build_visualization_response(data: Dict[str, Any]) -> InjectionVisualization
     # 允许显式设置
     mode = data.get("mode", mode)
     
+    # Recall v4 信息
+    recall_v4_info = data.get("recall_v4", {})
+    recall_v4_enabled = recall_v4_info.get("enabled", False)
+    recall_strategy = recall_v4_info.get("strategy", data.get("recall_strategy", ""))
+    recall_trace_ids = recall_v4_info.get("trace_ids", data.get("trace_ids", []))
+    recall_fact_rounds = recall_v4_info.get("fact_rounds_used", data.get("fact_rounds_used", 0))
+    recall_summary_count = data.get("summary_count", 0)
+    recall_message_count = data.get("message_count", 0)
+    
     return InjectionVisualizationResponse(
         request_id=request_id,
         timestamp=data.get("timestamp", datetime.utcnow().isoformat()),
@@ -439,6 +656,13 @@ def build_visualization_response(data: Dict[str, Any]) -> InjectionVisualization
         # RAG 专用
         rag_prompt_text=data.get("rag_prompt_text", data.get("final_input", "")),
         rag_context_text=data.get("rag_context_text", ""),
+        # Recall v4 信息
+        recall_v4_enabled=recall_v4_enabled,
+        recall_strategy=recall_strategy,
+        recall_trace_ids=recall_trace_ids,
+        recall_fact_rounds=recall_fact_rounds,
+        recall_summary_count=recall_summary_count,
+        recall_message_count=recall_message_count,
         # 性能指标
         total_latency_ms=data.get("latency_ms", 0),
         injection_overhead_ms=data.get("adapter_latency_ms", 0) + data.get("injection_latency_ms", 0),

@@ -31,6 +31,8 @@ from loguru import logger
 from dki.api.visualization_routes import record_visualization
 # 导入统计记录函数
 from dki.api.stats_routes import record_dki_request
+# 导入认证依赖
+from dki.api.auth_routes import get_current_user
 
 # 用户隔离上下文 (可选导入)
 try:
@@ -148,16 +150,19 @@ def create_dki_router() -> APIRouter:
         4. 调用 LLM 推理
         """,
     )
-    async def dki_chat(request: DKIChatRequest):
+    async def dki_chat(
+        request: DKIChatRequest,
+        auth_user: dict = Depends(get_current_user),
+    ):
         """
-        DKI 增强聊天
+        DKI enhanced chat.
         
-        安全流程 (v3.1):
-        1. 验证 user_id (请求体 vs auth token 交叉验证)
-        2. 创建 UserIsolationContext (贯穿整个请求生命周期)
-        3. DKI 通过隔离上下文读取用户偏好和历史
-        4. DKI 执行 K/V 注入 (带推理隔离守卫)
-        5. 返回响应
+        Security flow (v3.1):
+        1. Verify user_id (request body vs auth token cross-validation)
+        2. Create UserIsolationContext (spans the entire request lifecycle)
+        3. DKI reads user preferences and history via isolation context
+        4. DKI executes K/V injection (with inference isolation guard)
+        5. Return response
         """
         dki_system = get_dki_plugin()
         
@@ -167,8 +172,8 @@ def create_dki_router() -> APIRouter:
                 detail="DKI system not initialized. Please check configuration."
             )
         
-        # ============ 用户身份验证 ============
-        # user_id 不可为空
+        # ============ User Identity Verification ============
+        # user_id must not be empty
         if not request.user_id or not request.user_id.strip():
             raise HTTPException(
                 status_code=400,
@@ -176,6 +181,15 @@ def create_dki_router() -> APIRouter:
             )
         
         verified_user_id = request.user_id.strip()
+        
+        # Cross-validate: if authenticated, ensure request user_id matches token user
+        if auth_user and auth_user.get("id"):
+            if verified_user_id != auth_user["id"]:
+                logger.warning(
+                    f"User ID mismatch: request={verified_user_id}, token={auth_user['id']}. "
+                    f"Using token user_id for security."
+                )
+                verified_user_id = auth_user["id"]
         
         try:
             # 使用线程池执行同步的 DKI chat 方法
@@ -221,8 +235,8 @@ def create_dki_router() -> APIRouter:
                     "timestamp": datetime.utcnow().isoformat(),
                     "mode": "dki",
                     "query": request.query,
-                    "user_id": request.user_id,
-                    "session_id": request.session_id or request.user_id,
+                    "user_id": verified_user_id,
+                    "session_id": request.session_id or verified_user_id,
                     "injection_enabled": response.gating_decision.should_inject if response.gating_decision else False,
                     "alpha": response.gating_decision.alpha if response.gating_decision else 0.0,
                     "preference_tokens": preference_tokens,

@@ -39,7 +39,7 @@ def get_db_manager() -> DatabaseManager:
 
 
 class SessionCreate(BaseModel):
-    title: str = "新对话"
+    title: str = "New Chat"
 
 
 class SessionUpdate(BaseModel):

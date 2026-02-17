@@ -26,7 +26,10 @@ from loguru import logger
 from dki.core.dki_system import DKISystem
 from dki.core.rag_system import RAGSystem
 from dki.database.connection import get_db, DatabaseManager
-from dki.database.repository import SessionRepository, MemoryRepository, ExperimentRepository
+from dki.database.repository import (
+    SessionRepository, MemoryRepository, ExperimentRepository,
+    ConversationRepository, UserPreferenceRepository, DemoUserRepository,
+)
 from dki.experiment.runner import ExperimentRunner, ExperimentConfig
 from dki.experiment.data_generator import ExperimentDataGenerator
 from dki.config.config_loader import ConfigLoader
@@ -38,7 +41,7 @@ from dki.api.stats_routes import create_stats_router
 from dki.api.visualization_routes import create_visualization_router
 from dki.api.dki_routes import create_dki_router, set_dki_plugin
 from dki.api.dependencies import init_dependencies, cleanup_dependencies
-from dki.api.visualization_routes import record_visualization
+from dki.api.visualization_routes import record_visualization, get_visualization_history
 from dki.api.stats_routes import record_dki_request
 from dki.adapters import AdapterFactory, AdapterConfig, AdapterType
 from dki.cache import (
@@ -58,9 +61,9 @@ class ChatRequest(BaseModel):
     force_alpha: Optional[float] = None
     max_new_tokens: int = 256
     temperature: float = 0.7
-    # 用户隔离: 通过 token 或 user_id 标识用户
-    token: Optional[str] = None     # Bearer token (优先, 从 auth 系统获取 user_id)
-    user_id: Optional[str] = None   # 显式 user_id (token 不存在时使用)
+    # User isolation: identify user via token or user_id
+    token: Optional[str] = None     # Bearer token (priority, resolves user_id from auth system)
+    user_id: Optional[str] = None   # Explicit user_id (used when token is absent)
 
 
 class ChatResponse(BaseModel):
@@ -84,6 +87,14 @@ class MemoryResponse(BaseModel):
     memory_id: str
     session_id: str
     content: str
+
+
+class PreferenceRequest(BaseModel):
+    """User preference injection request"""
+    user_id: Optional[str] = None
+    content: str
+    preference_type: str = "general"
+    priority: int = 8
 
 
 class ExperimentRequest(BaseModel):
@@ -119,8 +130,8 @@ def create_app() -> FastAPI:
     
     # Initialize systems (lazy)
     _systems = {}
-    _redis_client = None  # Redis 客户端 (全局)
-    _preference_cache = None  # 偏好缓存管理器 (全局)
+    _redis_client = None  # Redis client (global)
+    _preference_cache = None  # Preference cache manager (global)
     
     def get_dki_system() -> DKISystem:
         if 'dki' not in _systems:
@@ -145,12 +156,12 @@ def create_app() -> FastAPI:
         return _systems['user_adapter']
     
     def get_preference_cache() -> Optional[PreferenceCacheManager]:
-        """获取偏好缓存管理器 (支持 Redis)"""
+        """Get preference cache manager (supports Redis)"""
         nonlocal _preference_cache
         return _preference_cache
     
     def get_redis_client() -> Optional[DKIRedisClient]:
-        """获取 Redis 客户端"""
+        """Get Redis client"""
         nonlocal _redis_client
         return _redis_client
     
@@ -169,8 +180,8 @@ def create_app() -> FastAPI:
         except Exception as e:
             logger.warning(f"Failed to connect user adapter: {e}")
         
-        # ============ 初始化 Redis 缓存 (与生产系统一致) ============
-        # 从配置文件加载 Redis 配置
+        # ============ Initialize Redis cache (consistent with production) ============
+        # Load Redis config from config file
         import yaml
         config_loader = ConfigLoader()
         try:
@@ -182,7 +193,7 @@ def create_app() -> FastAPI:
         redis_config_data = raw_config.get('redis', {})
         cache_config_data = raw_config.get('preference_cache', {})
         
-        # 初始化 Redis 客户端
+        # Initialize Redis client
         if REDIS_AVAILABLE and redis_config_data.get('enabled', False):
             redis_config = RedisConfig.from_dict(redis_config_data)
             _redis_client = DKIRedisClient(redis_config)
@@ -206,7 +217,7 @@ def create_app() -> FastAPI:
             else:
                 logger.info("Redis disabled in configuration, using L1 cache only")
         
-        # 初始化偏好缓存管理器 (支持 Redis L2 缓存)
+        # Initialize preference cache manager (supports Redis L2 cache)
         cache_config = CacheConfig.from_dict(cache_config_data)
         if _redis_client and _redis_client.is_available:
             cache_config.l2_enabled = True
@@ -228,7 +239,7 @@ def create_app() -> FastAPI:
             user_adapter=adapter,
         )
         
-        # 设置 DKI 插件 (用于 /v1/dki/chat 端点)
+        # Set up DKI plugin (for /v1/dki/chat endpoint)
         set_dki_plugin(dki)
         
         logger.info("DKI System started")
@@ -238,7 +249,7 @@ def create_app() -> FastAPI:
         """Cleanup on shutdown."""
         nonlocal _redis_client
         
-        # 关闭 Redis 连接
+        # Close Redis connection
         if _redis_client:
             await _redis_client.close()
             logger.info("Redis connection closed")
@@ -270,7 +281,7 @@ def create_app() -> FastAPI:
     visualization_router = create_visualization_router()
     app.include_router(visualization_router)
     
-    # Include DKI plugin routes (核心 DKI 聊天 API)
+    # Include DKI plugin routes (core DKI chat API)
     dki_router = create_dki_router()
     app.include_router(dki_router)
     
@@ -279,25 +290,25 @@ def create_app() -> FastAPI:
     
     def _resolve_user_id(request: ChatRequest) -> str:
         """
-        从请求中解析 user_id (用户隔离)
+        Resolve user_id from request (user isolation).
         
-        优先级:
-        1. request.token → 查 _tokens_db 获取 user_id
-        2. request.user_id → 直接使用
-        3. 降级为 "demo_user"
+        Priority:
+        1. request.token -> look up _tokens_db to get user_id
+        2. request.user_id -> use directly
+        3. Fallback to "demo_user"
         """
-        # 1. 从 token 解析
+        # 1. Resolve from token
         if request.token:
             uid = _tokens_db.get(request.token)
             if uid:
                 return uid
             logger.warning(f"Invalid token in chat request, falling back")
         
-        # 2. 显式 user_id
+        # 2. Explicit user_id
         if request.user_id and request.user_id.strip():
             return request.user_id.strip()
         
-        # 3. 降级
+        # 3. Fallback
         return "demo_user"
     
     @app.post("/api/chat", response_model=ChatResponse)
@@ -306,9 +317,9 @@ def create_app() -> FastAPI:
         Chat endpoint supporting DKI, RAG, and baseline modes.
         Also records visualization and statistics data.
         
-        用户隔离 (v3.1):
-        - 通过 request.token 或 request.user_id 标识用户
-        - DKI/RAG 系统使用解析后的 user_id 进行隔离缓存和推理
+        User Isolation (v3.1):
+        - Identifies user via request.token or request.user_id
+        - DKI/RAG systems use the resolved user_id for isolated caching and inference
         """
         session_id = request.session_id or f"session_{uuid.uuid4().hex[:8]}"
         resolved_user_id = _resolve_user_id(request)
@@ -325,7 +336,7 @@ def create_app() -> FastAPI:
                     temperature=request.temperature,
                 )
                 
-                # 记录可视化数据
+                # Record visualization data
                 try:
                     hybrid_info = response.metadata.get("hybrid_injection", {})
                     preference_tokens = hybrid_info.get("preference_tokens", 0)
@@ -362,7 +373,7 @@ def create_app() -> FastAPI:
                 except Exception as viz_err:
                     logger.warning(f"Failed to record visualization for /api/chat DKI: {viz_err}")
                 
-                # 记录统计数据
+                # Record statistics data
                 try:
                     record_dki_request(
                         cache_tier=response.cache_tier or "L3",
@@ -393,7 +404,7 @@ def create_app() -> FastAPI:
                     temperature=request.temperature,
                 )
                 
-                # 记录 RAG 可视化 (基本信息)
+                # Record RAG visualization (basic info)
                 try:
                     rag_prompt_info = {}
                     if response.prompt_info:
@@ -409,7 +420,7 @@ def create_app() -> FastAPI:
                         "injection_enabled": False,
                         "alpha": 0.0,
                         "preference_tokens": 0,
-                        "history_tokens": len(response.memories_used) * 50,  # 估算
+                        "history_tokens": len(response.memories_used) * 50,  # estimate
                         "query_tokens": response.input_tokens,
                         "total_tokens": response.input_tokens,
                         "cache_hit": False,
@@ -479,11 +490,10 @@ def create_app() -> FastAPI:
                     content=request.content,
                     memory_id=memory_id,
                     metadata=request.metadata,
+                    skip_db=True,  # DKI already stored it, only update RAG's in-memory index
                 )
             except Exception as rag_err:
-                # UNIQUE constraint or other DB error — memory already exists in DB,
-                # just log and continue (DKI already stored it successfully)
-                logger.warning(f"RAG add_memory skipped (already in DB): {rag_err}")
+                logger.warning(f"RAG add_memory (router only) failed: {rag_err}")
             
             return MemoryResponse(
                 memory_id=memory_id,
@@ -495,6 +505,204 @@ def create_app() -> FastAPI:
             logger.error(f"Add memory error: {e}")
             raise HTTPException(status_code=500, detail=str(e))
     
+    @app.post("/api/preference")
+    async def add_preference(request: PreferenceRequest):
+        """
+        Add user preference (writes to user_preferences table).
+        
+        This is the data source for DKI preference injection.
+        DKISystem.chat() loads preferences via _load_user_preferences_from_db(user_id),
+        then injects them into model inference through K/V injection.
+        
+        Difference from /api/memory:
+        - /api/memory: writes to memories table, used for RAG retrieval and DKI history suffix
+        - /api/preference: writes to user_preferences table, used for DKI preference K/V injection
+        """
+        try:
+            resolved_user_id = request.user_id or "demo_user"
+            
+            db_manager = DatabaseManager()
+            with db_manager.session_scope() as db:
+                # Ensure user exists
+                user_repo = DemoUserRepository(db)
+                user_repo.get_or_create(
+                    username=resolved_user_id,
+                    display_name=resolved_user_id,
+                )
+                
+                pref_repo = UserPreferenceRepository(db)
+                pref = pref_repo.create(
+                    user_id=resolved_user_id,
+                    preference_text=request.content,
+                    preference_type=request.preference_type,
+                    priority=request.priority,
+                )
+                pref_id = pref.id
+            
+            # Clear DKI system's in-memory cache, force reload from database next time
+            dki = get_dki_system()
+            dki.clear_preference_cache(resolved_user_id)
+            
+            logger.info(f"Added preference for user {resolved_user_id}: {request.content[:50]}...")
+            
+            return {
+                "preference_id": pref_id,
+                "user_id": resolved_user_id,
+                "content": request.content,
+                "type": request.preference_type,
+                "priority": request.priority,
+            }
+        except Exception as e:
+            logger.error(f"Add preference error: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    @app.get("/api/preferences/{user_id}")
+    async def get_preferences(user_id: str):
+        """Get all preferences for a user."""
+        try:
+            db_manager = DatabaseManager()
+            with db_manager.session_scope() as db:
+                pref_repo = UserPreferenceRepository(db)
+                prefs = pref_repo.get_by_user(user_id)
+                return {
+                    "user_id": user_id,
+                    "preferences": [
+                        {
+                            "id": p.id,
+                            "text": p.preference_text,
+                            "type": p.preference_type,
+                            "priority": p.priority,
+                            "created_at": p.created_at.isoformat() if p.created_at else None,
+                        }
+                        for p in prefs
+                    ],
+                }
+        except Exception as e:
+            logger.error(f"Get preferences error: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    @app.delete("/api/preferences/{user_id}")
+    async def clear_preferences(user_id: str):
+        """Clear all preferences for a user."""
+        try:
+            db_manager = DatabaseManager()
+            with db_manager.session_scope() as db:
+                pref_repo = UserPreferenceRepository(db)
+                prefs = pref_repo.get_by_user(user_id)
+                for p in prefs:
+                    pref_repo.delete(p.id)
+            
+            # Clear cache
+            dki = get_dki_system()
+            dki.clear_preference_cache(user_id)
+            
+            return {"message": f"Cleared all preferences for {user_id}", "count": len(prefs)}
+        except Exception as e:
+            logger.error(f"Clear preferences error: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.get("/api/experiment/sessions")
+    async def get_experiment_sessions():
+        """
+        Get experiment session list (for experiment record viewing).
+        
+        Returns all sessions starting with 'exp_', including basic info.
+        """
+        try:
+            db_manager = DatabaseManager()
+            with db_manager.session_scope() as db:
+                session_repo = SessionRepository(db)
+                all_sessions = session_repo.list_all()
+                
+                # Filter experiment sessions
+                exp_sessions = [
+                    s for s in all_sessions
+                    if s.id.startswith('exp_') or s.id.startswith('coherence_') or s.id.startswith('alpha_exp_')
+                ]
+                
+                return {
+                    "sessions": [
+                        {
+                            "session_id": s.id,
+                            "user_id": s.user_id if hasattr(s, 'user_id') else None,
+                            "created_at": s.created_at.isoformat() if s.created_at else None,
+                            "conversation_count": len(s.conversations) if hasattr(s, 'conversations') and s.conversations else 0,
+                        }
+                        for s in exp_sessions
+                    ],
+                    "total": len(exp_sessions),
+                }
+        except Exception as e:
+            logger.error(f"Get experiment sessions error: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    @app.get("/api/experiment/session/{session_id}")
+    async def get_experiment_session_detail(session_id: str):
+        """
+        Get experiment session detail (including injection data and token domains).
+        
+        Returns:
+        - Full conversation history (user/assistant messages)
+        - Injection info for each assistant message (injection_mode, injection_alpha, memory_ids)
+        - User preferences (KV plaintext)
+        - Corresponding visualization data (if available)
+        """
+        try:
+            db_manager = DatabaseManager()
+            with db_manager.session_scope() as db:
+                conv_repo = ConversationRepository(db)
+                conversations = conv_repo.get_by_session(session_id)
+                
+                if not conversations:
+                    raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+                
+                # Get user_id
+                session_repo = SessionRepository(db)
+                session = session_repo.get_by_id(session_id)
+                user_id = session.user_id if session and hasattr(session, 'user_id') else None
+                
+                # Get user preferences (KV plaintext)
+                preferences = []
+                if user_id:
+                    pref_repo = UserPreferenceRepository(db)
+                    prefs = pref_repo.get_by_user(user_id)
+                    preferences = [
+                        {
+                            "id": p.id,
+                            "text": p.preference_text,
+                            "type": p.preference_type,
+                            "priority": p.priority,
+                        }
+                        for p in prefs
+                    ]
+                
+                # Build conversation list
+                conversation_list = []
+                for conv in conversations:
+                    conv_dict = conv.to_dict()
+                    conversation_list.append(conv_dict)
+                
+                # Find corresponding visualization data
+                viz_history = get_visualization_history()
+                session_viz = [
+                    v for v in viz_history
+                    if v.get('session_id') == session_id
+                ]
+            
+            return {
+                "session_id": session_id,
+                "user_id": user_id,
+                "preferences": preferences,
+                "conversations": conversation_list,
+                "visualization_records": session_viz[-20:],  # Last 20 records
+                "total_turns": len(conversation_list),
+            }
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Get experiment session detail error: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
     @app.get("/api/memories/{session_id}")
     async def get_memories(session_id: str):
         """Get all memories for a session."""
@@ -534,7 +742,7 @@ def create_app() -> FastAPI:
             dki = get_dki_system()
             rag = get_rag_system()
             
-            # 获取缓存统计
+            # Get cache statistics
             cache_stats = {}
             if _preference_cache:
                 cache_stats = _preference_cache.get_stats()
@@ -551,12 +759,12 @@ def create_app() -> FastAPI:
     @app.get("/api/cache/stats")
     async def get_cache_stats():
         """
-        获取缓存统计信息
+        Get cache statistics.
         
-        包括:
-        - L1 (Memory) 缓存状态
-        - L2 (Redis) 缓存状态 (如果启用)
-        - 命中率统计
+        Includes:
+        - L1 (Memory) cache status
+        - L2 (Redis) cache status (if enabled)
+        - Hit rate statistics
         """
         try:
             if not _preference_cache:
@@ -567,7 +775,7 @@ def create_app() -> FastAPI:
             
             stats = _preference_cache.get_stats()
             
-            # 添加 Redis 服务器信息
+            # Add Redis server info
             if _redis_client and _redis_client.is_available:
                 redis_info = await _redis_client.info()
                 stats["redis_server"] = redis_info
@@ -583,9 +791,9 @@ def create_app() -> FastAPI:
     @app.get("/api/redis/status")
     async def get_redis_status():
         """
-        获取 Redis 连接状态
+        Get Redis connection status.
         
-        用于验证 Redis 是否正常工作
+        Used to verify Redis is working properly.
         """
         try:
             if not REDIS_AVAILABLE:
@@ -607,7 +815,7 @@ def create_app() -> FastAPI:
                     "reason": "Redis client exists but not connected",
                 }
             
-            # 测试连接
+            # Test connection
             ping_ok = await _redis_client.ping()
             info = await _redis_client.info()
             client_stats = _redis_client.get_stats()
@@ -627,12 +835,12 @@ def create_app() -> FastAPI:
     
     @app.post("/api/experiment/generate-data")
     async def generate_experiment_data():
-        """Generate experiment data."""
+        """Generate experiment data (including long sessions)."""
         try:
             generator = ExperimentDataGenerator("./data")
-            generator.generate_all()
+            generator.generate_all(include_long_sessions=True)
             generator.generate_alpha_sensitivity_data()
-            return {"status": "success", "message": "Experiment data generated"}
+            return {"status": "success", "message": "Experiment data generated (including long sessions)"}
         except Exception as e:
             logger.error(f"Generate data error: {e}")
             raise HTTPException(status_code=500, detail=str(e))
@@ -641,7 +849,12 @@ def create_app() -> FastAPI:
     async def run_experiment(request: ExperimentRequest):
         """Run an experiment."""
         try:
-            runner = ExperimentRunner()
+            dki = get_dki_system()
+            rag = get_rag_system()
+            runner = ExperimentRunner(
+                dki_system=dki,
+                rag_system=rag,
+            )
             config = ExperimentConfig(
                 name=request.name,
                 description=request.description,
@@ -653,6 +866,44 @@ def create_app() -> FastAPI:
             return results
         except Exception as e:
             logger.error(f"Experiment error: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    @app.post("/api/experiment/run-persona-chat")
+    async def run_persona_chat_experiment():
+        """
+        Run PersonaChat experiment (short + long sessions).
+        
+        Automatically:
+        1. Sets up experiment users and preferences (writes to database)
+        2. Generates experiment data (if not exists)
+        3. Runs short and long session experiments
+        4. Conversations are automatically persisted to conversations table
+        """
+        try:
+            dki = get_dki_system()
+            rag = get_rag_system()
+            runner = ExperimentRunner(
+                dki_system=dki,
+                rag_system=rag,
+            )
+            results = runner.run_persona_chat_experiment(
+                include_long_sessions=True,
+                setup_users=True,
+            )
+            return {
+                "status": "success",
+                "summary": results.get('summary', {}),
+                "short_session_count": {
+                    "dki": len(results.get('short_sessions', {}).get('dki', [])),
+                    "rag": len(results.get('short_sessions', {}).get('rag', [])),
+                },
+                "long_session_count": {
+                    "dki": len(results.get('long_sessions', {}).get('dki', [])),
+                    "rag": len(results.get('long_sessions', {}).get('rag', [])),
+                },
+            }
+        except Exception as e:
+            logger.error(f"PersonaChat experiment error: {e}")
             raise HTTPException(status_code=500, detail=str(e))
     
     @app.get("/api/experiments")
@@ -1043,18 +1294,38 @@ def get_index_html() -> str:
         </header>
         
         <div class="main-grid">
-            <!-- Memory Panel -->
+            <!-- Preference & Memory Panel -->
             <div class="panel">
-                <div class="panel-title">Memory Store</div>
+                <div class="panel-title">User Preferences</div>
                 
                 <div class="memory-input">
-                    <textarea id="memoryInput" placeholder="Enter memory content..."></textarea>
-                    <button class="experiment-btn" onclick="addMemory()">Add Memory</button>
+                    <textarea id="preferenceInput" placeholder="Enter user preferences, e.g.:&#10;I am a vegetarian, no meat&#10;I live in Beijing&#10;I am allergic to seafood"></textarea>
+                    <button class="experiment-btn" onclick="addPreference()" style="background:var(--accent-success); border-color:var(--accent-success); color:white;">
+                        🧠 Inject Preference (K/V)
+                    </button>
                 </div>
                 
-                <div class="panel-title" style="margin-top: 20px;">Memories</div>
-                <div class="memory-list" id="memoryList">
-                    <div class="memory-item">No memories yet. Add some above!</div>
+                <div style="display:flex; gap:8px; margin-bottom:10px;">
+                    <button class="experiment-btn" style="margin:0; font-size:0.8rem;" onclick="loadPreferences()">
+                        📋 View Preferences
+                    </button>
+                    <button class="experiment-btn" style="margin:0; font-size:0.8rem;" onclick="clearPreferences()">
+                        🗑️ Clear Preferences
+                    </button>
+                </div>
+                
+                <div class="panel-title" style="margin-top: 10px;">Current Preferences</div>
+                <div class="memory-list" id="preferenceList">
+                    <div class="memory-item" style="color:var(--text-secondary);">Click "View Preferences" to load</div>
+                </div>
+                
+                <div class="panel-title" style="margin-top: 15px;">Memory Store</div>
+                <div class="memory-input">
+                    <textarea id="memoryInput" placeholder="Enter memory content (for RAG history)..."></textarea>
+                    <button class="experiment-btn" onclick="addMemory()">Add Memory (RAG)</button>
+                </div>
+                <div class="memory-list" id="memoryList" style="max-height:150px;">
+                    <div class="memory-item">No memories yet.</div>
                 </div>
                 
                 <div class="alpha-control">
@@ -1119,18 +1390,20 @@ def get_index_html() -> str:
                 
                 <div class="panel-title" style="margin-top: 20px;">Injection Info</div>
                 <button class="experiment-btn" style="background: var(--accent-primary); color: white; border-color: var(--accent-primary);" onclick="viewInjectionInfo()">
-                    🔍 查看注入信息 (View Injection)
+                    🔍 View Injection Info
                 </button>
                 
                 <div class="panel-title" style="margin-top: 20px;">Experiments</div>
                 
-                <button class="experiment-btn" onclick="generateData()">Generate Test Data</button>
-                <button class="experiment-btn" onclick="runExperiment()">Run Comparison</button>
-                <button class="experiment-btn" onclick="runAlphaSensitivity()">α Sensitivity Test</button>
+                <button class="experiment-btn" onclick="generateData()">📊 Generate Test Data</button>
+                <button class="experiment-btn" onclick="runExperiment()">🧪 Run Comparison</button>
+                <button class="experiment-btn" onclick="runPersonaChatExperiment()">🗣️ PersonaChat (Short+Long)</button>
+                <button class="experiment-btn" onclick="viewExperimentRecords()">📋 View Experiment Records</button>
                 
                 <div class="panel-title" style="margin-top: 20px;">Session</div>
                 <div style="font-size: 0.85rem; color: var(--text-secondary);">
-                    Session ID: <span id="sessionId">-</span>
+                    Session ID: <span id="sessionId">-</span><br>
+                    User ID: <span id="currentUserDisplay">demo_user</span>
                 </div>
                 <button class="experiment-btn" style="margin-top: 10px;" onclick="newSession()">New Session</button>
             </div>
@@ -1141,18 +1414,31 @@ def get_index_html() -> str:
     <div id="injectionModal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.8); z-index:1000; overflow:auto;">
         <div style="max-width:900px; margin:30px auto; background:var(--bg-secondary); border-radius:12px; border:1px solid var(--border-color); max-height:90vh; overflow:auto;">
             <div style="padding:20px; border-bottom:1px solid var(--border-color); display:flex; justify-content:space-between; align-items:center; position:sticky; top:0; background:var(--bg-secondary); z-index:1;">
-                <h2 style="margin:0; background:linear-gradient(135deg, var(--accent-primary), var(--accent-secondary)); -webkit-background-clip:text; -webkit-text-fill-color:transparent;">🔍 注入信息 (Injection Info)</h2>
+                <h2 style="margin:0; background:linear-gradient(135deg, var(--accent-primary), var(--accent-secondary)); -webkit-background-clip:text; -webkit-text-fill-color:transparent;">🔍 Injection Info</h2>
                 <div>
-                    <button onclick="copyInjectionText()" style="padding:8px 16px; background:var(--accent-success); color:white; border:none; border-radius:6px; cursor:pointer; font-family:inherit; margin-right:8px;">📋 复制</button>
-                    <button onclick="closeInjectionModal()" style="padding:8px 16px; background:var(--bg-tertiary); color:var(--text-primary); border:2px solid var(--border-color); border-radius:6px; cursor:pointer; font-family:inherit;">✕ 关闭</button>
+                    <button onclick="copyInjectionText()" style="padding:8px 16px; background:var(--accent-success); color:white; border:none; border-radius:6px; cursor:pointer; font-family:inherit; margin-right:8px;">📋 Copy</button>
+                    <button onclick="closeInjectionModal()" style="padding:8px 16px; background:var(--bg-tertiary); color:var(--text-primary); border:2px solid var(--border-color); border-radius:6px; cursor:pointer; font-family:inherit;">✕ Close</button>
                 </div>
             </div>
             <div id="injectionContent" style="padding:20px;">
-                <p style="color:var(--text-secondary);">暂无注入信息，请先发送一条消息。</p>
+                <p style="color:var(--text-secondary);">No injection info yet. Send a message first.</p>
             </div>
         </div>
     </div>
     
+    <!-- Experiment Records Modal -->
+    <div id="experimentModal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.8); z-index:1000; overflow:auto;">
+        <div style="max-width:1000px; margin:30px auto; background:var(--bg-secondary); border-radius:12px; border:1px solid var(--border-color); max-height:90vh; overflow:auto;">
+            <div style="padding:20px; border-bottom:1px solid var(--border-color); display:flex; justify-content:space-between; align-items:center; position:sticky; top:0; background:var(--bg-secondary); z-index:1;">
+                <h2 style="margin:0; background:linear-gradient(135deg, var(--accent-primary), var(--accent-secondary)); -webkit-background-clip:text; -webkit-text-fill-color:transparent;">📋 Experiment Records</h2>
+                <button onclick="closeExperimentModal()" style="padding:8px 16px; background:var(--bg-tertiary); color:var(--text-primary); border:2px solid var(--border-color); border-radius:6px; cursor:pointer; font-family:inherit;">✕ Close</button>
+            </div>
+            <div id="experimentContent" style="padding:20px;">
+                <p style="color:var(--text-secondary);">Loading...</p>
+            </div>
+        </div>
+    </div>
+
     <script>
         // State
         let currentMode = 'dki';
@@ -1160,11 +1446,12 @@ def get_index_html() -> str:
         let useForceAlpha = false;
         let forceAlphaValue = 0.5;
         let stats = { latencies: [], memoriesUsed: 0, cacheHits: 0, totalQueries: 0, alphas: [] };
-        // 用户隔离: 从 localStorage 读取登录 token (由 auth 系统写入)
+        // User isolation: read login token from localStorage (written by auth system)
         let authToken = localStorage.getItem('dki_token') || null;
         let currentUserId = localStorage.getItem('dki_user_id') || 'demo_user';
         
         document.getElementById('sessionId').textContent = sessionId;
+        document.getElementById('currentUserDisplay').textContent = currentUserId;
         
         // Mode selection
         function setMode(mode) {
@@ -1180,7 +1467,90 @@ def get_index_html() -> str:
             document.getElementById('alphaValue').textContent = 'α = ' + forceAlphaValue.toFixed(2);
         }
         
-        // Add memory
+        // ============ Preference Management ============
+        async function addPreference() {
+            const content = document.getElementById('preferenceInput').value.trim();
+            if (!content) {
+                alert('Please enter preference content');
+                return;
+            }
+            
+            try {
+                const response = await fetch('/api/preference', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        user_id: currentUserId,
+                        content: content,
+                        preference_type: 'general',
+                        priority: 8,
+                    })
+                });
+                
+                if (response.ok) {
+                    const data = await response.json();
+                    document.getElementById('preferenceInput').value = '';
+                    addPreferenceToList(data.content, data.priority);
+                    // Also add as memory (ensure RAG can use it too)
+                    await fetch('/api/memory', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ session_id: sessionId, content: content })
+                    });
+                    alert('Preference injected! DKI will use this preference via K/V injection.');
+                } else {
+                    const err = await response.json();
+                    alert('Injection failed: ' + (err.detail || 'Unknown error'));
+                }
+            } catch (error) {
+                console.error('Add preference error:', error);
+                alert('Injection failed: ' + error.message);
+            }
+        }
+        
+        function addPreferenceToList(content, priority) {
+            const list = document.getElementById('preferenceList');
+            if (list.children[0]?.textContent?.includes('Click') || list.children[0]?.textContent?.includes('No preferences')) {
+                list.innerHTML = '';
+            }
+            const item = document.createElement('div');
+            item.className = 'memory-item';
+            item.innerHTML = '<span style="color:var(--accent-success); font-weight:bold;">P' + priority + '</span> ' + escapeHtml(content);
+            list.appendChild(item);
+        }
+        
+        async function loadPreferences() {
+            try {
+                const response = await fetch('/api/preferences/' + encodeURIComponent(currentUserId));
+                if (response.ok) {
+                    const data = await response.json();
+                    const list = document.getElementById('preferenceList');
+                    if (data.preferences.length === 0) {
+                        list.innerHTML = '<div class="memory-item" style="color:var(--text-secondary);">No preferences yet. Add some above.</div>';
+                    } else {
+                        list.innerHTML = '';
+                        for (const p of data.preferences) {
+                            addPreferenceToList(p.text, p.priority);
+                        }
+                    }
+                }
+            } catch (error) {
+                console.error('Load preferences error:', error);
+            }
+        }
+        
+        async function clearPreferences() {
+            if (!confirm('Are you sure you want to clear all preferences?')) return;
+            try {
+                await fetch('/api/preferences/' + encodeURIComponent(currentUserId), { method: 'DELETE' });
+                document.getElementById('preferenceList').innerHTML = '<div class="memory-item" style="color:var(--text-secondary);">Preferences cleared</div>';
+                alert('Preferences cleared');
+            } catch (error) {
+                console.error('Clear preferences error:', error);
+            }
+        }
+        
+        // ============ Memory Store (RAG) ============
         async function addMemory() {
             const content = document.getElementById('memoryInput').value.trim();
             if (!content) return;
@@ -1204,7 +1574,7 @@ def get_index_html() -> str:
         
         function addMemoryToList(content) {
             const list = document.getElementById('memoryList');
-            if (list.children[0].textContent.includes('No memories')) {
+            if (list.children[0]?.textContent?.includes('No memories')) {
                 list.innerHTML = '';
             }
             const item = document.createElement('div');
@@ -1372,9 +1742,201 @@ def get_index_html() -> str:
         
         async function runAlphaSensitivity() {
             alert('Running α sensitivity analysis...');
-            // This would typically call the alpha sensitivity endpoint
             alert('Feature coming soon!');
         }
+        
+        // ============ PersonaChat Experiment ============
+        async function runPersonaChatExperiment() {
+            if (!confirm('Run PersonaChat experiment (short + long sessions)?\\nThis may take a while.')) return;
+            alert('Running PersonaChat experiment... Check console for progress.');
+            try {
+                const response = await fetch('/api/experiment/run-persona-chat', { method: 'POST' });
+                const data = await response.json();
+                if (data.status === 'success') {
+                    let msg = 'PersonaChat experiment completed!\\n\\n';
+                    msg += 'Short sessions: DKI=' + data.short_session_count.dki + ', RAG=' + data.short_session_count.rag + '\\n';
+                    msg += 'Long sessions: DKI=' + data.long_session_count.dki + ', RAG=' + data.long_session_count.rag + '\\n\\n';
+                    for (const [key, summary] of Object.entries(data.summary || {})) {
+                        msg += key + ': latency=' + (summary.mean_latency_ms?.toFixed(1) || 0) + 'ms, recall=' + (summary.mean_recall?.toFixed(3) || 0) + '\\n';
+                    }
+                    alert(msg);
+                } else {
+                    alert('Experiment failed: ' + JSON.stringify(data));
+                }
+            } catch (error) {
+                alert('Error: ' + error.message);
+            }
+        }
+        
+        // ============ Experiment Records Viewer ============
+        async function viewExperimentRecords() {
+            const modal = document.getElementById('experimentModal');
+            const content = document.getElementById('experimentContent');
+            modal.style.display = 'block';
+            content.innerHTML = '<p style="color:var(--text-secondary);">Loading experiment sessions...</p>';
+            
+            try {
+                const response = await fetch('/api/experiment/sessions');
+                if (response.ok) {
+                    const data = await response.json();
+                    if (data.sessions.length === 0) {
+                        content.innerHTML = '<p style="color:var(--text-secondary);">No experiment records yet. Run an experiment first.</p>';
+                        return;
+                    }
+                    content.innerHTML = renderExperimentSessionList(data.sessions);
+                } else {
+                    content.innerHTML = '<p style="color:#f56c6c;">Failed to fetch data</p>';
+                }
+            } catch (error) {
+                content.innerHTML = '<p style="color:#f56c6c;">Request failed: ' + error.message + '</p>';
+            }
+        }
+        
+        function renderExperimentSessionList(sessions) {
+            let html = '<div style="margin-bottom:15px; color:var(--text-secondary); font-size:0.85rem;">Total: ' + sessions.length + ' experiment sessions</div>';
+            html += '<div style="display:grid; gap:8px;">';
+            for (const s of sessions.slice(0, 50)) {
+                const isLong = s.session_id.includes('long');
+                const typeLabel = isLong ? '<span style="color:#f59e0b;">Long Session</span>' : '<span style="color:#3b82f6;">Short Session</span>';
+                html += '<div style="background:var(--bg-tertiary); padding:12px; border-radius:8px; cursor:pointer; border:1px solid var(--border-color); transition:border-color 0.3s;" ';
+                html += 'onmouseover="this.style.borderColor=\\'var(--accent-primary)\\'" onmouseout="this.style.borderColor=\\'var(--border-color)\\'" ';
+                html += 'onclick="viewSessionDetail(\\'' + s.session_id + '\\')">';
+                html += '<div style="display:flex; justify-content:space-between; align-items:center;">';
+                html += '<div><span style="font-weight:bold; color:var(--accent-primary);">' + escapeHtml(s.session_id) + '</span> ' + typeLabel + '</div>';
+                html += '<span style="color:var(--text-secondary); font-size:0.8rem;">' + (s.conversation_count || '?') + ' msgs</span>';
+                html += '</div>';
+                if (s.user_id) {
+                    html += '<div style="font-size:0.8rem; color:var(--text-secondary); margin-top:4px;">User: ' + escapeHtml(s.user_id) + '</div>';
+                }
+                html += '</div>';
+            }
+            html += '</div>';
+            return html;
+        }
+        
+        async function viewSessionDetail(sessionId) {
+            const content = document.getElementById('experimentContent');
+            content.innerHTML = '<p style="color:var(--text-secondary);">Loading session details...</p>';
+            
+            try {
+                const response = await fetch('/api/experiment/session/' + encodeURIComponent(sessionId));
+                if (response.ok) {
+                    const data = await response.json();
+                    content.innerHTML = renderSessionDetail(data);
+                } else if (response.status === 404) {
+                    content.innerHTML = '<p style="color:var(--text-secondary);">Session not found or no conversation records</p>';
+                } else {
+                    content.innerHTML = '<p style="color:#f56c6c;">Failed to fetch details</p>';
+                }
+            } catch (error) {
+                content.innerHTML = '<p style="color:#f56c6c;">Request failed: ' + error.message + '</p>';
+            }
+        }
+        
+        function renderSessionDetail(data) {
+            let html = '';
+            
+            // Back button
+            html += '<button onclick="viewExperimentRecords()" style="padding:8px 16px; background:var(--bg-tertiary); color:var(--text-primary); border:2px solid var(--border-color); border-radius:6px; cursor:pointer; font-family:inherit; margin-bottom:15px;">← Back to List</button>';
+            
+            // Basic info
+            html += '<div style="background:var(--bg-tertiary); padding:15px; border-radius:8px; margin-bottom:15px;">';
+            html += '<h3 style="margin:0 0 10px 0; color:var(--accent-primary);">📌 Session Info</h3>';
+            html += '<div style="display:grid; grid-template-columns:1fr 1fr; gap:8px; font-size:0.85rem;">';
+            html += '<div>Session: <span style="color:var(--accent-primary)">' + escapeHtml(data.session_id) + '</span></div>';
+            html += '<div>User: <span style="color:var(--text-secondary)">' + escapeHtml(data.user_id || '-') + '</span></div>';
+            html += '<div>Messages: <span style="color:var(--accent-warning)">' + data.total_turns + '</span></div>';
+            html += '</div></div>';
+            
+            // User preferences (KV plaintext)
+            if (data.preferences && data.preferences.length > 0) {
+                html += '<div style="background:var(--bg-tertiary); padding:15px; border-radius:8px; margin-bottom:15px; border-left:4px solid #10b981;">';
+                html += '<h3 style="margin:0 0 10px 0; color:#10b981;">🧠 User Preferences (K/V Injection Plaintext)</h3>';
+                for (const p of data.preferences) {
+                    html += '<div style="padding:8px; margin-bottom:6px; background:var(--bg-primary); border-radius:6px; font-size:0.85rem;">';
+                    html += '<span style="color:var(--accent-success); font-weight:bold;">[P' + p.priority + '] [' + escapeHtml(p.type) + ']</span> ';
+                    html += escapeHtml(p.text);
+                    html += '</div>';
+                }
+                html += '</div>';
+            }
+            
+            // Conversation history
+            if (data.conversations && data.conversations.length > 0) {
+                html += '<div style="background:var(--bg-tertiary); padding:15px; border-radius:8px; margin-bottom:15px;">';
+                html += '<h3 style="margin:0 0 10px 0; color:var(--accent-primary);">💬 Conversation History (' + data.conversations.length + ' messages)</h3>';
+                
+                for (const conv of data.conversations) {
+                    const isUser = conv.role === 'user';
+                    const bgColor = isUser ? 'rgba(99,102,241,0.15)' : 'var(--bg-primary)';
+                    const roleColor = isUser ? 'var(--accent-primary)' : 'var(--accent-success)';
+                    const roleLabel = isUser ? 'User' : 'Assistant';
+                    
+                    html += '<div style="padding:10px 12px; margin-bottom:8px; border-radius:8px; background:' + bgColor + '; font-size:0.85rem;">';
+                    html += '<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">';
+                    html += '<span style="color:' + roleColor + '; font-weight:bold;">' + roleLabel + '</span>';
+                    
+                    // Show injection info tags
+                    if (!isUser && conv.injection_mode && conv.injection_mode !== 'none') {
+                        html += '<div style="display:flex; gap:6px; align-items:center;">';
+                        html += '<span style="background:var(--accent-primary); color:white; padding:2px 8px; border-radius:4px; font-size:0.75rem;">' + conv.injection_mode.toUpperCase() + '</span>';
+                        if (conv.injection_alpha !== null && conv.injection_alpha !== undefined) {
+                            html += '<span style="background:var(--accent-warning); color:white; padding:2px 8px; border-radius:4px; font-size:0.75rem;">α=' + conv.injection_alpha.toFixed(2) + '</span>';
+                        }
+                        if (conv.latency_ms) {
+                            html += '<span style="color:var(--text-secondary); font-size:0.75rem;">' + conv.latency_ms.toFixed(0) + 'ms</span>';
+                        }
+                        html += '</div>';
+                    }
+                    html += '</div>';
+                    
+                    // Conversation content (truncate long content)
+                    const content = conv.content || '';
+                    const displayContent = content.length > 500 ? content.substring(0, 500) + '...' : content;
+                    html += '<div style="white-space:pre-wrap; word-break:break-all;">' + escapeHtml(displayContent) + '</div>';
+                    
+                    // Associated memory IDs
+                    if (conv.memory_ids && conv.memory_ids.length > 0) {
+                        html += '<div style="margin-top:6px; font-size:0.75rem; color:var(--text-secondary);">Memories: ' + conv.memory_ids.join(', ') + '</div>';
+                    }
+                    
+                    html += '</div>';
+                }
+                html += '</div>';
+            }
+            
+            // Visualization records
+            if (data.visualization_records && data.visualization_records.length > 0) {
+                html += '<div style="background:var(--bg-tertiary); padding:15px; border-radius:8px; margin-bottom:15px; border-left:4px solid var(--accent-primary);">';
+                html += '<h3 style="margin:0 0 10px 0; color:var(--accent-primary);">📊 Token Domain Details (Visualization)</h3>';
+                
+                for (const viz of data.visualization_records) {
+                    html += '<div style="padding:10px; margin-bottom:8px; background:var(--bg-primary); border-radius:6px; font-size:0.8rem;">';
+                    html += '<div style="display:flex; gap:15px; margin-bottom:6px;">';
+                    html += '<span>Query: <b style="color:#3b82f6;">' + (viz.query_tokens || 0) + '</b> tokens</span>';
+                    html += '<span>Preference (K/V): <b style="color:#10b981;">' + (viz.preference_tokens || 0) + '</b> tokens</span>';
+                    html += '<span>History (Suffix): <b style="color:#f59e0b;">' + (viz.history_tokens || 0) + '</b> tokens</span>';
+                    html += '<span>α: <b style="color:var(--accent-primary);">' + (viz.alpha?.toFixed(2) || 0) + '</b></span>';
+                    html += '</div>';
+                    if (viz.preference_text) {
+                        html += '<div style="color:var(--text-secondary);">Preference: ' + escapeHtml(viz.preference_text.substring(0, 100)) + (viz.preference_text.length > 100 ? '...' : '') + '</div>';
+                    }
+                    html += '</div>';
+                }
+                html += '</div>';
+            }
+            
+            return html;
+        }
+        
+        function closeExperimentModal() {
+            document.getElementById('experimentModal').style.display = 'none';
+        }
+        
+        // Close experiment modal on click outside
+        document.getElementById('experimentModal').addEventListener('click', function(e) {
+            if (e.target === this) closeExperimentModal();
+        });
         
         // ============ Injection Info Viewer ============
         let lastInjectionData = null;
@@ -1384,7 +1946,7 @@ def get_index_html() -> str:
             const content = document.getElementById('injectionContent');
             
             modal.style.display = 'block';
-            content.innerHTML = '<p style="color:var(--text-secondary);">加载中...</p>';
+            content.innerHTML = '<p style="color:var(--text-secondary);">Loading...</p>';
             
             try {
                 // Fetch latest visualization data
@@ -1395,83 +1957,83 @@ def get_index_html() -> str:
                     lastInjectionData = data;
                     content.innerHTML = renderInjectionInfo(data);
                 } else if (response.status === 404) {
-                    content.innerHTML = '<p style="color:var(--text-secondary);">暂无注入信息。请先发送一条消息，系统会自动记录注入过程。</p>';
+                    content.innerHTML = '<p style="color:var(--text-secondary);">No injection data available. Please send a message first — the system will automatically record the injection process.</p>';
                 } else {
-                    content.innerHTML = '<p style="color:#f56c6c;">获取数据失败: ' + response.statusText + '</p>';
+                    content.innerHTML = '<p style="color:#f56c6c;">Failed to fetch data: ' + response.statusText + '</p>';
                 }
             } catch (error) {
-                content.innerHTML = '<p style="color:#f56c6c;">请求失败: ' + error.message + '</p>';
+                content.innerHTML = '<p style="color:#f56c6c;">Request failed: ' + error.message + '</p>';
             }
         }
         
         function renderInjectionInfo(data) {
             let html = '';
             
-            // 基本信息
+            // Basic information
             html += '<div style="background:var(--bg-tertiary); padding:15px; border-radius:8px; margin-bottom:15px;">';
-            html += '<h3 style="margin:0 0 10px 0; color:var(--accent-primary);">📌 基本信息</h3>';
+            html += '<h3 style="margin:0 0 10px 0; color:var(--accent-primary);">📌 Basic Information</h3>';
             html += '<div style="display:grid; grid-template-columns:1fr 1fr; gap:8px; font-size:0.85rem;">';
-            html += '<div>请求 ID: <span style="color:var(--accent-primary)">' + (data.request_id || '-') + '</span></div>';
-            html += '<div>时间: <span style="color:var(--text-secondary)">' + (data.timestamp || '-') + '</span></div>';
-            html += '<div>用户 ID: <span style="color:var(--text-secondary)">' + (data.user_id || '-') + '</span></div>';
-            html += '<div>会话 ID: <span style="color:var(--text-secondary)">' + (data.session_id || '-') + '</span></div>';
-            html += '<div>总延迟: <span style="color:var(--accent-warning)">' + (data.total_latency_ms?.toFixed(1) || 0) + ' ms</span></div>';
-            html += '<div>注入开销: <span style="color:var(--accent-warning)">' + (data.injection_overhead_ms?.toFixed(1) || 0) + ' ms</span></div>';
+            html += '<div>Request ID: <span style="color:var(--accent-primary)">' + (data.request_id || '-') + '</span></div>';
+            html += '<div>Timestamp: <span style="color:var(--text-secondary)">' + (data.timestamp || '-') + '</span></div>';
+            html += '<div>User ID: <span style="color:var(--text-secondary)">' + (data.user_id || '-') + '</span></div>';
+            html += '<div>Session ID: <span style="color:var(--text-secondary)">' + (data.session_id || '-') + '</span></div>';
+            html += '<div>Total Latency: <span style="color:var(--accent-warning)">' + (data.total_latency_ms?.toFixed(1) || 0) + ' ms</span></div>';
+            html += '<div>Injection Overhead: <span style="color:var(--accent-warning)">' + (data.injection_overhead_ms?.toFixed(1) || 0) + ' ms</span></div>';
             html += '</div></div>';
             
-            // Token 分布
+            // Token distribution
             const dist = data.token_distribution || {};
             html += '<div style="background:var(--bg-tertiary); padding:15px; border-radius:8px; margin-bottom:15px;">';
-            html += '<h3 style="margin:0 0 10px 0; color:var(--accent-primary);">📊 Token 分布</h3>';
+            html += '<h3 style="margin:0 0 10px 0; color:var(--accent-primary);">📊 Token Distribution</h3>';
             html += '<div style="display:flex; gap:20px; font-size:0.85rem;">';
-            html += '<div style="text-align:center; flex:1;"><div style="font-size:1.5rem; font-weight:bold; color:#3b82f6;">' + (dist.query || 0) + '</div><div style="color:var(--text-secondary);">查询</div></div>';
-            html += '<div style="text-align:center; flex:1;"><div style="font-size:1.5rem; font-weight:bold; color:#10b981;">' + (dist.preference || 0) + '</div><div style="color:var(--text-secondary);">偏好 (K/V)</div></div>';
-            html += '<div style="text-align:center; flex:1;"><div style="font-size:1.5rem; font-weight:bold; color:#f59e0b;">' + (dist.history || 0) + '</div><div style="color:var(--text-secondary);">历史 (后缀)</div></div>';
-            html += '<div style="text-align:center; flex:1;"><div style="font-size:1.5rem; font-weight:bold; color:var(--accent-primary);">' + (dist.total || 0) + '</div><div style="color:var(--text-secondary);">总计</div></div>';
+            html += '<div style="text-align:center; flex:1;"><div style="font-size:1.5rem; font-weight:bold; color:#3b82f6;">' + (dist.query || 0) + '</div><div style="color:var(--text-secondary);">Query</div></div>';
+            html += '<div style="text-align:center; flex:1;"><div style="font-size:1.5rem; font-weight:bold; color:#10b981;">' + (dist.preference || 0) + '</div><div style="color:var(--text-secondary);">Preference (K/V)</div></div>';
+            html += '<div style="text-align:center; flex:1;"><div style="font-size:1.5rem; font-weight:bold; color:#f59e0b;">' + (dist.history || 0) + '</div><div style="color:var(--text-secondary);">History (Suffix)</div></div>';
+            html += '<div style="text-align:center; flex:1;"><div style="font-size:1.5rem; font-weight:bold; color:var(--accent-primary);">' + (dist.total || 0) + '</div><div style="color:var(--text-secondary);">Total</div></div>';
             html += '</div></div>';
             
-            // 原始查询
+            // Original query
             html += '<div style="background:var(--bg-tertiary); padding:15px; border-radius:8px; margin-bottom:15px;">';
-            html += '<h3 style="margin:0 0 10px 0; color:var(--accent-primary);">💬 原始查询</h3>';
+            html += '<h3 style="margin:0 0 10px 0; color:var(--accent-primary);">💬 Original Query</h3>';
             html += '<pre style="background:var(--bg-primary); padding:10px; border-radius:6px; color:var(--text-primary); white-space:pre-wrap; word-break:break-all; max-height:100px; overflow:auto;">' + escapeHtml(data.original_query || '') + '</pre>';
             html += '</div>';
             
-            // DKI 偏好注入
+            // DKI Preference Injection
             html += '<div style="background:var(--bg-tertiary); padding:15px; border-radius:8px; margin-bottom:15px; border-left:4px solid #10b981;">';
-            html += '<h3 style="margin:0 0 10px 0; color:#10b981;">🧠 DKI 偏好注入 (K/V, 负位置)</h3>';
-            html += '<pre style="background:var(--bg-primary); padding:10px; border-radius:6px; color:var(--text-primary); white-space:pre-wrap; word-break:break-all; max-height:200px; overflow:auto;">' + escapeHtml(data.preference_text || '(无偏好注入)') + '</pre>';
+            html += '<h3 style="margin:0 0 10px 0; color:#10b981;">🧠 DKI Preference Injection (K/V, Negative Position)</h3>';
+            html += '<pre style="background:var(--bg-primary); padding:10px; border-radius:6px; color:var(--text-primary); white-space:pre-wrap; word-break:break-all; max-height:200px; overflow:auto;">' + escapeHtml(data.preference_text || '(No preference injection)') + '</pre>';
             html += '</div>';
             
-            // DKI 历史后缀
+            // DKI History Suffix
             html += '<div style="background:var(--bg-tertiary); padding:15px; border-radius:8px; margin-bottom:15px; border-left:4px solid #f59e0b;">';
-            html += '<h3 style="margin:0 0 10px 0; color:#f59e0b;">📜 DKI 历史后缀 (Suffix, 正位置)</h3>';
-            html += '<pre style="background:var(--bg-primary); padding:10px; border-radius:6px; color:var(--text-primary); white-space:pre-wrap; word-break:break-all; max-height:300px; overflow:auto;">' + escapeHtml(data.history_suffix_text || '(无历史后缀)') + '</pre>';
+            html += '<h3 style="margin:0 0 10px 0; color:#f59e0b;">📜 DKI History Suffix (Suffix, Positive Position)</h3>';
+            html += '<pre style="background:var(--bg-primary); padding:10px; border-radius:6px; color:var(--text-primary); white-space:pre-wrap; word-break:break-all; max-height:300px; overflow:auto;">' + escapeHtml(data.history_suffix_text || '(No history suffix)') + '</pre>';
             html += '</div>';
             
-            // 历史消息
+            // History messages
             if (data.history_messages && data.history_messages.length > 0) {
                 html += '<div style="background:var(--bg-tertiary); padding:15px; border-radius:8px; margin-bottom:15px;">';
-                html += '<h3 style="margin:0 0 10px 0; color:var(--accent-primary);">💬 历史消息 (' + data.history_messages.length + ' 条)</h3>';
+                html += '<h3 style="margin:0 0 10px 0; color:var(--accent-primary);">💬 History Messages (' + data.history_messages.length + ' messages)</h3>';
                 for (const msg of data.history_messages) {
                     const isUser = msg.role === 'user';
                     html += '<div style="padding:8px 12px; margin-bottom:6px; border-radius:8px; background:' + (isUser ? 'rgba(99,102,241,0.2)' : 'var(--bg-primary)') + '; font-size:0.85rem;">';
-                    html += '<span style="color:' + (isUser ? 'var(--accent-primary)' : 'var(--accent-success)') + '; font-weight:bold;">' + (isUser ? '用户' : '助手') + ':</span> ';
+                    html += '<span style="color:' + (isUser ? 'var(--accent-primary)' : 'var(--accent-success)') + '; font-weight:bold;">' + (isUser ? 'User' : 'Assistant') + ':</span> ';
                     html += escapeHtml(msg.content || '');
                     html += '</div>';
                 }
                 html += '</div>';
             }
             
-            // 最终输入预览
+            // Final input preview
             html += '<div style="background:var(--bg-tertiary); padding:15px; border-radius:8px; margin-bottom:15px; border-left:4px solid var(--accent-primary);">';
-            html += '<h3 style="margin:0 0 10px 0; color:var(--accent-primary);">📄 最终输入预览</h3>';
+            html += '<h3 style="margin:0 0 10px 0; color:var(--accent-primary);">📄 Final Input Preview</h3>';
             html += '<pre style="background:var(--bg-primary); padding:10px; border-radius:6px; color:var(--text-primary); white-space:pre-wrap; word-break:break-all; max-height:400px; overflow:auto;">' + escapeHtml(data.final_input_preview || '') + '</pre>';
             html += '</div>';
             
-            // 流程步骤
+            // Flow steps
             if (data.flow_steps && data.flow_steps.length > 0) {
                 html += '<div style="background:var(--bg-tertiary); padding:15px; border-radius:8px; margin-bottom:15px;">';
-                html += '<h3 style="margin:0 0 10px 0; color:var(--accent-primary);">⚡ 注入流程步骤</h3>';
+                html += '<h3 style="margin:0 0 10px 0; color:var(--accent-primary);">⚡ Injection Flow Steps</h3>';
                 for (const step of data.flow_steps) {
                     const statusColor = step.status === 'completed' ? '#10b981' : step.status === 'skipped' ? '#94a3b8' : '#f59e0b';
                     html += '<div style="display:flex; align-items:center; gap:10px; padding:6px 0; border-bottom:1px solid var(--border-color);">';
@@ -1498,22 +2060,22 @@ def get_index_html() -> str:
         
         function copyInjectionText() {
             if (!lastInjectionData) {
-                alert('无注入数据可复制');
+                alert('No injection data to copy');
                 return;
             }
             
-            let text = '=== DKI 注入信息 ===\\n';
-            text += '请求 ID: ' + (lastInjectionData.request_id || '-') + '\\n';
-            text += '时间: ' + (lastInjectionData.timestamp || '-') + '\\n';
-            text += '\\n== 偏好注入 (K/V) ==\\n';
-            text += (lastInjectionData.preference_text || '(无)') + '\\n';
-            text += '\\n== 历史后缀 (Suffix) ==\\n';
-            text += (lastInjectionData.history_suffix_text || '(无)') + '\\n';
-            text += '\\n== 最终输入 ==\\n';
-            text += (lastInjectionData.final_input_preview || '(无)') + '\\n';
+            let text = '=== DKI Injection Info ===\\n';
+            text += 'Request ID: ' + (lastInjectionData.request_id || '-') + '\\n';
+            text += 'Timestamp: ' + (lastInjectionData.timestamp || '-') + '\\n';
+            text += '\\n== Preference Injection (K/V) ==\\n';
+            text += (lastInjectionData.preference_text || '(None)') + '\\n';
+            text += '\\n== History Suffix ==\\n';
+            text += (lastInjectionData.history_suffix_text || '(None)') + '\\n';
+            text += '\\n== Final Input ==\\n';
+            text += (lastInjectionData.final_input_preview || '(None)') + '\\n';
             
             navigator.clipboard.writeText(text).then(() => {
-                alert('已复制到剪贴板');
+                alert('Copied to clipboard');
             }).catch(() => {
                 // Fallback
                 const textarea = document.createElement('textarea');
@@ -1522,7 +2084,7 @@ def get_index_html() -> str:
                 textarea.select();
                 document.execCommand('copy');
                 document.body.removeChild(textarea);
-                alert('已复制到剪贴板');
+                alert('Copied to clipboard');
             });
         }
         
@@ -1531,9 +2093,12 @@ def get_index_html() -> str:
             if (e.target === this) closeInjectionModal();
         });
         
-        // Close modal on Escape
+        // Close modals on Escape
         document.addEventListener('keydown', function(e) {
-            if (e.key === 'Escape') closeInjectionModal();
+            if (e.key === 'Escape') {
+                closeInjectionModal();
+                closeExperimentModal();
+            }
         });
     </script>
 </body>

@@ -14,7 +14,8 @@ from loguru import logger
 
 from dki.database.models import (
     Session, Memory, Conversation, KVCache, 
-    Experiment, ExperimentResult, AuditLog, DemoUser, UserPreference
+    Experiment, ExperimentResult, AuditLog, DemoUser, UserPreference,
+    FunctionCallLog,
 )
 
 
@@ -87,6 +88,19 @@ class SessionRepository(BaseRepository):
             session.updated_at = datetime.utcnow()
             self.db.flush()
         return session
+    
+    def list_all(self, limit: int = 200) -> List[Session]:
+        """List all sessions (ordered by most recent)."""
+        return (
+            self.db.query(Session)
+            .order_by(desc(Session.updated_at))
+            .limit(limit)
+            .all()
+        )
+    
+    def get_by_id(self, session_id: str) -> Optional[Session]:
+        """Alias for get() - for consistency with other repos."""
+        return self.get(session_id)
     
     def delete(self, session_id: str) -> bool:
         """Soft delete session."""
@@ -283,6 +297,10 @@ class ConversationRepository(BaseRepository):
         
         # 反转以获得时间顺序 (从旧到新)
         return list(reversed(conversations))
+    
+    def get_by_id(self, message_id: str) -> Optional[Conversation]:
+        """Get a conversation entry by ID."""
+        return self.db.query(Conversation).filter(Conversation.id == message_id).first()
 
 
 class ExperimentRepository(BaseRepository):
@@ -586,3 +604,123 @@ class UserPreferenceRepository(BaseRepository):
             .limit(limit)
             .all()
         )
+
+
+class FunctionCallLogRepository(BaseRepository):
+    """
+    Repository for FunctionCallLog operations (v3.2)
+    
+    记录和查询 DKI 系统中的 function call 日志,
+    支持按 session_id / request_id / user_id 查询。
+    """
+    
+    def create(
+        self,
+        session_id: str,
+        function_name: str,
+        arguments: Dict[str, Any],
+        user_id: Optional[str] = None,
+        turn_id: Optional[str] = None,
+        request_id: Optional[str] = None,
+        round_index: int = 0,
+        response_text: Optional[str] = None,
+        response_tokens: int = 0,
+        status: str = "success",
+        error_message: Optional[str] = None,
+        prompt_before: Optional[str] = None,
+        prompt_after: Optional[str] = None,
+        model_output_before: Optional[str] = None,
+        latency_ms: float = 0,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> FunctionCallLog:
+        """Create a new function call log entry."""
+        log_entry = FunctionCallLog(
+            session_id=session_id,
+            user_id=user_id,
+            turn_id=turn_id,
+            request_id=request_id,
+            round_index=round_index,
+            function_name=function_name,
+            response_text=response_text,
+            response_tokens=response_tokens,
+            status=status,
+            error_message=error_message,
+            prompt_before=prompt_before,
+            prompt_after=prompt_after,
+            model_output_before=model_output_before,
+            latency_ms=latency_ms,
+        )
+        log_entry.arguments = arguments
+        
+        if metadata:
+            log_entry.set_extra_metadata(metadata)
+        
+        self.db.add(log_entry)
+        self.db.flush()
+        logger.debug(
+            f"Created function call log: {function_name} "
+            f"(session={session_id}, round={round_index})"
+        )
+        return log_entry
+    
+    def get_by_session(
+        self,
+        session_id: str,
+        limit: int = 100,
+    ) -> List[FunctionCallLog]:
+        """Get all function call logs for a session."""
+        return (
+            self.db.query(FunctionCallLog)
+            .filter(FunctionCallLog.session_id == session_id)
+            .order_by(FunctionCallLog.created_at, FunctionCallLog.round_index)
+            .limit(limit)
+            .all()
+        )
+    
+    def get_by_request_id(
+        self,
+        request_id: str,
+    ) -> List[FunctionCallLog]:
+        """Get all function call logs for a specific request."""
+        return (
+            self.db.query(FunctionCallLog)
+            .filter(FunctionCallLog.request_id == request_id)
+            .order_by(FunctionCallLog.round_index)
+            .all()
+        )
+    
+    def get_by_user(
+        self,
+        user_id: str,
+        limit: int = 100,
+    ) -> List[FunctionCallLog]:
+        """Get all function call logs for a user."""
+        return (
+            self.db.query(FunctionCallLog)
+            .filter(FunctionCallLog.user_id == user_id)
+            .order_by(desc(FunctionCallLog.created_at))
+            .limit(limit)
+            .all()
+        )
+    
+    def get_stats(
+        self,
+        session_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Get function call statistics."""
+        query = self.db.query(FunctionCallLog)
+        if session_id:
+            query = query.filter(FunctionCallLog.session_id == session_id)
+        
+        total = query.count()
+        success = query.filter(FunctionCallLog.status == "success").count()
+        error = query.filter(FunctionCallLog.status == "error").count()
+        budget_exceeded = query.filter(FunctionCallLog.status == "budget_exceeded").count()
+        
+        return {
+            "total": total,
+            "success": success,
+            "error": error,
+            "budget_exceeded": budget_exceeded,
+            "success_rate": success / total if total > 0 else 0,
+        }

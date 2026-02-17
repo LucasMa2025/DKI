@@ -117,6 +117,7 @@ class RAGSystem:
         content: str,
         memory_id: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        skip_db: bool = False,
     ) -> str:
         """
         Add a memory to the system.
@@ -126,6 +127,9 @@ class RAGSystem:
             content: Memory content
             memory_id: Optional memory ID
             metadata: Optional metadata
+            skip_db: If True, skip database insertion (memory already in DB,
+                      only add to in-memory router). This avoids UNIQUE constraint
+                      violations when DKI and RAG share the same database.
             
         Returns:
             Memory ID
@@ -133,25 +137,46 @@ class RAGSystem:
         # Compute embedding
         embedding = self.embedding_service.embed(content)
         
-        # Store in database
-        with self.db_manager.session_scope() as db:
-            session_repo = SessionRepository(db)
-            memory_repo = MemoryRepository(db)
-            
-            # Ensure session exists
-            session_repo.get_or_create(session_id)
-            
-            # Create memory
-            memory = memory_repo.create(
-                session_id=session_id,
-                content=content,
-                embedding=embedding,
-                memory_id=memory_id,
-                metadata=metadata,
-            )
-            memory_id = memory.id
+        if not skip_db:
+            # Store in database
+            with self.db_manager.session_scope() as db:
+                session_repo = SessionRepository(db)
+                memory_repo = MemoryRepository(db)
+                
+                # Ensure session exists
+                session_repo.get_or_create(session_id)
+                
+                # Check if memory already exists (avoid UNIQUE constraint violation)
+                if memory_id:
+                    existing = memory_repo.get(memory_id)
+                    if existing:
+                        logger.debug(f"Memory {memory_id} already exists in DB, skipping insert")
+                        memory_id = existing.id
+                    else:
+                        memory = memory_repo.create(
+                            session_id=session_id,
+                            content=content,
+                            embedding=embedding,
+                            memory_id=memory_id,
+                            metadata=metadata,
+                        )
+                        memory_id = memory.id
+                else:
+                    memory = memory_repo.create(
+                        session_id=session_id,
+                        content=content,
+                        embedding=embedding,
+                        memory_id=memory_id,
+                        metadata=metadata,
+                    )
+                    memory_id = memory.id
+        else:
+            # skip_db mode: memory_id must be provided
+            if not memory_id:
+                from dki.database.repository import BaseRepository
+                memory_id = BaseRepository.generate_id("mem_")
         
-        # Add to router
+        # Add to router (in-memory index)
         self.memory_router.add_memory(
             memory_id=memory_id,
             content=content,
@@ -159,7 +184,7 @@ class RAGSystem:
             metadata=metadata,
         )
         
-        logger.debug(f"Added memory: {memory_id}")
+        logger.debug(f"Added memory: {memory_id} (skip_db={skip_db})")
         return memory_id
     
     def load_memories_from_db(self, session_id: str) -> int:

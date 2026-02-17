@@ -299,6 +299,80 @@ class AuditLog(Base):
         self._metadata = json.dumps(value, ensure_ascii=False)
 
 
+class FunctionCallLog(Base):
+    """
+    Function Call 日志模型 (v3.2)
+    
+    记录 DKI 系统中的 function call (如 retrieve_fact) 的完整信息,
+    包括调用参数、返回结果、prompt 快照等。
+    
+    用途:
+    - 调试: 查看每次 fact call 的输入输出
+    - 可视化: 在 UI 中展示 function call 列表
+    - 审计: 追踪 function call 的调用链路
+    - 分析: 统计 function call 的使用频率和效果
+    """
+    
+    __tablename__ = 'function_call_logs'
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    session_id = Column(String(64), nullable=False, index=True)
+    user_id = Column(String(64), index=True)
+    turn_id = Column(String(64))          # 关联的对话轮次 (conversation.id)
+    request_id = Column(String(64), index=True)  # 关联的请求 ID
+    round_index = Column(Integer, default=0)     # fact call 轮次 (0-based)
+    function_name = Column(String(128), nullable=False)  # 函数名
+    _arguments = Column('arguments', Text, default='{}')  # 函数参数 (JSON)
+    response_text = Column(Text)           # 函数返回文本
+    response_tokens = Column(Integer, default=0)  # 返回文本 token 估算
+    status = Column(String(32), default='success')  # success, error, timeout, budget_exceeded
+    error_message = Column(Text)           # 错误信息
+    prompt_before = Column(Text)           # 调用前的完整 prompt
+    prompt_after = Column(Text)            # 调用后的完整 prompt
+    model_output_before = Column(Text)     # 触发 function call 的模型输出
+    latency_ms = Column(Float, default=0)  # 函数调用耗时 (ms)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    _metadata = Column('metadata', Text, default='{}')
+    
+    @hybrid_property
+    def arguments(self) -> Dict[str, Any]:
+        return json.loads(self._arguments) if self._arguments else {}
+    
+    @arguments.setter
+    def arguments(self, value: Dict[str, Any]):
+        self._arguments = json.dumps(value, ensure_ascii=False)
+    
+    def get_extra_metadata(self) -> Dict[str, Any]:
+        """Get metadata as dict."""
+        return json.loads(self._metadata) if self._metadata else {}
+    
+    def set_extra_metadata(self, value: Dict[str, Any]) -> None:
+        """Set metadata from dict."""
+        self._metadata = json.dumps(value, ensure_ascii=False)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'id': self.id,
+            'session_id': self.session_id,
+            'user_id': self.user_id,
+            'turn_id': self.turn_id,
+            'request_id': self.request_id,
+            'round_index': self.round_index,
+            'function_name': self.function_name,
+            'arguments': self.arguments,
+            'response_text': self.response_text,
+            'response_tokens': self.response_tokens,
+            'status': self.status,
+            'error_message': self.error_message,
+            'prompt_before': self.prompt_before,
+            'prompt_after': self.prompt_after,
+            'model_output_before': self.model_output_before,
+            'latency_ms': self.latency_ms,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'metadata': self.get_extra_metadata(),
+        }
+
+
 class ModelRegistry(Base):
     """Model registry for tracking available models."""
     

@@ -125,8 +125,8 @@ Please provide a coherent response after understanding the historical context.
     DEFAULT_HISTORY_SUFFIX_EN = """
 ---
 [End of Session History]
-Please respond based on the above history and the user's current question.
-Note: Historical information is for reference; please answer comprehensively.
+IMPORTANT: The above history is for context only. Focus on answering the user's CURRENT question below.
+Do NOT repeat or continue topics from the history unless the user explicitly asks about them.
 """
     
     DEFAULT_HISTORY_PREFIX_CN = """
@@ -141,8 +141,8 @@ Note: Historical information is for reference; please answer comprehensively.
     DEFAULT_HISTORY_SUFFIX_CN = """
 ---
 [会话历史结束]
-请基于以上历史和用户当前问题，使用中文给出回复。
-注意：历史信息仅供参考，请综合回答。
+重要：以上历史仅供参考上下文。请专注回答用户下面的【当前问题】。
+不要重复或继续历史中的话题，除非用户明确提问。
 """
     
     def __init__(
@@ -222,8 +222,11 @@ Note: Historical information is for reference; please answer comprehensively.
                     for msg in history.get_recent(self.config.history_max_messages)
                 ]
         
-        # 3. User query (当前问题)
-        text_parts.append(f"User: {user_query}")
+        # 3. User query (当前问题) — 用明确标记区分，防止模型混淆历史和当前问题
+        if self.language == "cn":
+            text_parts.append(f"[当前问题]\n用户: {user_query}")
+        else:
+            text_parts.append(f"[Current Question]\nUser: {user_query}")
         
         result.input_text = "\n\n".join(text_parts)
         result.total_tokens = self._estimate_tokens(result.input_text)
@@ -283,8 +286,14 @@ Note: Historical information is for reference; please answer comprehensively.
         2. Guides processing ("understand context, then respond")
         3. Sets expectations ("comprehensive answer")
         
-        Safety: Filters out messages that contain injection template markers
-        to prevent recursive nesting of history prompts.
+        Safety measures:
+        1. Filters out messages that contain injection template markers
+           to prevent recursive nesting of history prompts.
+        2. Truncates long assistant responses to prevent them from
+           dominating the context and causing the model to respond
+           to historical topics instead of the current query.
+        3. Filters out assistant responses that contain embedded questions
+           or topics unrelated to the conversation flow.
         """
         if not history.messages:
             return ""
@@ -294,12 +303,22 @@ Note: Historical information is for reference; please answer comprehensively.
         
         # 安全过滤: 跳过包含注入模板标记的消息 (防止递归嵌套)
         # 这些标记表明消息内容是之前注入的历史后缀，不应再次嵌套
+        # 注入模板标记: 仅匹配 DKI 系统注入的特殊标记, 不匹配正常角色标签
+        # "Assistant:" / "助手:" 是正常角色标签, 不应在此过滤
         injection_markers = [
             "[会话历史参考]",
             "[Session History Reference]",
             "[会话历史结束]",
             "[End of Session History]",
+            "[AI助手]",
+            "[当前问题]",
+            "[Current Question]",
         ]
+        
+        # Maximum length for a single assistant response in history
+        # Long responses dominate context and cause the model to "continue"
+        # the historical topic rather than answer the current question
+        MAX_ASSISTANT_RESPONSE_CHARS = 200
         
         # Format messages (过滤掉包含注入标记的消息)
         lines = []
@@ -318,6 +337,12 @@ Note: Historical information is for reference; please answer comprehensively.
             role_label = "User" if msg.role == "user" else "Assistant"
             if self.language == "cn":
                 role_label = "用户" if msg.role == "user" else "助手"
+            
+            # 截断过长的 assistant 回复，只保留摘要
+            # 这是防止"无关问题"污染当前 prompt 的关键措施
+            if msg.role == "assistant" and len(content) > MAX_ASSISTANT_RESPONSE_CHARS:
+                content = content[:MAX_ASSISTANT_RESPONSE_CHARS] + "..."
+            
             lines.append(f"{role_label}: {content}")
         
         if not lines:
@@ -380,28 +405,38 @@ Note: Historical information is for reference; please answer comprehensively.
                     preference.token_count = int(len(preference.content.split()) * 1.3)
                 
                 # Compute K/V through model
+                # Note: compute_kv now returns CPU tensors to avoid GPU memory leaks
                 if hasattr(self.model, 'compute_kv'):
                     kv_entries, _ = self.model.compute_kv(preference.content)
                     preference.kv_cache = kv_entries
                     self._preference_cache[cache_key] = kv_entries
                     return kv_entries
                 elif hasattr(self.model, 'forward') and hasattr(self.model, 'model'):
-                    # HuggingFace style
+                    # HuggingFace style - move to CPU to prevent GPU memory leak
                     outputs = self.model.model(
                         input_ids=tokens,
                         use_cache=True,
                         return_dict=True,
                     )
                     kv_cache = outputs.past_key_values
-                    preference.kv_cache = kv_cache
-                    self._preference_cache[cache_key] = kv_cache
-                    return kv_cache
+                    # Detach and move to CPU to avoid GPU memory accumulation
+                    cpu_kv_cache = tuple(
+                        (k.detach().cpu(), v.detach().cpu()) for k, v in kv_cache
+                    )
+                    del outputs, kv_cache
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    preference.kv_cache = cpu_kv_cache
+                    self._preference_cache[cache_key] = cpu_kv_cache
+                    return cpu_kv_cache
                 else:
                     logger.warning("Model does not support K/V computation")
                     return None
                     
         except Exception as e:
             logger.error(f"Failed to compute preference K/V: {e}")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             return None
     
     def _estimate_tokens(self, text: str) -> int:

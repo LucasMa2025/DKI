@@ -73,6 +73,48 @@ class PositionConfig(BaseModel):
     strategy: str = "virtual_prefix"
 
 
+class IsolationConfig(BaseModel):
+    """User isolation configuration (v3.1)."""
+    enabled: bool = True
+    cache_key_secret: str = ""
+    security_level: str = "strict"  # strict | standard | relaxed
+    verify_session_ownership: bool = True
+    audit_enabled: bool = True
+    audit_max_entries: int = 10000
+    enable_inference_guard: bool = True
+
+
+class PreferenceStoreConfig(BaseModel):
+    """Preference store configuration."""
+    max_users: int = 1000
+    ttl_seconds: int = 3600
+
+
+class ExecutorCacheConfig(BaseModel):
+    """Executor cache configuration."""
+    max_total: int = 10000
+    max_per_user: int = 100
+
+
+class HybridPreferenceConfig(BaseModel):
+    """Hybrid injection preference configuration."""
+    alpha: float = 0.4           # 偏好注入强度 (K/V)
+    enabled: bool = True
+
+
+class HybridHistoryConfig(BaseModel):
+    """Hybrid injection history configuration."""
+    max_turns: int = 10          # 最大历史轮数
+    enabled: bool = True
+
+
+class HybridInjectionConfigModel(BaseModel):
+    """Hybrid injection configuration (v3.2)."""
+    enabled: bool = True
+    preference: HybridPreferenceConfig = Field(default_factory=HybridPreferenceConfig)
+    history: HybridHistoryConfig = Field(default_factory=HybridHistoryConfig)
+
+
 class DKIConfig(BaseModel):
     """DKI module configuration."""
     enabled: bool = True
@@ -85,6 +127,21 @@ class DKIConfig(BaseModel):
     
     # Use tiered cache instead of simple cache
     use_tiered_cache: bool = True
+    
+    # Injection strategy (v3.2: only recall_v4 supported)
+    injection_strategy: str = "recall_v4"
+    
+    # Hybrid injection configuration (v3.2)
+    hybrid_injection: HybridInjectionConfigModel = Field(default_factory=HybridInjectionConfigModel)
+    
+    # User isolation (v3.1)
+    isolation: IsolationConfig = Field(default_factory=IsolationConfig)
+    
+    # Preference store
+    preference_store: PreferenceStoreConfig = Field(default_factory=PreferenceStoreConfig)
+    
+    # Executor cache
+    executor_cache: ExecutorCacheConfig = Field(default_factory=ExecutorCacheConfig)
 
 
 class RAGConfig(BaseModel):

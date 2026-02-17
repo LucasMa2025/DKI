@@ -286,6 +286,17 @@ class DKISystem:
             echo=self.config.database.echo,
         )
         
+        # ============ Function Call Logger (v3.2) ============
+        self._fc_logger: Optional[Any] = None
+        try:
+            from dki.core.function_call_logger import FunctionCallLogger
+            self._fc_logger = FunctionCallLogger(
+                db_manager=self.db_manager,
+                text_log_dir="logs/function_calls",
+            )
+        except Exception as fc_err:
+            logger.warning(f"FunctionCallLogger init failed (non-critical): {fc_err}")
+        
         # ============ Recall v4 组件 (惰性初始化) ============
         self._recall_config: Optional[Any] = None
         self._multi_signal_recall: Optional[Any] = None
@@ -395,15 +406,25 @@ class DKISystem:
             
             logger.info(f"Creating HybridDKIInjector with language={language}")
             
-            # 获取 tokenizer: 优先从 model_adapter 获取，确保 token 估算准确
-            # 如果 tokenizer=None，中文文本的 token 估算会严重偏低（因为中文不按空格分词）
+            # Ensure model adapter is loaded before creating injector
+            # This is needed for preference K/V computation
+            model_adapter = self._model_adapter
+            if model_adapter is None:
+                try:
+                    model_adapter = self.model  # triggers lazy load
+                except Exception as e:
+                    logger.warning(f"Failed to load model adapter for hybrid injector: {e}")
+                    model_adapter = None
+            
+            # Get tokenizer: prefer from model_adapter for accurate token estimation
+            # If tokenizer=None, Chinese text token estimation will be severely underestimated
             tokenizer = None
-            if self._model_adapter is not None and hasattr(self._model_adapter, 'tokenizer'):
-                tokenizer = self._model_adapter.tokenizer
+            if model_adapter is not None and hasattr(model_adapter, 'tokenizer'):
+                tokenizer = model_adapter.tokenizer
             
             self._hybrid_injector = HybridDKIInjector(
                 config=config,
-                model=self._model_adapter,
+                model=model_adapter,
                 tokenizer=tokenizer,
                 language=language,
             )
@@ -805,60 +826,82 @@ class DKISystem:
             recall_v4_suffix = None
             recall_v4_trace_ids = []
             
+            _recall_v4_failed = False
+            
             if self._use_recall_v4 and use_hybrid_mode and allow_injection:
                 # ============ Recall v4: 多信号召回 + 后缀组装 ============
-                timer.start_stage("recall_v4")
-                self._init_recall_v4_components()
-                
-                # Get user preference (for K/V injection, 不变)
-                preference = None
-                if user_id:
-                    preference = self.get_user_preference(user_id)
-                
-                # 多信号召回
-                recall_result = self._multi_signal_recall.recall(
-                    query=query,
-                    session_id=session_id,
-                    user_id=user_id,
-                )
-                
-                # 后缀组装
-                context_window = 4096
-                if hasattr(self.config.model, 'engines'):
-                    engine_cfg = self.config.model.engines.get(
-                        self.config.model.default_engine, {}
+                try:
+                    timer.start_stage("recall_v4")
+                    self._init_recall_v4_components()
+                    
+                    # Get user preference (for K/V injection, 不变)
+                    preference = None
+                    if user_id:
+                        preference = self.get_user_preference(user_id)
+                    
+                    # 多信号召回
+                    recall_result = self._multi_signal_recall.recall(
+                        query=query,
+                        session_id=session_id,
+                        user_id=user_id,
                     )
-                    context_window = getattr(engine_cfg, 'max_model_len', 4096) if hasattr(engine_cfg, 'max_model_len') else 4096
-                
-                pref_tokens = 0
-                if preference:
-                    pref_tokens = len(preference.content.split()) * 2  # 粗估
-                
-                assembled = self._suffix_builder.build(
-                    query=query,
-                    recalled_messages=recall_result.messages,
-                    context_window=context_window,
-                    preference_tokens=pref_tokens,
-                )
-                
-                recall_v4_suffix = assembled.text
-                recall_v4_trace_ids = assembled.trace_ids
-                
-                # 使用组装好的后缀替代 query
-                if assembled.total_tokens > 0:
-                    query = assembled.text
-                
-                # 仍然准备 hybrid_result 用于偏好 K/V 注入 (history 已由 recall_v4 处理)
-                if preference:
-                    hybrid_result = self.hybrid_injector.prepare_input(
-                        user_query=original_query,
-                        preference=preference,
-                        history=None,
+                    
+                    # 后缀组装
+                    context_window = 4096
+                    if hasattr(self.config.model, 'engines'):
+                        engine_cfg = self.config.model.engines.get(
+                            self.config.model.default_engine, {}
+                        )
+                        context_window = getattr(engine_cfg, 'max_model_len', 4096) if hasattr(engine_cfg, 'max_model_len') else 4096
+                    
+                    pref_tokens = 0
+                    if preference:
+                        # 中文: 约 1.5 token/字; 英文: 约 1.3 token/word
+                        import re as _re
+                        _cn = len(_re.findall(r'[\u4e00-\u9fff]', preference.content))
+                        _en = len(_re.findall(r'[a-zA-Z]+', preference.content))
+                        pref_tokens = int(_cn * 1.5 + _en * 1.3) or 1
+                    
+                    assembled = self._suffix_builder.build(
+                        query=query,
+                        recalled_messages=recall_result.messages,
+                        context_window=context_window,
+                        preference_tokens=pref_tokens,
                     )
+                    
+                    recall_v4_suffix = assembled.text
+                    recall_v4_trace_ids = assembled.trace_ids
+                    
+                    # 使用组装好的后缀替代 query
+                    if assembled.total_tokens > 0:
+                        query = assembled.text
+                    
+                    # 仍然准备 hybrid_result 用于偏好 K/V 注入 (history 已由 recall_v4 处理)
+                    if preference:
+                        hybrid_result = self.hybrid_injector.prepare_input(
+                            user_query=original_query,
+                            preference=preference,
+                            history=None,
+                        )
+                    
+                    timer.end_stage()
                 
-                timer.end_stage()
-                
-            elif use_hybrid_mode and allow_injection:
+                except Exception as recall_error:
+                    logger.error(
+                        f"Recall v4 failed, falling back to stable (hybrid): {recall_error}"
+                    )
+                    _recall_v4_failed = True
+                    # 重置 query 到原始输入
+                    query = original_query
+                    recall_v4_suffix = None
+                    recall_v4_trace_ids = []
+                    try:
+                        timer.end_stage()
+                    except Exception:
+                        pass
+            
+            if (_recall_v4_failed and use_hybrid_mode and allow_injection) or \
+               (not self._use_recall_v4 and use_hybrid_mode and allow_injection):
                 # ============ 原有 Hybrid 注入 (flat_history) ============
                 timer.start_stage("hybrid_prep")
                 
@@ -974,6 +1017,7 @@ class DKISystem:
                     temperature=temperature,
                     preference_kv=hybrid_result.preference_kv if hybrid_result else None,
                     preference_alpha=hybrid_result.preference_alpha if hybrid_result else 0.0,
+                    user_id=user_id,
                     **kwargs,
                 )
                 timer.end_stage()
@@ -1144,13 +1188,32 @@ class DKISystem:
         else:
             merged_kv = []
         
+        # Apply alpha scaling to memory K/V (MIS) — 仅对记忆 K/V 缩放
+        # 注意: 必须在 preference merge 之前完成, 否则 preference K/V 会被双重缩放
+        if timer:
+            timer.start_stage("projection")
+        
+        if merged_kv and gating_decision.alpha < 1.0:
+            scaled_kv = []
+            for entry in merged_kv:
+                key, value = self.mis.scale_kv_values(
+                    entry.key, entry.value, gating_decision.alpha
+                )
+                scaled_kv.append(KVCacheEntry(key=key, value=value, layer_idx=entry.layer_idx))
+            merged_kv = scaled_kv
+        
+        if timer:
+            timer.end_stage()
+        
         # Add preference K/V if available (hybrid injection)
+        # Preference K/V 使用自己的 preference_alpha, 不受 gating_decision.alpha 影响
         # Preference K/V is prepended (negative positions conceptually)
         if preference_kv is not None and preference_alpha > 0:
             if timer:
                 timer.start_stage("preference_merge")
             
-            # Scale preference K/V with its own alpha
+            # Scale preference K/V with its own alpha (独立缩放)
+            # Note: KV tensors may be on CPU (to save GPU memory), MIS handles this
             if isinstance(preference_kv, list) and len(preference_kv) > 0:
                 scaled_pref_kv = []
                 for entry in preference_kv:
@@ -1169,22 +1232,6 @@ class DKISystem:
             
             if timer:
                 timer.end_stage()
-        
-        # Apply alpha scaling to K/V (MIS)
-        if timer:
-            timer.start_stage("projection")
-        
-        if merged_kv and gating_decision.alpha < 1.0:
-            scaled_kv = []
-            for entry in merged_kv:
-                key, value = self.mis.scale_kv_values(
-                    entry.key, entry.value, gating_decision.alpha
-                )
-                scaled_kv.append(KVCacheEntry(key=key, value=value, layer_idx=entry.layer_idx))
-            merged_kv = scaled_kv
-        
-        if timer:
-            timer.end_stage()
         
         # Generate with injected K/V
         if timer:
@@ -1213,6 +1260,7 @@ class DKISystem:
         temperature: float,
         preference_kv: Optional[Any] = None,
         preference_alpha: float = 0.0,
+        user_id: Optional[str] = None,
         **kwargs,
     ) -> tuple:
         """
@@ -1239,15 +1287,47 @@ class DKISystem:
                 f"trace_id={fact_request.trace_id}"
             )
             
+            # ============ Function Call 日志: 记录调用前状态 ============
+            import time as _time
+            fc_start = _time.time()
+            prompt_before_call = prompt
+            model_output_before_call = output.text
+            fc_arguments = {
+                "trace_id": fact_request.trace_id,
+                "offset": fact_request.offset,
+                "limit": fact_request.limit,
+            }
+            
             # 检索事实
-            fact_response = self._fact_retriever.retrieve(
-                trace_id=fact_request.trace_id,
-                session_id=session_id,
-                offset=fact_request.offset,
-                limit=fact_request.limit,
-            )
+            try:
+                fact_response = self._fact_retriever.retrieve(
+                    trace_id=fact_request.trace_id,
+                    session_id=session_id,
+                    offset=fact_request.offset,
+                    limit=fact_request.limit,
+                )
+            except Exception as retrieve_err:
+                self._log_function_call(
+                    session_id=session_id, user_id=user_id,
+                    round_index=round_idx, function_name="retrieve_fact",
+                    arguments=fc_arguments, response_text=None,
+                    status="error", error_message=str(retrieve_err),
+                    prompt_before=prompt_before_call, prompt_after=prompt,
+                    model_output_before=model_output_before_call,
+                    latency_ms=(_time.time() - fc_start) * 1000,
+                )
+                return output, round_idx
             
             if not fact_response.messages:
+                self._log_function_call(
+                    session_id=session_id, user_id=user_id,
+                    round_index=round_idx, function_name="retrieve_fact",
+                    arguments=fc_arguments, response_text="(no facts found)",
+                    status="success",
+                    prompt_before=prompt_before_call, prompt_after=prompt,
+                    model_output_before=model_output_before_call,
+                    latency_ms=(_time.time() - fc_start) * 1000,
+                )
                 return output, round_idx
             
             # 格式化事实段落
@@ -1259,11 +1339,32 @@ class DKISystem:
             
             if total_fact_tokens > max_fact_tokens:
                 logger.info(f"Fact token budget exhausted: {total_fact_tokens}")
+                self._log_function_call(
+                    session_id=session_id, user_id=user_id,
+                    round_index=round_idx, function_name="retrieve_fact",
+                    arguments=fc_arguments, response_text=fact_text,
+                    response_tokens=fact_tokens, status="budget_exceeded",
+                    error_message=f"Total {total_fact_tokens} > max {max_fact_tokens}",
+                    prompt_before=prompt_before_call, prompt_after=prompt,
+                    model_output_before=model_output_before_call,
+                    latency_ms=(_time.time() - fc_start) * 1000,
+                )
                 return output, round_idx
             
             # 追加事实到 prompt
             continuation = "请基于以上补充事实回答用户问题。"
             prompt = prompt + "\n\n" + fact_text + "\n\n" + continuation
+            
+            # ============ Function Call 日志: 记录成功调用 ============
+            self._log_function_call(
+                session_id=session_id, user_id=user_id,
+                round_index=round_idx, function_name="retrieve_fact",
+                arguments=fc_arguments, response_text=fact_text,
+                response_tokens=fact_tokens, status="success",
+                prompt_before=prompt_before_call, prompt_after=prompt,
+                model_output_before=model_output_before_call,
+                latency_ms=(_time.time() - fc_start) * 1000,
+            )
             
             # 重新推理
             if preference_kv and preference_alpha > 0.1:
@@ -1284,6 +1385,45 @@ class DKISystem:
                 )
         
         return output, max_rounds
+    
+    def _log_function_call(
+        self,
+        session_id: str,
+        user_id: Optional[str],
+        round_index: int,
+        function_name: str,
+        arguments: Dict[str, Any],
+        response_text: Optional[str],
+        response_tokens: int = 0,
+        status: str = "success",
+        error_message: Optional[str] = None,
+        prompt_before: Optional[str] = None,
+        prompt_after: Optional[str] = None,
+        model_output_before: Optional[str] = None,
+        latency_ms: float = 0,
+    ) -> None:
+        """记录 function call 日志 (委托给 FunctionCallLogger)"""
+        if not hasattr(self, '_fc_logger') or not self._fc_logger:
+            return
+        
+        try:
+            self._fc_logger.log(
+                session_id=session_id,
+                user_id=user_id,
+                round_index=round_index,
+                function_name=function_name,
+                arguments=arguments,
+                response_text=response_text,
+                response_tokens=response_tokens,
+                status=status,
+                error_message=error_message,
+                prompt_before=prompt_before,
+                prompt_after=prompt_after,
+                model_output_before=model_output_before,
+                latency_ms=latency_ms,
+            )
+        except Exception as log_err:
+            logger.warning(f"Failed to log function call: {log_err}")
     
     def _merge_kv_entries(
         self,

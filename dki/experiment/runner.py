@@ -10,6 +10,7 @@ Runs comparison experiments between RAG and DKI
 """
 
 import json
+import re
 import time
 from datetime import datetime
 from pathlib import Path
@@ -47,6 +48,10 @@ class ExperimentConfig:
     max_new_tokens: int = 256
     temperature: float = 0.7
     alpha_values: List[float] = field(default_factory=lambda: [0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
+    # force_alpha for DKI mode (v3.2): ensures injection actually fires
+    # DualFactorGating often returns alpha<0.1 in experiment scenarios,
+    # silently skipping injection. Default 0.4 is a reasonable value.
+    force_alpha: float = 0.4
     
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -58,6 +63,7 @@ class ExperimentConfig:
             'max_new_tokens': self.max_new_tokens,
             'temperature': self.temperature,
             'alpha_values': self.alpha_values,
+            'force_alpha': self.force_alpha,
         }
 
 
@@ -457,9 +463,10 @@ class ExperimentRunner:
             score = 0
             for pref in user_data.get("preferences", []):
                 pref_text = pref["text"].lower()
-                # 简单的关键词重叠计数
-                for word in pref_text:
-                    if word in personas_text:
+                # 简单的关键词重叠计数 (按词分割, 非逐字符)
+                pref_words = re.findall(r'[\u4e00-\u9fff]+|[a-zA-Z]+', pref_text)
+                for word in pref_words:
+                    if len(word) >= 2 and word in personas_text:
                         score += 1
             
             if score > best_score:
@@ -657,6 +664,11 @@ class ExperimentRunner:
                 elif mode == 'rag':
                     self.rag_system.add_memory(session_id, mem)
             
+            # DKI mode: also write personas as user preferences so
+            # DKISystem._load_user_preferences_from_db() can find them
+            if mode == 'dki' and item.get('personas'):
+                self._write_session_preferences(user_id, item['personas'])
+            
             queries = self._extract_queries(item)
             
             for query in queries:
@@ -703,16 +715,30 @@ class ExperimentRunner:
         config: ExperimentConfig,
         user_id: Optional[str] = None,
     ) -> ExperimentResult:
-        """Run a single query and capture injection info."""
+        """Run a single query and capture injection info.
+        
+        Fix (v3.2): DKI mode now passes force_alpha=0.4 to bypass the
+        DualFactorGating decision which often returns alpha<0.1 in
+        experiment scenarios (no real entropy signal), causing injection
+        to be silently skipped.  The experiment's own alpha_sensitivity
+        sweep can override this via config.
+        """
         user_id = user_id or self._get_first_experiment_user_id()
         try:
             if mode == 'dki':
+                # Determine force_alpha: use experiment config if provided,
+                # otherwise default to 0.4 to ensure injection actually fires.
+                # Without force_alpha, DualFactorGating often yields alpha<0.1
+                # and the chat() method skips injection entirely.
+                exp_force_alpha = getattr(config, 'force_alpha', 0.4)
+                
                 response = self.dki_system.chat(
                     query=query,
                     session_id=session_id,
                     user_id=user_id,
                     max_new_tokens=config.max_new_tokens,
                     temperature=config.temperature,
+                    force_alpha=exp_force_alpha,
                 )
                 
                 # 构造 DKI 注入信息
@@ -1252,6 +1278,253 @@ class ExperimentRunner:
         )
         return results
     
+    def run_persona_chat_experiment(
+        self,
+        data_path: Optional[str] = None,
+        include_long_sessions: bool = True,
+        setup_users: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        运行 PersonaChat 实验 (短会话 + 长会话)
+        
+        短会话: 5 轮对话, 每轮简短查询 (原有设计)
+        长会话: 8-15 轮对话, 每轮 512-2K 字符 (新增, 强调 DKI 优势)
+        
+        长会话优势场景:
+        - RAG 在长上下文下挤压推理 token 预算
+        - DKI 通过 K/V 注入绕过偏好记忆的 token 消耗
+        - 长会话累积的历史使 multi-signal recall 优势更明显
+        
+        对话持久化:
+        - DKISystem.chat() 内部调用 _log_conversation() 自动持久化到 conversations 表
+        - 每个 session 的对话可通过 ConversationRepository.get_by_session() 查询
+        - 实验结果中包含 session_id, 可关联查询完整对话历史
+        """
+        self._ensure_systems()
+        
+        if setup_users:
+            self.setup_experiment_users()
+        
+        logger.info("Running PersonaChat experiment (short + long sessions)")
+        
+        # Load short session data
+        short_data = []
+        if data_path:
+            with open(data_path, 'r', encoding='utf-8') as f:
+                short_data = json.load(f)
+        else:
+            data_file = Path("./data/persona_chat.json")
+            if data_file.exists():
+                with open(data_file, 'r', encoding='utf-8') as f:
+                    short_data = json.load(f)
+            else:
+                logger.warning("No persona_chat data found, generating...")
+                from dki.experiment.data_generator import ExperimentDataGenerator
+                gen = ExperimentDataGenerator("./data")
+                short_data = gen.generate_persona_chat()
+        
+        # Load long session data
+        long_data = []
+        if include_long_sessions:
+            long_data_file = Path("./data/long_session_persona_chat.json")
+            if long_data_file.exists():
+                with open(long_data_file, 'r', encoding='utf-8') as f:
+                    long_data = json.load(f)
+            else:
+                logger.warning("No long session data found, generating...")
+                from dki.experiment.data_generator import ExperimentDataGenerator
+                gen = ExperimentDataGenerator("./data")
+                long_data = gen.generate_long_session_persona_chat()
+        
+        results = {
+            'short_sessions': {'dki': [], 'rag': []},
+            'long_sessions': {'dki': [], 'rag': []},
+            'summary': {},
+        }
+        
+        # ===== 短会话实验 =====
+        logger.info(f"Running short sessions ({len(short_data[:20])} sessions)")
+        for mode in ['dki', 'rag']:
+            for session_data in tqdm(short_data[:20], desc=f"Short ({mode})"):
+                session_result = self._run_session(mode, session_data, session_type='short')
+                results['short_sessions'][mode].append(session_result)
+        
+        # ===== 长会话实验 =====
+        if long_data:
+            logger.info(f"Running long sessions ({len(long_data[:10])} sessions)")
+            for mode in ['dki', 'rag']:
+                for session_data in tqdm(long_data[:10], desc=f"Long ({mode})"):
+                    session_result = self._run_session(mode, session_data, session_type='long')
+                    results['long_sessions'][mode].append(session_result)
+        
+        # ===== 汇总统计 =====
+        import numpy as np
+        for session_type in ['short_sessions', 'long_sessions']:
+            for mode in ['dki', 'rag']:
+                sessions = results[session_type][mode]
+                if not sessions:
+                    continue
+                
+                all_latencies = []
+                all_recall_scores = []
+                total_turns = 0
+                
+                for s in sessions:
+                    for t in s.get('turns', []):
+                        all_latencies.append(t.get('latency_ms', 0))
+                        if t.get('recall_score') is not None:
+                            all_recall_scores.append(t['recall_score'])
+                        total_turns += 1
+                
+                key = f"{session_type}_{mode}"
+                results['summary'][key] = {
+                    'session_count': len(sessions),
+                    'total_turns': total_turns,
+                    'mean_latency_ms': float(np.mean(all_latencies)) if all_latencies else 0,
+                    'p95_latency_ms': float(np.percentile(all_latencies, 95)) if all_latencies else 0,
+                    'mean_recall': float(np.mean(all_recall_scores)) if all_recall_scores else 0,
+                }
+        
+        # Save results
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filepath = self.output_dir / f"persona_chat_experiment_{timestamp}.json"
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(results, f, ensure_ascii=False, indent=2)
+        
+        logger.info(f"PersonaChat experiment results saved to {filepath}")
+        
+        # 打印摘要
+        for key, summary in results['summary'].items():
+            logger.info(
+                f"  {key}: sessions={summary['session_count']}, "
+                f"turns={summary['total_turns']}, "
+                f"latency={summary['mean_latency_ms']:.1f}ms, "
+                f"recall={summary['mean_recall']:.3f}"
+            )
+        
+        return results
+    
+    def _run_session(
+        self,
+        mode: str,
+        session_data: Dict[str, Any],
+        session_type: str = 'short',
+    ) -> Dict[str, Any]:
+        """
+        运行单个会话 (短或长)
+        
+        流程:
+        1. 创建独立 session_id
+        2. 获取对应的实验用户 ID
+        3. 为该 session 写入偏好 (DKI 模式)
+        4. 添加 memories (通用)
+        5. 逐轮执行对话
+        6. 收集注入信息和召回分数
+        
+        对话持久化:
+        - DKISystem.chat() 自动将对话写入 conversations 表
+        - session_id 可用于后续查询完整对话历史
+        """
+        session_id = f"exp_{mode}_{session_type}_{session_data.get('session_id', int(time.time()))}"
+        user_id = self._get_experiment_user_id(session_data)
+        
+        # 为 DKI 模式写入偏好
+        if mode == 'dki':
+            self._write_session_preferences(user_id, session_data.get('personas', []))
+        
+        # 添加 memories
+        system = self.dki_system if mode == 'dki' else self.rag_system
+        for mem in session_data.get('personas', []):
+            system.add_memory(session_id, mem)
+        
+        turn_results = []
+        
+        for turn_idx, turn_data in enumerate(session_data.get('turns', [])):
+            query = turn_data.get('query', '')
+            if not query:
+                continue
+            
+            try:
+                start_time = time.time()
+                
+                if mode == 'dki':
+                    response = self.dki_system.chat(
+                        query=query,
+                        session_id=session_id,
+                        user_id=user_id,
+                    )
+                    response_text = response.text
+                    latency = response.latency_ms
+                    
+                    # 构造注入信息
+                    hybrid_info = response.metadata.get('hybrid_injection', {})
+                    injection_info = InjectionInfo(
+                        mode='dki',
+                        original_query=query,
+                        preference_text=hybrid_info.get('preference_text'),
+                        preference_tokens=hybrid_info.get('preference_tokens', 0),
+                        history_suffix=hybrid_info.get('history_suffix_text'),
+                        history_tokens=hybrid_info.get('history_tokens', 0),
+                        history_messages=hybrid_info.get('history_messages', []),
+                        final_input=hybrid_info.get('final_input', query),
+                        alpha=response.gating_decision.alpha if response.gating_decision else 0.0,
+                    )
+                else:
+                    response = self.rag_system.chat(
+                        query=query,
+                        session_id=session_id,
+                        user_id=user_id,
+                    )
+                    response_text = response.text
+                    latency = response.latency_ms
+                    
+                    prompt_info = response.prompt_info
+                    injection_info = InjectionInfo(
+                        mode='rag',
+                        original_query=query,
+                        rag_context=prompt_info.retrieved_context if prompt_info else None,
+                        rag_prompt=prompt_info.final_prompt if prompt_info else None,
+                        final_input=prompt_info.final_prompt if prompt_info else query,
+                    )
+                
+                # 计算召回分数
+                recall_score = None
+                expected_keywords = turn_data.get('expected_keywords', [])
+                if expected_keywords:
+                    response_lower = response_text.lower()
+                    hits = sum(1 for kw in expected_keywords if kw.lower() in response_lower)
+                    recall_score = hits / len(expected_keywords) if expected_keywords else 0.0
+                
+                turn_results.append({
+                    'turn_idx': turn_idx,
+                    'query': query,
+                    'response': response_text[:500],  # 截断保存
+                    'latency_ms': latency,
+                    'recall_score': recall_score,
+                    'expected_keywords': expected_keywords,
+                    'injection_info': injection_info.to_dict(),
+                })
+                
+            except Exception as e:
+                logger.error(f"Session turn failed: {e}")
+                turn_results.append({
+                    'turn_idx': turn_idx,
+                    'query': query,
+                    'response': f"ERROR: {e}",
+                    'latency_ms': 0,
+                    'recall_score': None,
+                })
+        
+        return {
+            'session_id': session_id,
+            'session_type': session_type,
+            'user_id': user_id,
+            'experiment_user': session_data.get('experiment_user', ''),
+            'personas': session_data.get('personas', []),
+            'turns': turn_results,
+            'turn_count': len(turn_results),
+        }
+
     def run_ablation_study(
         self,
         data_path: Optional[str] = None,

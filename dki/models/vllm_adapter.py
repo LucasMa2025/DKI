@@ -99,23 +99,80 @@ class VLLMAdapter(BaseModelAdapter):
             raise
     
     def _load_hf_model(self) -> None:
-        """Load HuggingFace model for K/V computation."""
+        """
+        Load HuggingFace model for K/V computation.
+        
+        When vLLM already occupies most GPU memory, loading a second full model
+        on GPU will cause CUDA OOM. This method checks available GPU memory first:
+        - If sufficient (>= 4GB free), load with device_map="auto" (GPU)
+        - Otherwise, load to CPU to avoid OOM (slower but safe)
+        """
         if self.hf_model is not None:
             return
         
         from transformers import AutoModelForCausalLM
         
-        logger.info(f"Loading HF model for K/V computation: {self.model_name}")
-        # Use attn_implementation="eager" to support output_attentions=True
-        # SDPA attention does not support output_attentions
-        self.hf_model = AutoModelForCausalLM.from_pretrained(
-            self.model_name,
-            torch_dtype=self.torch_dtype,
-            device_map="auto",
-            trust_remote_code=self.trust_remote_code,
-            attn_implementation="eager",  # Required for output_attentions support
-        )
-        self.hf_model.eval()
+        # Check available GPU memory to decide device placement
+        use_cpu = False
+        if torch.cuda.is_available():
+            try:
+                free_mem = torch.cuda.mem_get_info()[0]
+                free_gb = free_mem / (1024 ** 3)
+                if free_gb < 4.0:
+                    logger.warning(
+                        f"Only {free_gb:.1f}GB free GPU memory, "
+                        f"loading HF model on CPU to avoid OOM"
+                    )
+                    use_cpu = True
+                else:
+                    logger.info(
+                        f"Loading HF model for K/V computation on GPU "
+                        f"({free_gb:.1f}GB free): {self.model_name}"
+                    )
+            except Exception:
+                use_cpu = True
+        else:
+            use_cpu = True
+        
+        try:
+            if use_cpu:
+                logger.info(
+                    f"Loading HF model for K/V computation on CPU: {self.model_name}"
+                )
+                self.hf_model = AutoModelForCausalLM.from_pretrained(
+                    self.model_name,
+                    torch_dtype=torch.float32,  # CPU uses float32
+                    device_map="cpu",
+                    trust_remote_code=self.trust_remote_code,
+                    attn_implementation="eager",
+                    low_cpu_mem_usage=True,
+                )
+            else:
+                self.hf_model = AutoModelForCausalLM.from_pretrained(
+                    self.model_name,
+                    torch_dtype=self.torch_dtype,
+                    device_map="auto",
+                    trust_remote_code=self.trust_remote_code,
+                    attn_implementation="eager",
+                )
+            self.hf_model.eval()
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower() or "CUDA" in str(e):
+                logger.warning(
+                    f"GPU OOM loading HF model, retrying on CPU: {e}"
+                )
+                torch.cuda.empty_cache()
+                self.hf_model = AutoModelForCausalLM.from_pretrained(
+                    self.model_name,
+                    torch_dtype=torch.float32,
+                    device_map="cpu",
+                    trust_remote_code=self.trust_remote_code,
+                    attn_implementation="eager",
+                    low_cpu_mem_usage=True,
+                )
+                self.hf_model.eval()
+            else:
+                raise
     
     def generate(
         self,
@@ -166,7 +223,12 @@ class VLLMAdapter(BaseModelAdapter):
             )
             # Use last hidden state mean as embedding
             hidden_states = outputs.hidden_states[-1]
-            embeddings = hidden_states.mean(dim=1)
+            embeddings = hidden_states.mean(dim=1).detach().cpu()
+        
+        # Free GPU memory
+        del outputs
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         
         return embeddings
     
@@ -175,7 +237,13 @@ class VLLMAdapter(BaseModelAdapter):
         text: str,
         return_hidden: bool = False,
     ) -> Tuple[List[KVCacheEntry], Optional[torch.Tensor]]:
-        """Compute K/V cache using HuggingFace model."""
+        """Compute K/V cache using HuggingFace model.
+        
+        GPU Memory Safety:
+        - Detaches K/V tensors and moves them to CPU to avoid GPU memory accumulation
+        - Clears intermediate computation tensors
+        - This is critical when vLLM already occupies most GPU memory
+        """
         self._load_hf_model()
         
         inputs = self.tokenize(text)
@@ -188,21 +256,27 @@ class VLLMAdapter(BaseModelAdapter):
                 return_dict=True,
             )
         
-        # Extract K/V cache
+        # Extract K/V cache — detach and move to CPU to prevent GPU memory leak
+        # KV tensors are stored in session cache and can accumulate over many turns
         kv_entries = []
         past_kv = outputs.past_key_values
         
         for layer_idx, (key, value) in enumerate(past_kv):
             entry = KVCacheEntry(
-                key=key,
-                value=value,
+                key=key.detach().cpu(),
+                value=value.detach().cpu(),
                 layer_idx=layer_idx,
             )
             kv_entries.append(entry)
         
         hidden_states = None
         if return_hidden and outputs.hidden_states is not None:
-            hidden_states = outputs.hidden_states[-1]
+            hidden_states = outputs.hidden_states[-1].detach().cpu()
+        
+        # Explicitly delete outputs to free GPU memory
+        del outputs
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         
         return kv_entries, hidden_states
     
@@ -244,22 +318,32 @@ class VLLMAdapter(BaseModelAdapter):
                 **kwargs
             )
         
+        # Determine target device for HF model inference
+        hf_device = next(self.hf_model.parameters()).device
+        
         # Standard path: Prepare past_key_values with alpha scaling
+        # Move KV tensors to HF model's device (may be CPU if loaded there)
         # Alpha scales the values (values affect output, keys affect attention weights)
         if alpha < 1.0:
             past_kv = tuple(
-                (entry.key, entry.value * alpha) for entry in injected_kv
+                (entry.key.to(hf_device), (entry.value * alpha).to(hf_device))
+                for entry in injected_kv
             )
         else:
             past_kv = tuple(
-                (entry.key, entry.value) for entry in injected_kv
+                (entry.key.to(hf_device), entry.value.to(hf_device))
+                for entry in injected_kv
             )
+        
+        # Move input tensors to HF model's device
+        input_ids = input_ids.to(hf_device)
+        attention_mask = attention_mask.to(hf_device)
         
         # Extend attention mask for injected K/V
         if mem_len > 0:
             mem_mask = torch.ones(
                 (input_ids.shape[0], mem_len),
-                device=self.device,
+                device=hf_device,
                 dtype=attention_mask.dtype,
             )
             attention_mask = torch.cat([mem_mask, attention_mask], dim=1)
@@ -281,14 +365,21 @@ class VLLMAdapter(BaseModelAdapter):
         
         # Decode output
         new_tokens = generated[0][input_ids.shape[1]:]
-        output_text = self.decode(new_tokens)
+        output_text = self.decode(new_tokens.cpu())
+        output_token_list = new_tokens.cpu().tolist()
+        input_len = input_ids.shape[1]
+        
+        # Cleanup: free GPU memory from intermediate tensors
+        del past_kv, generated, input_ids, attention_mask
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         
         return ModelOutput(
             text=output_text,
-            tokens=new_tokens.tolist(),
+            tokens=output_token_list,
             latency_ms=(end_time - start_time) * 1000,
-            input_tokens=input_ids.shape[1],
-            output_tokens=len(new_tokens),
+            input_tokens=input_len,
+            output_tokens=len(output_token_list),
             metadata={'alpha': alpha, 'mem_len': mem_len, 'flash_attn': False},
         )
     
@@ -309,32 +400,35 @@ class VLLMAdapter(BaseModelAdapter):
         """
         mem_len = injected_kv[0].key.shape[2] if injected_kv else 0
         
-        # For now, we still use HF model but with FlashAttention-enabled attention
-        # This is a simplified integration; full integration would require
-        # modifying the model's attention layers directly
+        # Determine target device for HF model inference
+        hf_device = next(self.hf_model.parameters()).device
         
-        # Prepare past_key_values with alpha scaling
+        # Move KV tensors to HF model's device and apply alpha scaling
         if alpha < 1.0:
             past_kv = tuple(
-                (entry.key, entry.value * alpha) for entry in injected_kv
+                (entry.key.to(hf_device), (entry.value * alpha).to(hf_device))
+                for entry in injected_kv
             )
         else:
             past_kv = tuple(
-                (entry.key, entry.value) for entry in injected_kv
+                (entry.key.to(hf_device), entry.value.to(hf_device))
+                for entry in injected_kv
             )
+        
+        # Move input tensors to HF model's device
+        input_ids = input_ids.to(hf_device)
+        attention_mask = attention_mask.to(hf_device)
         
         # Extend attention mask for injected K/V
         if mem_len > 0:
             mem_mask = torch.ones(
                 (input_ids.shape[0], mem_len),
-                device=self.device,
+                device=hf_device,
                 dtype=attention_mask.dtype,
             )
             attention_mask = torch.cat([mem_mask, attention_mask], dim=1)
         
         # Generate with injected K/V
-        # Note: The actual FlashAttention optimization happens at the
-        # attention layer level when the model is configured to use it
         with torch.no_grad():
             generated = self.hf_model.generate(
                 input_ids=input_ids,
@@ -351,14 +445,21 @@ class VLLMAdapter(BaseModelAdapter):
         
         # Decode output
         new_tokens = generated[0][input_ids.shape[1]:]
-        output_text = self.decode(new_tokens)
+        output_text = self.decode(new_tokens.cpu())
+        output_token_list = new_tokens.cpu().tolist()
+        input_len = input_ids.shape[1]
+        
+        # Cleanup: free GPU memory from intermediate tensors
+        del past_kv, generated, input_ids, attention_mask
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         
         return ModelOutput(
             text=output_text,
-            tokens=new_tokens.tolist(),
+            tokens=output_token_list,
             latency_ms=(end_time - start_time) * 1000,
-            input_tokens=input_ids.shape[1],
-            output_tokens=len(new_tokens),
+            input_tokens=input_len,
+            output_tokens=len(output_token_list),
             metadata={
                 'alpha': alpha,
                 'mem_len': mem_len,

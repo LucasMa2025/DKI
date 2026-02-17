@@ -100,7 +100,8 @@ class MultiSignalRecall:
                 and JIEBA_AVAILABLE
                 and self._conversation_repo):
             keyword_scored = self._keyword_recall(
-                query, session_id, db_session
+                query, session_id, db_session,
+                max_turns=recall_turns,
             )
             result.keyword_hits = len(keyword_scored)
             self._stats["keyword_total_hits"] += len(keyword_scored)
@@ -122,15 +123,21 @@ class MultiSignalRecall:
         # 归一化 vector 分数 (已在 [0,1] 范围, 但 clip 确保)
         norm_vector = self._clip_scores(vector_scored)
 
-        # 加权融合
+        # 加权融合 (归一化权重, 确保 w1+w2 = 1.0)
         w = self.config.score_weights
+        w_sum = w.keyword_weight + w.vector_weight
+        if w_sum <= 0:
+            w_sum = 1.0  # 防止除零
+        nw_keyword = w.keyword_weight / w_sum
+        nw_vector = w.vector_weight / w_sum
+        
         final_scores: Dict[str, float] = {}
         for msg_id in all_msg_ids:
             kw_score = norm_keyword.get(msg_id, 0.0)
             vec_score = norm_vector.get(msg_id, 0.0)
             final_scores[msg_id] = (
-                w.keyword_weight * kw_score
-                + w.vector_weight * vec_score
+                nw_keyword * kw_score
+                + nw_vector * vec_score
             )
 
         # 按 final_score 降序排序
@@ -213,8 +220,16 @@ class MultiSignalRecall:
         query: str,
         session_id: str,
         db_session: Optional[Any],
+        max_turns: int = 10,
     ) -> Dict[str, float]:
-        """关键词+权重检索"""
+        """关键词+权重检索
+        
+        Args:
+            query: 用户查询
+            session_id: 会话 ID
+            db_session: 数据库 session (可选)
+            max_turns: 最大回溯轮数 (由指代解析决定)
+        """
         scored = {}
 
         # 提取关键词
@@ -259,6 +274,11 @@ class MultiSignalRecall:
 
         if not messages:
             return scored
+
+        # 限制回溯范围: 只搜索最近 max_turns 轮 (每轮 user+assistant)
+        max_messages = max_turns * 2
+        if len(messages) > max_messages:
+            messages = messages[-max_messages:]
 
         # 对每条消息计算关键词命中分数
         for msg in messages:

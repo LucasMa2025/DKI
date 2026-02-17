@@ -34,7 +34,6 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
 from datetime import datetime
 
-import torch
 from loguru import logger
 
 from dki.adapters.base import (
@@ -296,9 +295,18 @@ class DKIPlugin:
             reference_resolver_config=reference_resolver_config,
         )
         
+        # ============ Function Call Logger (v3.2) ============
+        self._fc_logger = None
+        try:
+            from dki.core.function_call_logger import FunctionCallLogger
+            self._fc_logger = FunctionCallLogger(text_log_dir="logs/function_calls")
+        except Exception as fc_err:
+            logger.warning(f"FunctionCallLogger init failed (non-critical): {fc_err}")
+        
         # ============ Executor (纯执行) ============
         self._executor = InjectionExecutor(
             model_adapter=model_adapter,
+            function_call_logger=self._fc_logger,
         )
         
         # ============ 偏好 K/V 缓存 (支持 Redis 分布式) ============
@@ -649,8 +657,57 @@ class DKIPlugin:
         except Exception as e:
             logger.error(f"DKI Plugin error: {e}")
             metadata.latency_ms = (time.time() - start_time) * 1000
+            metadata.injection_strategy = "stable_fallback"
             
-            # 降级: 直接调用 LLM (无注入)
+            # 第一级降级: 尝试 stable 策略 (偏好 K/V + 原始查询)
+            try:
+                logger.info("Falling back to stable strategy in DKI Plugin")
+                # 构建 stable plan
+                stable_plan = InjectionPlan(
+                    strategy="stable",
+                    original_query=query,
+                    final_input=query,
+                    user_id=user_id,
+                    injection_enabled=False,
+                )
+                
+                # 尝试加载偏好并构建 stable 注入
+                try:
+                    preferences = await self.data_adapter.get_user_preferences(user_id)
+                    if preferences:
+                        pref_text = "\n".join(
+                            f"- {p.preference_type}: {p.preference_text}"
+                            for p in sorted(preferences, key=lambda x: x.priority, reverse=True)
+                            if not p.is_expired()
+                        )
+                        stable_plan.preference_text = pref_text
+                        stable_plan.preferences_count = len(preferences)
+                        stable_plan.injection_enabled = True
+                        stable_plan.alpha_profile = AlphaProfile(
+                            preference_alpha=0.4, history_alpha=1.0
+                        )
+                except Exception:
+                    pass  # 偏好加载失败, 继续无注入推理
+                
+                result = await self._executor.execute(
+                    plan=stable_plan,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    **kwargs,
+                )
+                
+                metadata.latency_ms = (time.time() - start_time) * 1000
+                return DKIPluginResponse(
+                    text=result.text,
+                    input_tokens=result.input_tokens,
+                    output_tokens=result.output_tokens,
+                    metadata=metadata,
+                    raw_output=result.raw_output,
+                )
+            except Exception as stable_error:
+                logger.error(f"Stable fallback failed: {stable_error}")
+            
+            # 第二级降级: 直接调用 LLM (无注入)
             try:
                 output = self.model.generate(
                     prompt=query,
@@ -658,6 +715,7 @@ class DKIPlugin:
                     temperature=temperature,
                     **kwargs,
                 )
+                metadata.injection_strategy = "none_fallback"
                 return DKIPluginResponse(
                     text=output.text,
                     input_tokens=output.input_tokens,
@@ -665,7 +723,7 @@ class DKIPlugin:
                     metadata=metadata,
                 )
             except Exception as fallback_error:
-                logger.error(f"Fallback generation failed: {fallback_error}")
+                logger.error(f"Final fallback generation failed: {fallback_error}")
                 raise
     
     # ================================================================
@@ -892,7 +950,10 @@ class DKIPlugin:
             await self._redis_client.close()
             logger.info("Redis connection closed")
         
-        if hasattr(self.data_adapter, 'close'):
+        if hasattr(self.data_adapter, 'disconnect'):
+            await self.data_adapter.disconnect()
+            logger.info("Database connection closed")
+        elif hasattr(self.data_adapter, 'close'):
             await self.data_adapter.close()
             logger.info("Database connection closed")
         
