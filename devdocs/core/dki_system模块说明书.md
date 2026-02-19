@@ -1,10 +1,11 @@
-# DKISystem 核心系统模块说明书 (v3.1 — Recall v4 集成版)
+# DKISystem 核心系统模块说明书 (v3.2 — Recall v4 + Stable 回退 + 用户隔离)
 
-> 源文件: `DKI/dki/core/dki_system.py` (1440 行)  
+> 源文件: `DKI/dki/core/dki_system.py` (1440+ 行)  
 > 辅助类: `_ConversationRepoWrapper` (同文件)  
 > 记忆召回包: `DKI/dki/core/recall/` (6 文件, Recall v4)  
+> 用户隔离包: `DKI/dki/cache/user_isolation.py`  
 > 模块路径: `dki.core.dki_system`  
-> 版本: 3.1.0
+> 版本: 3.2.0
 
 ---
 
@@ -16,22 +17,26 @@
 
 - 记忆检索 + K/V 注入生成
 - 杂化注入 (Hybrid Injection): 偏好 K/V + 历史 Suffix Prompt
-- **Recall v4 记忆召回策略 (v3.1 新增)**: 多信号召回 + 逐消息 Summary + Fact Call
+- **Recall v4 记忆召回策略**: 多信号召回 + 逐消息 Summary + Fact Call (默认策略)
+- **Stable 回退策略**: recall_v4 失败时自动降级到 stable (偏好 K/V + 平铺历史后缀)
+- **用户级隔离 (v3.2 新增)**: HMAC 签名缓存键 + 推理上下文守卫 + 用户分区缓存
 - 双因子门控 (Dual-Factor Gating): 相关性驱动 + 熵调制
 - 分层 K/V 缓存: L1(GPU) → L2(CPU) → L3(SSD) → L4(重算)
 - 位置重映射: RoPE/ALiBi 兼容
 - 注意力预算分析: Token vs Attention Budget
 
-### 1.1 v3.1 新增特性
+### 1.1 v3.2 变更特性
 
 | 特性 | 说明 |
 |------|------|
 | **Recall v4 记忆召回** | 多信号召回 (关键词 + 向量 + 指代) + 逐消息 Summary + Fact Call |
+| **Stable 回退策略** | recall_v4 失败时自动降级到 stable (偏好 K/V + 平铺历史后缀) |
+| **用户级隔离** | HMAC 签名缓存键 + UserIsolationContext + InferenceContextGuard |
 | **动态 History 预算** | 根据 context_window 自适应调整历史大小 |
 | **结构化认知标记** | `[SUMMARY]...[/SUMMARY]` 机器可读格式 |
 | **事实补充循环** | 模型可通过 `retrieve_fact()` 请求原文补充 |
 | **模型适配格式化** | Generic/DeepSeek/GLM 三种格式化器 |
-| **Full Attention 弃用** | 因长历史场景不可用, 推荐使用 Recall v4 |
+| **Full Attention 弃用** | 因长历史场景不可用, 已移除, 推荐使用 Recall v4 |
 
 ---
 
@@ -116,7 +121,13 @@ DKISystem.__init__()
   ├─ _user_preferences: Dict[str, UserPreference]
   ├─ DatabaseManager (SQLite/PostgreSQL)
   │
-  └─ (v3.1) Recall v4 组件初始化
+  ├─ (v3.2) 用户隔离组件初始化
+  │   ├─ 检测 USER_ISOLATION_AVAILABLE
+  │   ├─ UserIsolationContext (用户上下文管理)
+  │   ├─ UserScopedCacheStore (HMAC 签名缓存键)
+  │   └─ InferenceContextGuard (推理上下文隔离)
+  │
+  └─ Recall v4 组件初始化
       ├─ 检测 RECALL_V4_AVAILABLE (recall 包是否可导入)
       ├─ 读取 config.dki.recall 配置
       │   ├─ 如果是 dict → 直接使用
@@ -571,7 +582,7 @@ dki:
         prompt_formatter: "auto"            # auto | generic | deepseek | glm
 ```
 
-### 5.7 Recall v4 与原有 Hybrid 的关系
+### 5.7 Recall v4 与原有 Hybrid 的关系 + Stable 回退
 
 ```
                     ┌──────────────────────────────────┐
@@ -590,18 +601,31 @@ dki:
              ▼                      ▼                      ▼
     ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
     │ Recall v4 路径   │    │ 原有 Hybrid 路径 │    │ 标准 DKI 路径   │
-    │                  │    │                  │    │                  │
-    │ 多信号召回       │    │ get_session_     │    │ 直接门控 +      │
-    │ + 后缀组装       │    │ history()        │    │ K/V 注入        │
-    │ + 偏好 K/V       │    │ + prepare_input()│    │                  │
-    │ + Fact Call       │    │                  │    │                  │
-    └─────────────────┘    └─────────────────┘    └─────────────────┘
+    │ (默认)           │    │ (recall_v4 失败  │    │                  │
+    │ 多信号召回       │    │  时的回退路径)   │    │ 直接门控 +      │
+    │ + 后缀组装       │    │ get_session_     │    │ K/V 注入        │
+    │ + 偏好 K/V       │    │ history()        │    │                  │
+    │ + Fact Call       │    │ + prepare_input()│    │                  │
+    └────────┬────────┘    └─────────────────┘    └─────────────────┘
+             │
+             │ recall_v4 失败?
+             ▼
+    ┌─────────────────┐
+    │ Stable 回退路径  │
+    │ (v3.2 新增)     │
+    │                  │
+    │ 偏好 K/V 不变   │
+    │ + 平铺历史后缀  │
+    │ (原有 Hybrid)   │
+    └─────────────────┘
 ```
 
 **关键点:**
 - Recall v4 **替代**了 Hybrid 的历史部分 (`get_session_history`)
 - Recall v4 **保留**了 Hybrid 的偏好 K/V 注入部分
 - 当 Recall v4 启用时，`hybrid_result` 仅用于偏好 K/V，`history=None`
+- **(v3.2)** Recall v4 失败时, 自动降级到 Stable 策略 (偏好 K/V + 平铺历史后缀)
+- **(v3.2)** `_recall_v4_failed` 标志控制回退路径选择
 
 ---
 
@@ -740,7 +764,7 @@ self._log_conversation(
 
 ---
 
-## 8. chat() 主流程 — 完整调用链 (v3.1)
+## 8. chat() 主流程 — 完整调用链 (v3.2)
 
 ```
 DKISystem.chat(query, session_id, user_id, ...)
@@ -769,7 +793,12 @@ DKISystem.chat(query, session_id, user_id, ...)
   │   │   ├─ query = assembled.text (替换为组装后的后缀)
   │   │   ├─ 偏好 K/V 准备: hybrid_injector.prepare_input(query, preference, history=None)
   │   │   │   └─ 仅用于偏好 K/V, 不处理历史
-  │   │   └─ timer.end_stage()
+  │   │   ├─ timer.end_stage()
+  │   │   │
+  │   │   └─ (v3.2) Recall v4 失败时:
+  │   │       ├─ _recall_v4_failed = True
+  │   │       ├─ 重置 query = original_query
+  │   │       └─ 自动降级到 Stable 路径 (B)
   │   │
   │   ├─ (B) 原有 Hybrid 路径 [use_hybrid_mode + allow_injection]
   │   │   ├─ timer.start_stage("hybrid_prep")
@@ -1109,10 +1138,11 @@ search_memories(query, top_k)
 1. **存储模型无关**: 仅存储文本 + 路由向量，不存储 K/V
 2. **注入模型一致**: K/V 由目标模型计算，确保语义空间一致
 3. **会话缓存可丢弃**: 仅推理时使用，不影响持久化数据
-4. **优雅降级**: alpha → 0 恢复原始行为
+4. **优雅降级**: recall_v4 → stable → 无注入 三级降级
 5. **审计日志**: 所有注入操作记录到 audit_logs 表
-6. **Key 不缩放**: Key tensor 永远不被 alpha 缩放 (v3.1 新增)
+6. **Key 不缩放**: Key tensor 永远不被 alpha 缩放
 7. **原始查询记录**: 数据库记录使用 original_query，避免历史递归嵌套
+8. **用户级隔离 (v3.2 新增)**: 偏好 K/V 缓存按 user_id 物理分区, 推理上下文隔离 (InferenceContextGuard)
 
 ---
 
@@ -1136,7 +1166,11 @@ dki.core.dki_system (DKISystem)
   ├─ dki.database.connection (DatabaseManager)
   ├─ dki.database.repository (SessionRepository, MemoryRepository, ConversationRepository, AuditLogRepository)
   ├─ dki.config.config_loader (ConfigLoader)
-  └─ (v3.1, 可选) dki.core.recall
+  ├─ (v3.2, 可选) dki.cache.user_isolation
+  │   ├─ UserIsolationContext
+  │   ├─ UserScopedCacheStore
+  │   └─ InferenceContextGuard
+  └─ (可选) dki.core.recall
       ├─ RecallConfig, FactRequest
       ├─ MultiSignalRecall
       ├─ SuffixBuilder
@@ -1155,9 +1189,11 @@ dki.core.dki_system (DKISystem)
 | **偏好来源** | SQLite user_preferences 表 | 上层应用通过适配器提供 |
 | **历史来源** | SQLite conversations 表 | 上层应用通过适配器提供 |
 | **门控** | DualFactorGating (内置) | DualFactorGating (延迟初始化) |
-| **缓存** | SessionKVCache / TieredKVCache | Executor 内存缓存 + PreferenceCacheManager |
-| **策略** | Hybrid + Recall v4 | Stable + Recall v4 + Full Attention (弃用) |
+| **缓存** | SessionKVCache / TieredKVCache | Executor 用户分区缓存 + PreferenceCacheManager |
+| **策略** | Recall v4 (默认) + Stable (回退) | Recall v4 (默认) + Stable (回退) |
+| **Full Attention** | ❌ 已弃用 | ❌ 已弃用/移除 |
 | **Recall v4** | ✅ (直接集成) | ✅ (通过 Planner/Executor) |
 | **Fact Call** | ✅ (_execute_fact_call_loop) | ✅ (Executor._execute_fact_call_loop) |
+| **用户隔离** | ✅ (UserIsolationContext) | ✅ (用户分区缓存 + InferenceContextGuard) |
 | **架构** | 单类编排 | 决策-执行分离 (Planner + Executor) |
 | **适用场景** | Demo / 独立部署 | 集成到现有应用 |

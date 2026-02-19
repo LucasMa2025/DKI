@@ -1,10 +1,11 @@
-# DKIPlugin 插件核心模块说明书 (v3.1 — Recall v4 集成版)
+# DKIPlugin 插件核心模块说明书 (v3.2 — Recall v4 + Stable 回退 + 用户隔离)
 
-> 源文件: `DKI/dki/core/dki_plugin.py` (1021 行, 瘦 Facade)  
+> 源文件: `DKI/dki/core/dki_plugin.py` (1021+ 行, 瘦 Facade)  
 > 子组件包: `DKI/dki/core/plugin/` (4 文件)  
 > 记忆召回包: `DKI/dki/core/recall/` (6 文件, Recall v4)  
+> 用户隔离包: `DKI/dki/cache/user_isolation.py`  
 > 模块路径: `dki.core.dki_plugin` + `dki.core.plugin` + `dki.core.recall`  
-> 版本: 3.1.0
+> 版本: 3.2.0
 
 ---
 
@@ -14,15 +15,15 @@
 
 v2.x 版本的 `DKIPlugin` 是一个 "God Plugin"，单文件承担了 7 项职责:
 
-| 职责 | 说明 |
-|------|------|
-| 编排 | 串联 Memory Trigger → 数据加载 → 注入 → 推理 |
-| 数据访问 | 通过适配器读取偏好和历史 |
-| 语义理解 | Memory Trigger + Reference Resolver |
-| 注入决策 | Alpha 计算、门控、策略选择 |
-| 注入执行 | K/V 计算、缓存、模型调用 |
-| 运维 | 统计、日志、可视化 |
-| 配置管理 | 运行时策略切换、参数更新 |
+| 职责     | 说明                                         |
+| -------- | -------------------------------------------- |
+| 编排     | 串联 Memory Trigger → 数据加载 → 注入 → 推理 |
+| 数据访问 | 通过适配器读取偏好和历史                     |
+| 语义理解 | Memory Trigger + Reference Resolver          |
+| 注入决策 | Alpha 计算、门控、策略选择                   |
+| 注入执行 | K/V 计算、缓存、模型调用                     |
+| 运维     | 统计、日志、可视化                           |
+| 配置管理 | 运行时策略切换、参数更新                     |
 
 v3.0 将其拆分为 **"决策-执行"分离架构**:
 
@@ -38,30 +39,34 @@ InjectionExecutor (纯执行, 不做决策)
 ModelAdapter (LLM 推理)
 ```
 
-v3.1 新增 **Recall v4 记忆召回策略**，集成到 Planner/Executor 流程中:
+v3.1 新增 **Recall v4 记忆召回策略**，v3.2 新增 **Stable 回退** 和 **用户级隔离**:
 
 ```
 InjectionPlanner
    ├─ MultiSignalRecall (多信号召回: 关键词 + 向量 + 指代)
    ├─ SuffixBuilder (逐消息 Summary + 后缀组装)
-   └─ PromptFormatter (模型适配提示格式化)
+   ├─ PromptFormatter (模型适配提示格式化)
+   └─ (v3.2) Recall v4 失败时自动降级到 Stable 策略
 
 InjectionExecutor
    ├─ FactRetriever (事实补充: trace_id → 原文)
-   └─ PromptFormatter (Fact Call 检测 + 格式化)
+   ├─ PromptFormatter (Fact Call 检测 + 格式化)
+   ├─ (v3.2) Stable 回退执行 (_execute_stable_fallback)
+   └─ (v3.2) 用户级隔离缓存 (按 user_id 分区)
 ```
 
 ### 1.2 核心设计原则
 
-| 原则 | 说明 |
-|------|------|
-| **对外接口不变** | `chat()`, `from_config()`, `get_stats()` 等签名完全兼容 v2.x |
-| **决策与执行分离** | Planner 不持有模型引用, Executor 不做决策 |
-| **中间产物可序列化** | `InjectionPlan` 是纯数据结构, 可序列化/缓存/重放/测试 |
-| **Key 不缩放** | Key tensor 永远不被 alpha 缩放 (由 Executor 保证) |
-| **安全边界** | `SafetyEnvelope` 验证参数合法性, 防止实验参数泄漏到生产 |
-| **自动降级** | 任何异常自动降级到无注入推理 |
-| **Recall v4 可选** | 通过配置启用, 未启用时回退到原有 flat_history 策略 |
+| 原则                 | 说明                                                         |
+| -------------------- | ------------------------------------------------------------ |
+| **对外接口不变**     | `chat()`, `from_config()`, `get_stats()` 等签名完全兼容 v2.x |
+| **决策与执行分离**   | Planner 不持有模型引用, Executor 不做决策                    |
+| **中间产物可序列化** | `InjectionPlan` 是纯数据结构, 可序列化/缓存/重放/测试        |
+| **Key 不缩放**       | Key tensor 永远不被 alpha 缩放 (由 Executor 保证)            |
+| **安全边界**         | `SafetyEnvelope` 验证参数合法性, 防止实验参数泄漏到生产      |
+| **三级降级**         | recall_v4 → stable (偏好 K/V + 平铺历史) → 无注入推理        |
+| **Recall v4 默认**   | recall_v4 为默认策略, stable 为回退策略                      |
+| **用户级隔离**       | 偏好 K/V 缓存按 user_id 物理分区, 推理上下文隔离 (v3.2)      |
 
 ### 1.3 文件结构
 
@@ -94,13 +99,13 @@ dki/core/
     └── prompt_formatter.py          # 模型适配格式化 (Generic/DeepSeek/GLM)
 ```
 
-### 1.4 策略概览
+### 1.4 策略概览 (v3.2)
 
-| 策略 | 状态 | 偏好注入 | 历史注入 | Context 占用 | 适用场景 |
-|------|------|---------|---------|-------------|---------|
-| **Stable** | ✅ 生产推荐 | K/V (负位置) | Suffix Prompt | 中 | 生产环境 |
-| **Recall v4** | ✅ 新增 (v3.1) | K/V (负位置) | 多信号召回 + Summary + Fact Call | 动态 | 长历史场景 |
-| **Full Attention** | ⚠️ 已弃用 | K/V (负位置) | K/V (负位置) | 极低 | 仅研究 |
+| 策略               | 状态        | 偏好注入     | 历史注入                         | Context 占用 | 适用场景                 |
+| ------------------ | ----------- | ------------ | -------------------------------- | ------------ | ------------------------ |
+| **Recall v4**      | ✅ 默认策略 | K/V (负位置) | 多信号召回 + Summary + Fact Call | 动态         | 长历史场景 (推荐)        |
+| **Stable**         | ✅ 回退策略 | K/V (负位置) | Suffix Prompt (平铺历史)         | 中           | recall_v4 失败时自动降级 |
+| **Full Attention** | ❌ 已移除   | —            | —                                | —            | 不再支持                 |
 
 ---
 
@@ -112,11 +117,11 @@ dki/core/
 
 将单一 `alpha: float` 升级为结构化的分层控制，匹配 DKI 的三层语义模型:
 
-| 字段 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `preference_alpha` | `float` | `0.4` | 偏好 K/V 注入强度 |
-| `history_alpha` | `float` | `1.0` | 历史注入强度 (Stable=1.0, FA<1.0) |
-| `override_cap` | `float` | `0.7` | 偏好 alpha 安全上限 |
+| 字段               | 类型    | 默认值 | 说明                              |
+| ------------------ | ------- | ------ | --------------------------------- |
+| `preference_alpha` | `float` | `0.4`  | 偏好 K/V 注入强度                 |
+| `history_alpha`    | `float` | `1.0`  | 历史注入强度 (Stable=1.0, FA<1.0) |
+| `override_cap`     | `float` | `0.7`  | 偏好 alpha 安全上限               |
 
 **关键属性:**
 
@@ -129,15 +134,16 @@ def effective_preference_alpha(self) -> float:
 
 **三层语义模型:**
 
-| 层 | 语义 | 稳定性要求 | Alpha 范围 |
-|---|------|-----------|-----------|
-| Preference | Personality / Bias | 极高 | 0.0 ~ override_cap |
-| History | Episodic Memory | 中 | Stable=1.0, FA=0.1~0.5 |
-| Query | Current Intent | 最高优先级 | 始终 1.0 |
+| 层         | 语义               | 稳定性要求 | Alpha 范围             |
+| ---------- | ------------------ | ---------- | ---------------------- |
+| Preference | Personality / Bias | 极高       | 0.0 ~ override_cap     |
+| History    | Episodic Memory    | 中         | Stable=1.0, FA=0.1~0.5 |
+| Query      | Current Intent     | 最高优先级 | 始终 1.0               |
 
 **安全不变量:**
-- `preference_alpha` 永远不超过 `override_cap`
-- Key tensor 永远不被 alpha 缩放 (由 Executor 保证)
+
+-   `preference_alpha` 永远不超过 `override_cap`
+-   Key tensor 永远不被 alpha 缩放 (由 Executor 保证)
 
 ### 2.2 SafetyEnvelope — 安全边界
 
@@ -145,13 +151,13 @@ def effective_preference_alpha(self) -> float:
 
 不同策略下的参数安全约束。违规情况会被记录到 `InjectionPlan.safety_violations`，但不会阻止执行 (仅告警)。
 
-| 字段 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `stable_max_preference_alpha` | `float` | `0.5` | Stable 策略偏好 alpha 上限 |
-| `stable_history_alpha_must_be` | `float` | `1.0` | Stable 策略历史 alpha 必须为 1.0 |
-| `full_attention_max_preference_alpha` | `float` | `0.7` | FA 策略偏好 alpha 上限 |
-| `full_attention_max_history_alpha` | `float` | `0.5` | FA 策略历史 alpha 上限 |
-| `max_total_kv_tokens` | `int` | `600` | K/V token 总量上限 |
+| 字段                                  | 类型    | 默认值 | 说明                             |
+| ------------------------------------- | ------- | ------ | -------------------------------- |
+| `stable_max_preference_alpha`         | `float` | `0.5`  | Stable 策略偏好 alpha 上限       |
+| `stable_history_alpha_must_be`        | `float` | `1.0`  | Stable 策略历史 alpha 必须为 1.0 |
+| `full_attention_max_preference_alpha` | `float` | `0.7`  | FA 策略偏好 alpha 上限           |
+| `full_attention_max_history_alpha`    | `float` | `0.5`  | FA 策略历史 alpha 上限           |
+| `max_total_kv_tokens`                 | `int`   | `600`  | K/V token 总量上限               |
 
 **验证逻辑:**
 
@@ -175,15 +181,15 @@ def validate(self, plan: InjectionPlan) -> List[str]:
 
 由 `Planner.analyze_query()` 生成，在数据加载之前确定召回范围。
 
-| 字段 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `recall_limit` | `int` | `10` | 历史召回轮数 |
-| `memory_triggered` | `bool` | `False` | 是否触发记忆存储 |
-| `trigger_type` | `Optional[str]` | `None` | 触发类型 |
-| `trigger_confidence` | `float` | `0.0` | 触发置信度 |
-| `reference_resolved` | `bool` | `False` | 是否解析了指代 |
-| `reference_type` | `Optional[str]` | `None` | 指代类型 |
-| `reference_scope` | `Optional[str]` | `None` | 指代范围 |
+| 字段                 | 类型            | 默认值  | 说明             |
+| -------------------- | --------------- | ------- | ---------------- |
+| `recall_limit`       | `int`           | `10`    | 历史召回轮数     |
+| `memory_triggered`   | `bool`          | `False` | 是否触发记忆存储 |
+| `trigger_type`       | `Optional[str]` | `None`  | 触发类型         |
+| `trigger_confidence` | `float`         | `0.0`   | 触发置信度       |
+| `reference_resolved` | `bool`          | `False` | 是否解析了指代   |
+| `reference_type`     | `Optional[str]` | `None`  | 指代类型         |
+| `reference_scope`    | `Optional[str]` | `None`  | 指代范围         |
 
 ### 2.4 InjectionPlan — 注入计划 (核心中间产物)
 
@@ -191,54 +197,52 @@ def validate(self, plan: InjectionPlan) -> List[str]:
 
 Planner 生成、Executor 消费的中间产物。纯数据结构，不包含任何逻辑。
 
-| 字段分组 | 字段 | 类型 | 说明 |
-|----------|------|------|------|
-| **策略** | `strategy` | `str` | `"stable"` / `"full_attention"` / `"none"` |
-| **偏好** | `preference_text` | `str` | 格式化后的偏好文本 |
-| | `preferences_count` | `int` | 偏好数量 |
-| | `preference_tokens` | `int` | 偏好 token 数 |
-| **历史** | `history_suffix` | `str` | 格式化后的 suffix prompt (始终准备, 用于 fallback) |
-| | `history_messages` | `List[Dict]` | 原始消息列表 (仅 FA 策略) |
-| | `history_tokens` | `int` | 历史 token 数 |
-| | `relevant_history_count` | `int` | 相关历史数量 |
-| **查询** | `user_id` | `str` | 用户标识 (用于缓存键) |
-| | `original_query` | `str` | 原始用户输入 |
-| | `final_input` | `str` | 最终发给模型的输入 |
-| | `query_tokens` | `int` | 查询 token 数 |
-| | `total_tokens` | `int` | 总 token 数 |
-| **Alpha** | `alpha_profile` | `AlphaProfile` | 分层 Alpha 控制 |
-| **决策** | `injection_enabled` | `bool` | 是否启用注入 |
-| | `gating_decision` | `Dict` | 门控决策详情 |
-| **Trigger** | `memory_triggered` | `bool` | 是否触发记忆 |
-| | `trigger_type` | `Optional[str]` | 触发类型 |
-| **Reference** | `reference_resolved` | `bool` | 是否解析指代 |
-| | `reference_type` | `Optional[str]` | 指代类型 |
-| | `reference_scope` | `Optional[str]` | 指代范围 |
-| | `recall_limit` | `int` | 召回轮数 |
-| **FA 特有** | `global_indication` | `str` | 全局指示文本 |
-| | `full_attention_fallback` | `bool` | 是否降级 |
-| | `history_kv_tokens` | `int` | 历史 K/V token 数 |
-| **Recall v4** | `assembled_suffix` | `str` | 组装后的后缀文本 (替代 history_suffix) |
-| | `recall_strategy` | `str` | 召回策略 (`"summary_with_fact_call"` / `"flat_history"`) |
-| | `summary_count` | `int` | suffix 中的 summary 条目数 |
-| | `message_count` | `int` | suffix 中的原文消息数 |
-| | `trace_ids` | `List[str]` | 所有 trace_id (用于 Fact Call) |
-| | `has_fact_call_instruction` | `bool` | 是否包含 fact call 指导 |
-| | `fact_rounds_used` | `int` | 实际使用的 fact call 轮次 |
-| | `session_id` | `str` | 会话 ID (用于 fact retriever) |
-| **安全** | `safety_violations` | `List[str]` | 安全违规列表 |
+| 字段分组      | 字段                        | 类型            | 说明                                                                                 |
+| ------------- | --------------------------- | --------------- | ------------------------------------------------------------------------------------ |
+| **策略**      | `strategy`                  | `str`           | `"recall_v4"` (默认) / `"stable"` (回退) / `"none"`                                  |
+| **偏好**      | `preference_text`           | `str`           | 格式化后的偏好文本                                                                   |
+|               | `preferences_count`         | `int`           | 偏好数量                                                                             |
+|               | `preference_tokens`         | `int`           | 偏好 token 数                                                                        |
+| **历史**      | `history_suffix`            | `str`           | 格式化后的 suffix prompt (recall_v4 组装 / stable 平铺)                              |
+|               | `history_tokens`            | `int`           | 历史 token 数                                                                        |
+|               | `relevant_history_count`    | `int`           | 相关历史数量                                                                         |
+| **查询**      | `user_id`                   | `str`           | 用户标识 (用于缓存键)                                                                |
+|               | `original_query`            | `str`           | 原始用户输入                                                                         |
+|               | `final_input`               | `str`           | 最终发给模型的输入                                                                   |
+|               | `query_tokens`              | `int`           | 查询 token 数                                                                        |
+|               | `total_tokens`              | `int`           | 总 token 数                                                                          |
+| **Alpha**     | `alpha_profile`             | `AlphaProfile`  | 分层 Alpha 控制                                                                      |
+| **决策**      | `injection_enabled`         | `bool`          | 是否启用注入                                                                         |
+|               | `gating_decision`           | `Dict`          | 门控决策详情                                                                         |
+| **Trigger**   | `memory_triggered`          | `bool`          | 是否触发记忆                                                                         |
+|               | `trigger_type`              | `Optional[str]` | 触发类型                                                                             |
+| **Reference** | `reference_resolved`        | `bool`          | 是否解析指代                                                                         |
+|               | `reference_type`            | `Optional[str]` | 指代类型                                                                             |
+|               | `reference_scope`           | `Optional[str]` | 指代范围                                                                             |
+|               | `recall_limit`              | `int`           | 召回轮数                                                                             |
+| **Recall v4** | `assembled_suffix`          | `str`           | 组装后的后缀文本 (替代 history_suffix)                                               |
+|               | `recall_strategy`           | `str`           | 召回策略 (`"summary_with_fact_call"` / `"flat_history"` / `"flat_history_fallback"`) |
+|               | `summary_count`             | `int`           | suffix 中的 summary 条目数                                                           |
+|               | `message_count`             | `int`           | suffix 中的原文消息数                                                                |
+|               | `trace_ids`                 | `List[str]`     | 所有 trace_id (用于 Fact Call)                                                       |
+|               | `has_fact_call_instruction` | `bool`          | 是否包含 fact call 指导                                                              |
+|               | `fact_rounds_used`          | `int`           | 实际使用的 fact call 轮次                                                            |
+|               | `session_id`                | `str`           | 会话 ID (用于 fact retriever)                                                        |
+| **安全**      | `safety_violations`         | `List[str]`     | 安全违规列表                                                                         |
+
+> **v3.2 变更**: 移除了 Full Attention 特有字段 (`global_indication`, `full_attention_fallback`, `history_kv_tokens`, `history_messages`)。`strategy` 默认值从 `"stable"` 改为 `"recall_v4"`。
 
 **可独立测试:**
 
 ```python
 plan = InjectionPlan(
-    strategy="stable",
+    strategy="recall_v4",
     injection_enabled=True,
     preference_text="素食主义者",
     alpha_profile=AlphaProfile(preference_alpha=0.3),
 )
 assert plan.alpha_profile.effective_preference_alpha == 0.3
-assert plan.to_dict()["strategy"] == "stable"
+assert plan.to_dict()["strategy"] == "recall_v4"
 ```
 
 ### 2.5 ExecutionResult — 执行结果
@@ -247,23 +251,21 @@ assert plan.to_dict()["strategy"] == "stable"
 
 Executor 的输出，包含模型输出和执行性能数据。
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `text` | `str` | 生成的回复文本 |
-| `input_tokens` | `int` | 输入 token 数 |
-| `output_tokens` | `int` | 输出 token 数 |
-| `raw_output` | `Optional[Any]` | 原始 ModelOutput |
-| `inference_latency_ms` | `float` | 推理耗时 (ms) |
-| `preference_cache_hit` | `bool` | 偏好缓存是否命中 |
-| `preference_cache_tier` | `str` | 缓存层级 (`"memory"` / `"compute"` / `"error"`) |
-| `full_attention_fallback` | `bool` | FA 是否降级 |
-| `full_attention_position_mode` | `str` | FA 位置模式 |
-| `full_attention_preference_tokens` | `int` | FA 偏好 token 数 |
-| `full_attention_history_tokens` | `int` | FA 历史 token 数 |
-| `fallback_used` | `bool` | 是否使用了降级 |
-| `error_message` | `Optional[str]` | 错误信息 |
-| `fact_rounds_used` | `int` | Recall v4 fact call 实际轮次 |
-| `fact_tokens_total` | `int` | Recall v4 fact call 总 token 数 |
+| 字段                    | 类型            | 说明                                            |
+| ----------------------- | --------------- | ----------------------------------------------- |
+| `text`                  | `str`           | 生成的回复文本                                  |
+| `input_tokens`          | `int`           | 输入 token 数                                   |
+| `output_tokens`         | `int`           | 输出 token 数                                   |
+| `raw_output`            | `Optional[Any]` | 原始 ModelOutput                                |
+| `inference_latency_ms`  | `float`         | 推理耗时 (ms)                                   |
+| `preference_cache_hit`  | `bool`          | 偏好缓存是否命中                                |
+| `preference_cache_tier` | `str`           | 缓存层级 (`"memory"` / `"compute"` / `"error"`) |
+| `fallback_used`         | `bool`          | 是否使用了降级                                  |
+| `error_message`         | `Optional[str]` | 错误信息                                        |
+| `fact_rounds_used`      | `int`           | Recall v4 fact call 实际轮次                    |
+| `fact_tokens_total`     | `int`           | Recall v4 fact call 总 token 数                 |
+
+> **v3.2 变更**: 移除了 Full Attention 特有字段 (`full_attention_fallback`, `full_attention_position_mode`, `full_attention_preference_tokens`, `full_attention_history_tokens`)。
 
 ### 2.6 InjectionMetadata — 注入元数据 (监控用)
 
@@ -271,48 +273,47 @@ Executor 的输出，包含模型输出和执行性能数据。
 
 由 `DKIPlugin.chat()` 在 Planner 和 Executor 执行后组装，用于监控 API。
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `injection_enabled` | `bool` | 注入是否启用 |
-| `alpha` | `float` | 有效注入强度 (effective_preference_alpha) |
-| `injection_strategy` | `str` | 注入策略 |
-| `preference_tokens` | `int` | 偏好 token 数 |
-| `history_tokens` | `int` | 历史 token 数 (Suffix Prompt) |
-| `history_kv_tokens` | `int` | 历史 K/V token 数 (FA 特有) |
-| `query_tokens` | `int` | 查询 token 数 |
-| `total_tokens` | `int` | 总 token 数 |
-| `preference_cache_hit` | `bool` | 偏好缓存命中 |
-| `preference_cache_tier` | `str` | 缓存层级 |
-| `latency_ms` | `float` | 总延迟 |
-| `adapter_latency_ms` | `float` | 适配器延迟 |
-| `injection_latency_ms` | `float` | 注入延迟 |
-| `inference_latency_ms` | `float` | 推理延迟 |
-| `gating_decision` | `Optional[Dict]` | 门控决策 |
-| `preferences_count` | `int` | 偏好数量 |
-| `history_messages_count` | `int` | 历史消息数量 |
-| `relevant_history_count` | `int` | 相关历史数量 |
-| `memory_triggered` | `bool` | 是否触发记忆 |
-| `trigger_type` | `Optional[str]` | 触发类型 |
-| `reference_resolved` | `bool` | 是否解析指代 |
-| `reference_type` | `Optional[str]` | 指代类型 |
-| `reference_scope` | `Optional[str]` | 指代范围 |
-| `full_attention_fallback` | `bool` | FA 是否降级 |
-| `alpha_profile` | `Optional[Dict]` | 分层 Alpha 详情 (v3.0 新增) |
-| `safety_violations` | `Optional[List[str]]` | 安全违规列表 (v3.0 新增) |
-| `request_id` | `str` | 请求唯一标识 (8位 UUID) |
-| `timestamp` | `datetime` | 时间戳 |
+| 字段                     | 类型                  | 说明                                      |
+| ------------------------ | --------------------- | ----------------------------------------- |
+| `injection_enabled`      | `bool`                | 注入是否启用                              |
+| `alpha`                  | `float`               | 有效注入强度 (effective_preference_alpha) |
+| `injection_strategy`     | `str`                 | 注入策略                                  |
+| `preference_tokens`      | `int`                 | 偏好 token 数                             |
+| `history_tokens`         | `int`                 | 历史 token 数 (Suffix Prompt)             |
+| `history_kv_tokens`      | `int`                 | 历史 K/V token 数 (FA 特有)               |
+| `query_tokens`           | `int`                 | 查询 token 数                             |
+| `total_tokens`           | `int`                 | 总 token 数                               |
+| `preference_cache_hit`   | `bool`                | 偏好缓存命中                              |
+| `preference_cache_tier`  | `str`                 | 缓存层级                                  |
+| `latency_ms`             | `float`               | 总延迟                                    |
+| `adapter_latency_ms`     | `float`               | 适配器延迟                                |
+| `injection_latency_ms`   | `float`               | 注入延迟                                  |
+| `inference_latency_ms`   | `float`               | 推理延迟                                  |
+| `gating_decision`        | `Optional[Dict]`      | 门控决策                                  |
+| `preferences_count`      | `int`                 | 偏好数量                                  |
+| `history_messages_count` | `int`                 | 历史消息数量                              |
+| `relevant_history_count` | `int`                 | 相关历史数量                              |
+| `memory_triggered`       | `bool`                | 是否触发记忆                              |
+| `trigger_type`           | `Optional[str]`       | 触发类型                                  |
+| `reference_resolved`     | `bool`                | 是否解析指代                              |
+| `reference_type`         | `Optional[str]`       | 指代类型                                  |
+| `reference_scope`        | `Optional[str]`       | 指代范围                                  |
+| `alpha_profile`          | `Optional[Dict]`      | 分层 Alpha 详情 (v3.0 新增)               |
+| `safety_violations`      | `Optional[List[str]]` | 安全违规列表 (v3.0 新增)                  |
+| `request_id`             | `str`                 | 请求唯一标识 (8 位 UUID)                  |
+| `timestamp`              | `datetime`            | 时间戳                                    |
 
 ### 2.7 DKIPluginResponse — 插件响应
 
 > 源文件: `dki/core/dki_plugin.py` 第 193-215 行
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `text` | `str` | 生成的回复文本 |
-| `input_tokens` | `int` | 输入 token 数 |
-| `output_tokens` | `int` | 输出 token 数 |
-| `metadata` | `InjectionMetadata` | 注入元数据 |
-| `raw_output` | `Optional[ModelOutput]` | 原始模型输出 |
+| 字段            | 类型                    | 说明           |
+| --------------- | ----------------------- | -------------- |
+| `text`          | `str`                   | 生成的回复文本 |
+| `input_tokens`  | `int`                   | 输入 token 数  |
+| `output_tokens` | `int`                   | 输出 token 数  |
+| `metadata`      | `InjectionMetadata`     | 注入元数据     |
+| `raw_output`    | `Optional[ModelOutput]` | 原始模型输出   |
 
 ---
 
@@ -322,16 +323,16 @@ Executor 的输出，包含模型输出和执行性能数据。
 
 ### 3.1 构造函数参数
 
-| 参数 | 类型 | 说明 |
-|------|------|------|
-| `model_adapter` | `BaseModelAdapter` | LLM 模型适配器 |
-| `user_data_adapter` | `IUserDataAdapter` | 外部数据适配器 |
-| `config` | `Optional[Any]` | 配置 (默认从 config.yaml 加载) |
-| `language` | `str` | 语言 (`"en"` / `"cn"`) |
-| `memory_trigger_config` | `Optional[MemoryTriggerConfig]` | Memory Trigger 配置 |
-| `reference_resolver_config` | `Optional[ReferenceResolverConfig]` | Reference Resolver 配置 |
-| `redis_client` | `Optional[DKIRedisClient]` | Redis 客户端 |
-| `cache_config` | `Optional[CacheConfig]` | 缓存配置 |
+| 参数                        | 类型                                | 说明                           |
+| --------------------------- | ----------------------------------- | ------------------------------ |
+| `model_adapter`             | `BaseModelAdapter`                  | LLM 模型适配器                 |
+| `user_data_adapter`         | `IUserDataAdapter`                  | 外部数据适配器                 |
+| `config`                    | `Optional[Any]`                     | 配置 (默认从 config.yaml 加载) |
+| `language`                  | `str`                               | 语言 (`"en"` / `"cn"`)         |
+| `memory_trigger_config`     | `Optional[MemoryTriggerConfig]`     | Memory Trigger 配置            |
+| `reference_resolver_config` | `Optional[ReferenceResolverConfig]` | Reference Resolver 配置        |
+| `redis_client`              | `Optional[DKIRedisClient]`          | Redis 客户端                   |
+| `cache_config`              | `Optional[CacheConfig]`             | 缓存配置                       |
 
 ### 3.2 初始化流程
 
@@ -343,18 +344,16 @@ DKIPlugin.__init__()
   │   └─ _gating: DualFactorGating (property 延迟创建)
   ├─ 确定注入策略 (_get_injection_strategy)
   │   ├─ config.dki.injection_strategy
-  │   └─ 默认 "stable"
+  │   └─ 默认 "recall_v4" (v3.2)
   ├─ 创建 InjectionPlanner (纯决策)
-  │   ├─ 传入 config, language, injection_strategy
+  │   ├─ 传入 config, language, injection_strategy="recall_v4"
   │   ├─ 内部创建 MemoryTrigger
   │   ├─ 内部创建 ReferenceResolver
   │   ├─ 内部创建 SafetyEnvelope
-  │   └─ (v3.1) 接受 recall_config, multi_signal_recall, suffix_builder
-  ├─ 创建 FullAttentionInjector (仅 full_attention 策略)
+  │   └─ 接受 recall_config, multi_signal_recall, suffix_builder
   ├─ 创建 InjectionExecutor (纯执行)
   │   ├─ 传入 model_adapter
-  │   ├─ 传入 full_attention_injector (可选)
-  │   └─ (v3.1) 接受 fact_retriever, prompt_formatter, recall_config
+  │   └─ 接受 fact_retriever, prompt_formatter, recall_config
   ├─ 创建 PreferenceCacheManager (支持 L1 + L2 Redis)
   ├─ 工作日志 (_injection_logs, 最多 1000 条)
   └─ 统计数据 (_stats)
@@ -436,14 +435,14 @@ DKIPlugin.chat(query, user_id, session_id, ...)
   │   └─ planner.build_plan(query, user_id, prefs, history, context)
   │       → InjectionPlan (纯数据, 可序列化)
   │       ├─ 格式化偏好文本
-  │       ├─ 策略分支:
-  │       │   ├─ Recall v4 (如果配置启用且组件可用):
+  │       ├─ 策略分支 (v3.2):
+  │       │   ├─ Recall v4 (默认策略):
   │       │   │   ├─ MultiSignalRecall.recall() → 多信号召回
   │       │   │   ├─ SuffixBuilder.build() → 逐消息 Summary + 后缀组装
-  │       │   │   └─ 填充 assembled_suffix, trace_ids, summary_count 等
+  │       │   │   ├─ 填充 assembled_suffix, trace_ids, summary_count 等
+  │       │   │   └─ 失败时: plan.strategy → "stable" (自动降级)
   │       │   │
-  │       │   ├─ Stable: 格式化历史后缀 (始终准备, 用于 fallback)
-  │       │   └─ Full Attention: 额外准备原始消息列表
+  │       │   └─ Stable (回退策略): 格式化平铺历史后缀
   │       │
   │       ├─ 计算分层 Alpha (AlphaProfile)
   │       ├─ 注入决策 (是否注入)
@@ -454,11 +453,11 @@ DKIPlugin.chat(query, user_id, session_id, ...)
   ├─ Step 4: 执行注入计划 (Executor)
   │   └─ executor.execute(plan, max_new_tokens, temperature)
   │       → ExecutionResult
-  │       ├─ strategy == "full_attention" → _execute_full_attention()
-  │       ├─ injection_enabled + 有偏好 → _execute_stable()
-  │       │   └─ (v3.1) 如果 plan.has_fact_call_instruction:
+  │       ├─ injection_enabled + 有偏好 → _execute_with_kv_injection()
+  │       │   └─ 如果 plan.strategy == "recall_v4" + has_fact_call_instruction:
   │       │       └─ _execute_fact_call_loop() → 事实补充循环
-  │       └─ 其他 → _execute_plain()
+  │       ├─ 其他 → _execute_plain()
+  │       └─ 异常 → _execute_stable_fallback() → _execute_fallback()
   │
   ├─ Step 5: 记录工作数据
   │   ├─ 组装 InjectionMetadata (从 plan + result)
@@ -466,9 +465,14 @@ DKIPlugin.chat(query, user_id, session_id, ...)
   │   └─ record_visualization() → 可视化 API 数据
   │
   └─ 返回 DKIPluginResponse
-  
-  异常处理:
-  └─ 降级: 直接调用 model.generate(query) (无注入)
+
+  异常处理 (v3.2 三级降级):
+  ├─ 第一级: 尝试 stable 策略 (偏好 K/V + 原始查询)
+  │   ├─ 构建 stable_plan
+  │   ├─ 加载偏好并构建 stable 注入
+  │   └─ executor.execute(stable_plan)
+  ├─ 第二级: 直接调用 model.generate(query) (无注入)
+  └─ 第三级: 抛出异常
 ```
 
 ### 4.1 数据流图
@@ -526,28 +530,28 @@ DKIPlugin.chat(query, user_id, session_id, ...)
 
 ### 5.1 设计约束
 
-| 约束 | 说明 |
-|------|------|
-| 不持有模型引用 | Planner 不依赖 `BaseModelAdapter` |
-| 不执行推理 | 不调用 `model.generate()` 或 `model.compute_kv()` |
-| 输出可序列化 | `InjectionPlan` 是纯数据, 可 `to_dict()` |
-| 可独立测试 | 不需要 GPU 或模型即可测试所有决策逻辑 |
+| 约束           | 说明                                              |
+| -------------- | ------------------------------------------------- |
+| 不持有模型引用 | Planner 不依赖 `BaseModelAdapter`                 |
+| 不执行推理     | 不调用 `model.generate()` 或 `model.compute_kv()` |
+| 输出可序列化   | `InjectionPlan` 是纯数据, 可 `to_dict()`          |
+| 可独立测试     | 不需要 GPU 或模型即可测试所有决策逻辑             |
 
 ### 5.2 构造函数参数
 
-| 参数 | 类型 | 说明 |
-|------|------|------|
-| `config` | `Optional[Any]` | DKI 配置对象 |
-| `language` | `str` | 语言 (`"en"` / `"cn"`) |
-| `injection_strategy` | `str` | 默认注入策略 (`"stable"` / `"full_attention"` / `"recall_v4"`) |
-| `memory_trigger` | `Optional[MemoryTrigger]` | Memory Trigger 实例 (可注入) |
-| `memory_trigger_config` | `Optional[MemoryTriggerConfig]` | Memory Trigger 配置 |
-| `reference_resolver` | `Optional[ReferenceResolver]` | Reference Resolver 实例 (可注入) |
-| `reference_resolver_config` | `Optional[ReferenceResolverConfig]` | Reference Resolver 配置 |
-| `safety_envelope` | `Optional[SafetyEnvelope]` | 安全边界 (可注入) |
-| `recall_config` | `Optional[RecallConfig]` | Recall v4 配置 (v3.1 新增) |
-| `multi_signal_recall` | `Optional[MultiSignalRecall]` | 多信号召回器 (v3.1 新增) |
-| `suffix_builder` | `Optional[SuffixBuilder]` | 后缀组装器 (v3.1 新增) |
+| 参数                        | 类型                                | 说明                                                    |
+| --------------------------- | ----------------------------------- | ------------------------------------------------------- |
+| `config`                    | `Optional[Any]`                     | DKI 配置对象                                            |
+| `language`                  | `str`                               | 语言 (`"en"` / `"cn"`)                                  |
+| `injection_strategy`        | `str`                               | 默认注入策略 (`"recall_v4"` (默认) / `"stable"` (回退)) |
+| `memory_trigger`            | `Optional[MemoryTrigger]`           | Memory Trigger 实例 (可注入)                            |
+| `memory_trigger_config`     | `Optional[MemoryTriggerConfig]`     | Memory Trigger 配置                                     |
+| `reference_resolver`        | `Optional[ReferenceResolver]`       | Reference Resolver 实例 (可注入)                        |
+| `reference_resolver_config` | `Optional[ReferenceResolverConfig]` | Reference Resolver 配置                                 |
+| `safety_envelope`           | `Optional[SafetyEnvelope]`          | 安全边界 (可注入)                                       |
+| `recall_config`             | `Optional[RecallConfig]`            | Recall v4 配置 (v3.1 新增)                              |
+| `multi_signal_recall`       | `Optional[MultiSignalRecall]`       | 多信号召回器 (v3.1 新增)                                |
+| `suffix_builder`            | `Optional[SuffixBuilder]`           | 后缀组装器 (v3.1 新增)                                  |
 
 ### 5.3 Phase 1: analyze_query() — 查询分析
 
@@ -568,13 +572,13 @@ analyze_query(query)
 
 **指代类型与召回轮数:**
 
-| 指代类型 | 触发词示例 | 默认召回轮数 | 说明 |
-|----------|-----------|-------------|------|
-| `NONE` | (无指代) | 10 | 默认召回 |
-| `JUST_NOW` | "刚刚"、"刚才" | 5 | 最近几轮 |
-| `RECENTLY` | "最近"、"前几天" | 20 | 较大范围 |
-| `LAST_TOPIC` | "那件事"、"上次聊的" | 15 | 话题相关 |
-| `ASSISTANT_STANCE` | "你之前说的"、"你建议的" | 10 | 助手立场 |
+| 指代类型           | 触发词示例               | 默认召回轮数 | 说明     |
+| ------------------ | ------------------------ | ------------ | -------- |
+| `NONE`             | (无指代)                 | 10           | 默认召回 |
+| `JUST_NOW`         | "刚刚"、"刚才"           | 5            | 最近几轮 |
+| `RECENTLY`         | "最近"、"前几天"         | 20           | 较大范围 |
+| `LAST_TOPIC`       | "那件事"、"上次聊的"     | 15           | 话题相关 |
+| `ASSISTANT_STANCE` | "你之前说的"、"你建议的" | 10           | 助手立场 |
 
 ### 5.4 Phase 2: build_plan() — 构建注入计划
 
@@ -590,20 +594,17 @@ build_plan(query, user_id, preferences, relevant_history, context, force_alpha,
   │       ├─ 过滤过期偏好 (is_expired())
   │       └─ 格式: "- {type}: {text}"
   │
-  ├─ Step 2: 格式化历史 (策略分支)
-  │   ├─ 判断 use_recall_v4:
-  │   │   ├─ strategy == "recall_v4"
-  │   │   └─ strategy == "stable" + recall_config.enabled + strategy == "summary_with_fact_call"
-  │   │
-  │   ├─ Recall v4 分支:
+  ├─ Step 2: 格式化历史 (策略分支, v3.2)
+  │   ├─ Recall v4 分支 (默认):
   │   │   └─ _build_recall_v4_plan(plan, query, session_id, ...)
   │   │       ├─ MultiSignalRecall.recall(query, session_id, user_id)
   │   │       ├─ SuffixBuilder.build(query, recalled_messages, context_window, ...)
-  │   │       └─ 填充 plan.assembled_suffix, trace_ids, summary_count 等
-  │   │       └─ 异常时回退到 flat_history_fallback
+  │   │       ├─ 填充 plan.assembled_suffix, trace_ids, summary_count 等
+  │   │       └─ 异常时: plan.recall_strategy → "flat_history_fallback"
+  │   │                  plan.strategy → "stable" (自动降级)
   │   │
-  │   ├─ Stable 分支: _format_history_suffix(relevant_history) → 始终准备
-  │   └─ Full Attention 分支: 额外准备原始消息列表
+  │   └─ Stable 分支 (recall_v4 失败时的回退):
+  │       └─ _format_history_suffix(relevant_history) → 平铺历史后缀
   │
   ├─ Step 3: 计算分层 Alpha
   │   └─ _compute_alpha_profile(strategy, preferences, history, force_alpha)
@@ -624,7 +625,7 @@ build_plan(query, user_id, preferences, relevant_history, context, force_alpha,
       └─ SafetyEnvelope.validate(plan) → violations
 ```
 
-### 5.5 Recall v4 计划构建 (_build_recall_v4_plan)
+### 5.5 Recall v4 计划构建 (\_build_recall_v4_plan)
 
 > 源文件: `dki/core/plugin/injection_planner.py` 第 400-451 行
 
@@ -729,8 +730,9 @@ planner.update_memory_trigger_config(
     custom_patterns=[...],
 )
 
-# 切换注入策略
-planner.injection_strategy = "recall_v4"  # v3.1 新增
+# 切换注入策略 (v3.2: 仅支持 recall_v4 和 stable)
+planner.injection_strategy = "recall_v4"  # 默认
+planner.injection_strategy = "stable"     # 回退
 ```
 
 ### 5.10 统计数据
@@ -742,8 +744,9 @@ planner.get_stats()
 #     "safety_violations": 2,
 #     "memory_trigger_count": 15,
 #     "reference_resolved_count": 8,
-#     "recall_v4_plans": 42,          # v3.1 新增
-#     "strategy": "stable",
+#     "recall_v4_plans": 42,
+#     "stable_fallback_plans": 3,     # v3.2 新增
+#     "strategy": "recall_v4",
 #     "memory_trigger": {...},
 #     "reference_resolver": {...},
 # }
@@ -757,61 +760,65 @@ planner.get_stats()
 
 ### 6.1 设计约束
 
-| 约束 | 说明 |
-|------|------|
-| 不做决策 | 不判断"是否注入"，只按 Plan 执行 |
-| Key 不缩放 | Key tensor 永远不被 alpha 缩放 |
+| 约束       | 说明                                                     |
+| ---------- | -------------------------------------------------------- |
+| 不做决策   | 不判断"是否注入"，只按 Plan 执行                         |
+| Key 不缩放 | Key tensor 永远不被 alpha 缩放                           |
 | Alpha 受限 | 使用 `effective_preference_alpha` (受 override_cap 约束) |
-| 自动降级 | 任何异常自动降级到无注入推理 |
+| 自动降级   | 任何异常自动降级到无注入推理                             |
 
-### 6.2 构造函数参数
+### 6.2 构造函数参数 (v3.2)
 
-| 参数 | 类型 | 说明 |
-|------|------|------|
-| `model_adapter` | `BaseModelAdapter` | LLM 模型适配器 |
-| `full_attention_injector` | `Optional[FullAttentionInjector]` | FA 注入器 (可选) |
-| `fact_retriever` | `Optional[FactRetriever]` | 事实检索器 (Recall v4, 可选) |
+| 参数               | 类型                        | 说明                           |
+| ------------------ | --------------------------- | ------------------------------ |
+| `model_adapter`    | `BaseModelAdapter`          | LLM 模型适配器                 |
+| `fact_retriever`   | `Optional[FactRetriever]`   | 事实检索器 (Recall v4, 可选)   |
 | `prompt_formatter` | `Optional[PromptFormatter]` | 提示格式化器 (Recall v4, 可选) |
-| `recall_config` | `Optional[RecallConfig]` | 召回配置 (Recall v4, 可选) |
+| `recall_config`    | `Optional[RecallConfig]`    | 召回配置 (Recall v4, 可选)     |
+
+> **v3.2 变更**: 移除了 `full_attention_injector` 参数。新增用户级隔离缓存 (按 user_id 分区) 和 `InferenceContextGuard`。
 
 ### 6.3 execute() — 主执行入口
 
 > 源文件: `dki/core/plugin/injection_executor.py` 第 114-176 行
 
 ```
-execute(plan, max_new_tokens, temperature)
+execute(plan, max_new_tokens, temperature)  [v3.2]
   │
   ├─ 路由判断:
-  │   ├─ strategy=="full_attention" + 注入器存在 + injection_enabled
-  │   │   → _execute_full_attention()
   │   ├─ injection_enabled + 有偏好文本
-  │   │   → _execute_stable()
-  │   │   └─ (v3.1) 如果 plan.has_fact_call_instruction + recall 组件可用:
+  │   │   → _execute_with_kv_injection()
+  │   │   └─ 如果 plan.strategy == "recall_v4"
+  │   │       + plan.has_fact_call_instruction + recall 组件可用:
   │   │       └─ _execute_fact_call_loop() → 事实补充循环
   │   └─ 其他
   │       → _execute_plain()
   │
-  └─ 异常处理:
+  └─ 异常处理 (三级降级):
+      ├─ _execute_stable_fallback() (偏好 K/V + 平铺历史后缀)
       └─ _execute_fallback() (无注入推理)
 ```
 
-### 6.4 Stable 策略执行
+### 6.4 K/V 注入执行 (recall_v4 + stable 共用)
 
-> 源文件: `dki/core/plugin/injection_executor.py` 第 182-236 行
+> 源文件: `dki/core/plugin/injection_executor.py`
 
 ```
-_execute_stable(plan)
+_execute_with_kv_injection(plan)  [v3.2]
   │
-  ├─ 获取偏好 K/V (含内存缓存)
+  ├─ 获取偏好 K/V (含用户级隔离缓存)
   │   └─ _get_preference_kv(user_id, preference_text)
-  │       ├─ cache_key = f"{user_id}:{md5(preference_text)}"
-  │       ├─ 检查内存缓存 → 命中返回 (kv, True, "memory")
+  │       ├─ 用户级缓存分区: _preference_kv_cache[user_id][content_hash]
+  │       ├─ 检查缓存 → 命中返回 (kv, True, "memory")
   │       ├─ 计算 K/V: model.compute_kv(preference_text)
-  │       ├─ 存入缓存
+  │       ├─ 存入用户分区缓存
   │       └─ 返回 (kv, False, "compute")
   │
   ├─ 使用 effective alpha (受 override_cap 约束)
   │   └─ alpha = plan.alpha_profile.effective_preference_alpha
+  │
+  ├─ 推理上下文隔离 (InferenceContextGuard)
+  │   └─ 确保推理结束后 K/V 不残留
   │
   └─ LLM 推理
       ├─ 有 K/V + alpha > 0.1
@@ -869,165 +876,154 @@ Round 2: 检索 msg-012 后半段 → 追加到 prompt → 重新推理
 结束: 返回最终结果 (fact_rounds_used=2)
 ```
 
-### 6.6 Full Attention 策略执行 (⚠️ 已弃用)
+### 6.6 Full Attention 策略 (❌ 已移除)
 
-> 源文件: `dki/core/plugin/injection_executor.py` 第 242-325 行
+> **v3.2 变更**: Full Attention 策略已完全移除。原因:
+>
+> -   K/V 容量有限, 不可引用, OOD 风险
+> -   长历史场景不可用
+> -   事实准确性不足
+>
+> 推荐使用 Recall v4 策略处理所有场景。Stable 策略作为 recall_v4 的回退方案。
 
-```
-_execute_full_attention(plan)
-  │
-  ├─ 调用 Full Attention 注入器
-  │   └─ fa_injector.inject(model, preference_text, history_messages, query)
-  │       └─ 返回 InjectionResult
-  │
-  ├─ 降级检查
-  │   └─ 失败或 fallback → _execute_stable_fallback()
-  │
-  ├─ 构造最终输入 (仅包含全局指示 + 查询)
-  │   └─ final_input = global_indication + "\n" + query
-  │
-  └─ LLM 推理
-      └─ model.forward_with_kv_injection(final_input, merged_kv, alpha)
-```
-
-> ⚠️ **弃用说明**: Full Attention 策略因 K/V 容量有限、不可引用、OOD 风险等原因已弃用。
-> 推荐使用 Recall v4 策略处理长历史场景。代码保留用于向后兼容和研究目的。
-
-### 6.7 降级机制
+### 6.7 降级机制 (v3.2 三级降级)
 
 ```
 降级层级:
-  ├─ Full Attention 失败
+  ├─ Level 0: Recall v4 Planner 阶段失败
+  │   └─ Planner 回退到 flat_history_fallback
+  │       ├─ plan.recall_strategy → "flat_history_fallback"
+  │       ├─ plan.strategy → "stable"
+  │       └─ 使用平铺历史后缀
+  │
+  ├─ Level 1: Executor 执行异常
   │   └─ _execute_stable_fallback()
   │       ├─ 使用 plan.history_suffix 重构 stable 输入
-  │       └─ 调用 _execute_stable()
+  │       ├─ 获取偏好 K/V (如果可用)
+  │       └─ model.forward_with_kv_injection() 或 model.generate()
   │
-  ├─ Recall v4 失败
-  │   └─ Planner 回退到 flat_history_fallback
-  │       └─ 使用原有 stable 格式化
+  ├─ Level 2: Stable 回退也失败
+  │   └─ _execute_fallback()
+  │       └─ model.generate(plan.original_query) (仅原始查询, 无注入)
   │
-  └─ 任何执行异常
-      └─ _execute_fallback()
-          └─ model.generate(plan.original_query) (仅原始查询, 无注入)
+  └─ Level 3: DKIPlugin.chat() 主流程异常
+      ├─ 第一级: 构建 stable_plan + executor.execute()
+      ├─ 第二级: model.generate(query) (无注入)
+      └─ 第三级: 抛出异常
 ```
 
-### 6.8 K/V 缓存
+### 6.8 K/V 缓存 (v3.2 用户级隔离)
 
-> 源文件: `dki/core/plugin/injection_executor.py` 第 543-571 行
+> 源文件: `dki/core/plugin/injection_executor.py`
 
 ```
-_get_preference_kv(user_id, preference_text)
-  ├─ 生成缓存键: cache_key = f"{user_id}:{md5(preference_text)}"
-  ├─ 检查内存缓存: _preference_kv_cache[cache_key]
+_get_preference_kv(user_id, preference_text)  [v3.2 用户级隔离]
+  ├─ 生成缓存键: content_hash = md5(preference_text)
+  ├─ 用户级分区缓存: _preference_kv_cache[user_id][content_hash]
   │   └─ 命中 + hash 匹配 → 返回 (kv_entries, True, "memory")
+  │   └─ 用户 ID 不匹配 → 拒绝访问 (cache_user_isolation_denials++)
   ├─ 计算 K/V: model.compute_kv(preference_text)
   │   └─ 返回 List[KVCacheEntry]
   │       每个 entry: key=[B, H, S, D], value=[B, H, S, D]
-  ├─ 存入缓存: _preference_kv_cache[cache_key] = (kv_entries, content_hash)
+  ├─ 存入用户分区: _preference_kv_cache[user_id][content_hash] = (kv_entries, content_hash)
   └─ 返回 (kv_entries, False, "compute")
-  
+
   异常:
   └─ 返回 (None, False, "error")
+
+  安全保证 (v3.2):
+  ├─ 缓存按 user_id 物理分区, 不同用户的 K/V 不在同一字典中
+  ├─ InferenceContextGuard 确保推理结束后 K/V 不残留
+  └─ 统计: cache_user_isolation_denials 记录隔离拒绝次数
 ```
 
-### 6.9 统计数据
+### 6.9 统计数据 (v3.2)
 
 ```python
 executor.get_stats()
 # {
 #     "executions": 150,
-#     "stable_executions": 120,
-#     "full_attention_executions": 5,
+#     "recall_v4_executions": 42,
 #     "plain_executions": 10,
-#     "recall_v4_executions": 42,    # v3.1 新增
 #     "fallbacks": 2,
+#     "stable_fallbacks": 3,              # v3.2 新增
 #     "cache_hits": 85,
-#     "fact_call_rounds": 15,        # v3.1 新增
-#     "kv_cache_size": 15,
-#     "full_attention_available": True,
+#     "cache_user_isolation_denials": 0,   # v3.2 新增
+#     "fact_call_rounds": 15,
 # }
 ```
 
 ---
 
-## 7. 注入策略对比
+## 7. 注入策略对比 (v3.2)
 
-### 7.1 Stable 策略 (默认, 生产推荐)
+### 7.1 Recall v4 策略 (默认, 推荐)
 
-| 维度 | 说明 |
-|------|------|
-| **偏好注入** | K/V 注入 (负位置), alpha=0.3~0.5 |
-| **历史注入** | Suffix Prompt (正位置), alpha=1.0 |
-| **Context 占用** | 历史后缀 + 查询 (中等) |
-| **稳定性** | 高 (历史可引用, 可追溯) |
-| **适用场景** | 生产环境, 需要可解释性, 短历史 |
+| 维度             | 说明                                     |
+| ---------------- | ---------------------------------------- |
+| **偏好注入**     | K/V 注入 (负位置), alpha=0.3~0.5         |
+| **历史注入**     | 多信号召回 + 逐消息 Summary + Fact Call  |
+| **Context 占用** | 动态 (根据 context_window 自适应)        |
+| **稳定性**       | 高 (summary 含 trace_id, 可追溯补充事实) |
+| **适用场景**     | 所有场景 (短/长历史均适用)               |
+| **依赖**         | jieba (中文分词), 可选 LLM Summary       |
 
-### 7.2 Recall v4 策略 (v3.1 新增, 长历史推荐)
+### 7.2 Stable 策略 (回退, recall_v4 失败时自动降级)
 
-| 维度 | 说明 |
-|------|------|
-| **偏好注入** | K/V 注入 (负位置), alpha=0.3~0.5 |
-| **历史注入** | 多信号召回 + 逐消息 Summary + Fact Call |
-| **Context 占用** | 动态 (根据 context_window 自适应) |
-| **稳定性** | 高 (summary 含 trace_id, 可追溯补充事实) |
-| **适用场景** | 长历史场景, 需要精确事实的场景 |
-| **依赖** | jieba (中文分词), 可选 LLM Summary |
+| 维度             | 说明                                        |
+| ---------------- | ------------------------------------------- |
+| **偏好注入**     | K/V 注入 (负位置), alpha=0.3~0.5            |
+| **历史注入**     | Suffix Prompt (正位置, 平铺历史), alpha=1.0 |
+| **Context 占用** | 历史后缀 + 查询 (中等)                      |
+| **稳定性**       | 高 (历史可引用, 可追溯)                     |
+| **适用场景**     | recall_v4 失败时的自动回退, 短历史场景      |
 
-### 7.3 Full Attention 策略 (⚠️ 已弃用)
+### 7.3 Full Attention 策略 (❌ 已移除)
 
-| 维度 | 说明 |
-|------|------|
-| **偏好注入** | K/V 注入 (负位置 -100~-1) |
-| **历史注入** | K/V 注入 (负位置 -500~-101) |
-| **Context 占用** | 仅全局指示 + 查询 (约 3-5 tokens) |
-| **稳定性** | 低 (K/V 容量有限, OOD 风险, 不可引用) |
-| **弃用原因** | 长历史场景不可用, 事实准确性不足 |
+> Full Attention 策略已在 v3.2 中完全移除。
+> 原因: K/V 容量有限、不可引用、OOD 风险、长历史场景不可用。
 
-### 7.4 策略选择决策树
+### 7.4 策略选择决策树 (v3.2)
 
 ```
                     ┌─────────────────┐
                     │ injection_enabled│
-                    │     == False?    │
+                    │ + preference_text│
+                    │     非空?        │
                     └────────┬────────┘
                          Yes │ No
-                             │
-                    ┌────────▼────────┐
-                    │  _execute_plain  │
-                    │  (无注入推理)    │
-                    └─────────────────┘
-                             │ No
-                    ┌────────▼────────┐
-                    │ strategy ==      │
-                    │ "full_attention"?│
-                    └────────┬────────┘
-                         Yes │ No
+                             │    │
+                             │    ▼
+                             │  ┌─────────────────┐
+                             │  │ _execute_plain   │
+                             │  │ (无注入推理)     │
+                             │  └─────────────────┘
                              │
               ┌──────────────▼──────────────┐
-              │ _execute_full_attention      │
-              │ (⚠️ 已弃用, 仅研究)         │
-              │ 失败? → _execute_stable_     │
-              │         fallback             │
-              └──────────────────────────────┘
-                             │ No
+              │ _execute_with_kv_injection   │
+              │ (偏好 K/V 注入推理)         │
+              │ recall_v4 和 stable 共用    │
+              └──────────────┬──────────────┘
+                             │
               ┌──────────────▼──────────────┐
-              │ preference_text 非空?        │
+              │ strategy == "recall_v4"      │
+              │ + has_fact_call_instruction?  │
               └──────────────┬──────────────┘
                          Yes │ No
                              │
               ┌──────────────▼──────────────┐
-              │ _execute_stable              │
-              │ (偏好 K/V + 历史 Suffix)    │
-              │                              │
-              │ has_fact_call_instruction?    │
-              │   → _execute_fact_call_loop  │
-              │     (Recall v4 事实补充)     │
+              │ _execute_fact_call_loop      │
+              │ (Recall v4 事实补充)        │
               └──────────────────────────────┘
-                             │ No
-              ┌──────────────▼──────────────┐
-              │ _execute_plain               │
-              │ (无注入推理)                 │
-              └──────────────────────────────┘
+
+  异常降级:
+  ┌────────────────────────────────────────┐
+  │ 执行异常                               │
+  │  → _execute_stable_fallback()          │
+  │    (偏好 K/V + 平铺历史后缀)          │
+  │  → _execute_fallback()                 │
+  │    (无注入推理)                        │
+  └────────────────────────────────────────┘
 ```
 
 ---
@@ -1049,16 +1045,24 @@ executor.get_stats()
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### 8.2 缓存键设计
+### 8.2 缓存键设计 (v3.2 用户级隔离)
 
 ```
-cache_key = f"{user_id}:{md5(preference_text)}"
+缓存结构: {user_id: {content_hash: (kv_entries, content_hash)}}
+
+cache_key = md5(preference_text)
+缓存分区 = _preference_kv_cache[user_id]
 
 示例:
-  user_123:a1b2c3d4e5f6...
+  _preference_kv_cache["user_123"]["a1b2c3d4e5f6..."] = (kv_entries, "a1b2c3d4e5f6...")
+  _preference_kv_cache["user_456"]["b2c3d4e5f6a1..."] = (kv_entries, "b2c3d4e5f6a1...")
 ```
 
-当用户偏好更新时，`md5(preference_text)` 变化，旧缓存自动失效。
+安全保证:
+
+-   缓存按 user_id 物理分区, 不同用户的 K/V 不在同一字典中
+-   当用户偏好更新时，`md5(preference_text)` 变化，旧缓存自动失效
+-   InferenceContextGuard 确保推理结束后 K/V 不残留
 
 ### 8.3 多实例部署
 
@@ -1066,7 +1070,7 @@ cache_key = f"{user_id}:{md5(preference_text)}"
 没有 Redis: 命中率 = 70% / N (N = 实例数)
   - 2 实例: 35%
   - 4 实例: 17.5%
-  
+
 有 Redis: 命中率 = 70% (恒定)
   - 所有实例共享 L2 缓存
 ```
@@ -1077,25 +1081,25 @@ cache_key = f"{user_id}:{md5(preference_text)}"
 
 ### 9.1 通过适配器访问的上层应用表
 
-| 表名 | 操作 | 说明 |
-|------|------|------|
-| `user_preferences` (上层应用) | 读 | 用户偏好 |
-| `chat_messages` (上层应用) | 读 | 历史消息 |
+| 表名                          | 操作 | 说明     |
+| ----------------------------- | ---- | -------- |
+| `user_preferences` (上层应用) | 读   | 用户偏好 |
+| `chat_messages` (上层应用)    | 读   | 历史消息 |
 
 ### 9.2 DKI 内部存储
 
-| 存储 | 操作 | 说明 |
-|------|------|------|
-| 可视化数据 (内存) | 写 | `record_visualization()` |
-| 注入日志 (内存) | 写 | `_injection_logs` (最多 1000 条) |
-| 偏好 K/V 缓存 (内存) | 读/写 | `_preference_kv_cache` |
+| 存储                 | 操作  | 说明                             |
+| -------------------- | ----- | -------------------------------- |
+| 可视化数据 (内存)    | 写    | `record_visualization()`         |
+| 注入日志 (内存)      | 写    | `_injection_logs` (最多 1000 条) |
+| 偏好 K/V 缓存 (内存) | 读/写 | `_preference_kv_cache`           |
 
 ### 9.3 Recall v4 数据库交互
 
-| 组件 | 表 | 操作 | 说明 |
-|------|-----|------|------|
-| `MultiSignalRecall` | `conversations` | 读 | 检索历史消息 (关键词 + 向量) |
-| `FactRetriever` | `conversations` | 读 | 按 trace_id 检索原文 (支持分块) |
+| 组件                | 表              | 操作 | 说明                            |
+| ------------------- | --------------- | ---- | ------------------------------- |
+| `MultiSignalRecall` | `conversations` | 读   | 检索历史消息 (关键词 + 向量)    |
+| `FactRetriever`     | `conversations` | 读   | 按 trace_id 检索原文 (支持分块) |
 
 ---
 
@@ -1125,8 +1129,9 @@ plugin.get_stats()
 #         "safety_violations": 2,
 #         "memory_trigger_count": 15,
 #         "reference_resolved_count": 8,
-#         "recall_v4_plans": 42,          # v3.1 新增
-#         "strategy": "stable",
+#         "recall_v4_plans": 42,
+#         "stable_fallback_plans": 3,     # v3.2 新增
+#         "strategy": "recall_v4",
 #         "memory_trigger": {...},
 #         "reference_resolver": {...},
 #     },
@@ -1134,15 +1139,13 @@ plugin.get_stats()
 #     # Executor 层统计
 #     "executor": {
 #         "executions": 150,
-#         "stable_executions": 120,
-#         "full_attention_executions": 5,
+#         "recall_v4_executions": 42,
 #         "plain_executions": 10,
-#         "recall_v4_executions": 42,     # v3.1 新增
 #         "fallbacks": 2,
+#         "stable_fallbacks": 3,              # v3.2 新增
 #         "cache_hits": 85,
-#         "fact_call_rounds": 15,         # v3.1 新增
-#         "kv_cache_size": 15,
-#         "full_attention_available": True,
+#         "cache_user_isolation_denials": 0,   # v3.2 新增
+#         "fact_call_rounds": 15,
 #     },
 #
 #     # 缓存统计 (含 Redis)
@@ -1187,18 +1190,17 @@ logs = plugin.get_injection_logs(limit=100, offset=0)
 
 ## 11. 运行时配置更新
 
-### 11.1 切换注入策略
+### 11.1 切换注入策略 (v3.2)
 
 ```python
-# 运行时切换到 Recall v4 策略 (v3.1 新增)
+# 运行时切换到 Recall v4 策略 (默认)
 plugin.switch_injection_strategy("recall_v4")
 
-# 切换到 Stable 策略
+# 切换到 Stable 策略 (回退)
 plugin.switch_injection_strategy("stable")
 
-# 切换到 Full Attention 策略 (⚠️ 已弃用)
-plugin.switch_injection_strategy("full_attention")
-# 内部: 如果 executor 没有 FA 注入器, 自动初始化
+# Full Attention 已移除, 不再支持
+# plugin.switch_injection_strategy("full_attention")  # ❌ 不再支持
 ```
 
 ### 11.2 更新 Reference Resolver 配置
@@ -1222,52 +1224,47 @@ plugin.update_memory_trigger_config(
 # 委托给: planner.update_memory_trigger_config(...)
 ```
 
-### 11.4 更新 Full Attention 配置 (⚠️ 已弃用)
-
-```python
-plugin.update_full_attention_config(
-    preference_alpha=0.3,
-    history_alpha=0.5,
-    max_total_kv_tokens=800,
-)
-# 委托给: executor.full_attention_injector.update_config(...)
-```
-
-### 11.5 获取组件配置
+### 11.4 获取组件配置
 
 ```python
 configs = plugin.get_component_configs()
 # {
 #     "memory_trigger": {...},
 #     "reference_resolver": {...},
-#     "injection_strategy": "stable",
-#     "full_attention": {...},  # 仅当 FA 注入器存在时
+#     "injection_strategy": "recall_v4",
 # }
 ```
 
+> **v3.2 变更**: 移除了 `update_full_attention_config()` 方法和 `full_attention` 配置项。
+
 ---
 
-## 12. 错误处理与降级
+## 12. 错误处理与降级 (v3.2)
 
 ```
-异常处理策略 (四级降级):
+异常处理策略 (三级降级):
   │
-  ├─ Level 0: Recall v4 多信号召回失败
+  ├─ Level 0: Recall v4 多信号召回失败 (Planner 阶段)
   │   └─ Planner 回退到 flat_history_fallback
-  │       └─ 使用原有 stable 历史格式化
+  │       ├─ plan.recall_strategy → "flat_history_fallback"
+  │       ├─ plan.strategy → "stable"
+  │       └─ 使用平铺历史后缀
   │
-  ├─ Level 1: Full Attention 注入失败
+  ├─ Level 1: Executor 执行异常
   │   └─ _execute_stable_fallback()
   │       ├─ 使用 plan.history_suffix 重构 stable 输入
-  │       └─ 调用 _execute_stable() (偏好 K/V + 历史 Suffix)
+  │       ├─ 获取偏好 K/V (如果可用)
+  │       └─ model.forward_with_kv_injection() 或 model.generate()
+  │       └─ 失败 → _execute_fallback()
+  │           └─ model.generate(plan.original_query) (无注入)
   │
-  ├─ Level 2: Executor 执行异常
-  │   └─ _execute_fallback()
-  │       └─ model.generate(plan.original_query) (仅原始查询, 无注入)
-  │
-  └─ Level 3: chat() 主流程异常
-      └─ model.generate(query) (仅原始查询, 无注入)
-      
+  └─ Level 2: DKIPlugin.chat() 主流程异常
+      ├─ 第一级: 构建 stable_plan + executor.execute()
+      │   ├─ 加载偏好并构建 stable 注入
+      │   └─ 执行 stable 策略
+      ├─ 第二级: model.generate(query) (无注入)
+      └─ 第三级: 抛出异常
+
   缓存相关:
   ├─ 偏好 K/V 计算失败
   │   └─ 返回 (None, False, "error"), 跳过偏好注入
@@ -1355,52 +1352,57 @@ await dki.close()  # 关闭 Redis + 数据库连接
 
 ---
 
-## 14. v2.x → v3.0 → v3.1 迁移指南
+## 14. v2.x → v3.0 → v3.1 → v3.2 迁移指南
 
-### 14.1 对外接口 (无变化)
+### 14.1 对外接口
 
-| 方法 | v2.x | v3.0 | v3.1 | 变化 |
-|------|------|------|------|------|
-| `chat()` | ✅ | ✅ | ✅ | 签名不变, 返回类型不变 |
-| `from_config()` | ✅ | ✅ | ✅ | 签名不变 |
-| `get_stats()` | ✅ | ✅ | ✅ | v3.1 新增 recall_v4/fact_call 统计 |
-| `get_injection_logs()` | ✅ | ✅ | ✅ | 不变 |
-| `switch_injection_strategy()` | ✅ | ✅ | ✅ | v3.1 支持 "recall_v4" |
-| `update_reference_resolver_config()` | ✅ | ✅ | ✅ | 不变 |
-| `update_memory_trigger_config()` | ✅ | ✅ | ✅ | 不变 |
-| `update_full_attention_config()` | ✅ | ✅ | ✅ | 不变 (⚠️ FA 已弃用) |
-| `close()` | ✅ | ✅ | ✅ | 不变 |
+| 方法                                 | v2.x | v3.0 | v3.1 | v3.2 | 变化                                     |
+| ------------------------------------ | ---- | ---- | ---- | ---- | ---------------------------------------- |
+| `chat()`                             | ✅   | ✅   | ✅   | ✅   | 签名不变, 返回类型不变                   |
+| `from_config()`                      | ✅   | ✅   | ✅   | ✅   | 签名不变                                 |
+| `get_stats()`                        | ✅   | ✅   | ✅   | ✅   | v3.2 新增 stable_fallback/isolation 统计 |
+| `get_injection_logs()`               | ✅   | ✅   | ✅   | ✅   | 不变                                     |
+| `switch_injection_strategy()`        | ✅   | ✅   | ✅   | ✅   | v3.2 仅支持 recall_v4/stable             |
+| `update_reference_resolver_config()` | ✅   | ✅   | ✅   | ✅   | 不变                                     |
+| `update_memory_trigger_config()`     | ✅   | ✅   | ✅   | ✅   | 不变                                     |
+| `update_full_attention_config()`     | ✅   | ✅   | ✅   | ❌   | v3.2 移除                                |
+| `close()`                            | ✅   | ✅   | ✅   | ✅   | 不变                                     |
 
-### 14.2 InjectionPlan (v3.1 新增字段)
+### 14.2 InjectionPlan (v3.2 变更)
 
-| 字段 | v3.0 | v3.1 | 说明 |
-|------|------|------|------|
-| `assembled_suffix` | ❌ | ✅ | Recall v4 组装后缀 |
-| `recall_strategy` | ❌ | ✅ | 召回策略标识 |
-| `summary_count` | ❌ | ✅ | Summary 条目数 |
-| `message_count` | ❌ | ✅ | 原文消息数 |
-| `trace_ids` | ❌ | ✅ | trace_id 列表 |
-| `has_fact_call_instruction` | ❌ | ✅ | 是否含 fact call 指导 |
-| `fact_rounds_used` | ❌ | ✅ | fact call 实际轮次 |
-| `session_id` | ❌ | ✅ | 会话 ID |
+| 字段                      | v3.0       | v3.1       | v3.2          | 说明                           |
+| ------------------------- | ---------- | ---------- | ------------- | ------------------------------ |
+| `strategy` (默认值)       | `"stable"` | `"stable"` | `"recall_v4"` | 默认策略变更                   |
+| `assembled_suffix`        | ❌         | ✅         | ✅            | Recall v4 组装后缀             |
+| `recall_strategy`         | ❌         | ✅         | ✅            | 新增 `"flat_history_fallback"` |
+| `global_indication`       | ✅         | ✅         | ❌            | FA 特有, 已移除                |
+| `full_attention_fallback` | ✅         | ✅         | ❌            | FA 特有, 已移除                |
+| `history_kv_tokens`       | ✅         | ✅         | ❌            | FA 特有, 已移除                |
+| `history_messages`        | ✅         | ✅         | ❌            | FA 特有, 已移除                |
 
-### 14.3 ExecutionResult (v3.1 新增字段)
+### 14.3 ExecutionResult (v3.2 变更)
 
-| 字段 | v3.0 | v3.1 | 说明 |
-|------|------|------|------|
-| `fact_rounds_used` | ❌ | ✅ | fact call 实际轮次 |
-| `fact_tokens_total` | ❌ | ✅ | fact call 总 token 数 |
+| 字段                               | v3.0 | v3.1 | v3.2 | 说明                  |
+| ---------------------------------- | ---- | ---- | ---- | --------------------- |
+| `fact_rounds_used`                 | ❌   | ✅   | ✅   | fact call 实际轮次    |
+| `fact_tokens_total`                | ❌   | ✅   | ✅   | fact call 总 token 数 |
+| `full_attention_fallback`          | ✅   | ✅   | ❌   | FA 特有, 已移除       |
+| `full_attention_position_mode`     | ✅   | ✅   | ❌   | FA 特有, 已移除       |
+| `full_attention_preference_tokens` | ✅   | ✅   | ❌   | FA 特有, 已移除       |
+| `full_attention_history_tokens`    | ✅   | ✅   | ❌   | FA 特有, 已移除       |
 
 ### 14.4 内部架构变化
 
-| 组件 | v2.x | v3.0 | v3.1 |
-|------|------|------|------|
-| 决策逻辑 | `DKIPlugin.chat()` | `InjectionPlanner` | `InjectionPlanner` + Recall v4 |
-| 执行逻辑 | `DKIPlugin._inject_*()` | `InjectionExecutor` | `InjectionExecutor` + Fact Call |
-| 记忆召回 | 无 | 无 | `MultiSignalRecall` (关键词 + 向量 + 指代) |
-| 后缀组装 | 无 | 无 | `SuffixBuilder` (逐消息 Summary) |
-| 事实补充 | 无 | 无 | `FactRetriever` (trace_id → 原文) |
-| 提示格式化 | 无 | 无 | `PromptFormatter` (Generic/DeepSeek/GLM) |
+| 组件           | v2.x                    | v3.0                | v3.1                | v3.2                     |
+| -------------- | ----------------------- | ------------------- | ------------------- | ------------------------ |
+| 决策逻辑       | `DKIPlugin.chat()`      | `InjectionPlanner`  | + Recall v4         | + Stable 回退            |
+| 执行逻辑       | `DKIPlugin._inject_*()` | `InjectionExecutor` | + Fact Call         | + Stable 回退 + 用户隔离 |
+| 默认策略       | stable                  | stable              | stable              | **recall_v4**            |
+| Full Attention | ✅                      | ✅                  | ⚠️ 弃用             | ❌ 移除                  |
+| 用户隔离       | ❌                      | ❌                  | ❌                  | ✅                       |
+| 记忆召回       | 无                      | 无                  | `MultiSignalRecall` | 不变                     |
+| 后缀组装       | 无                      | 无                  | `SuffixBuilder`     | 不变                     |
+| 事实补充       | 无                      | 无                  | `FactRetriever`     | 不变                     |
 
 ---
 
@@ -1412,7 +1414,7 @@ dki.core.dki_plugin (Facade)
   │   ├─ dki.core.plugin.injection_plan (数据结构)
   │   ├─ dki.core.components.memory_trigger
   │   ├─ dki.core.components.reference_resolver
-  │   └─ dki.core.recall (v3.1, 可选)
+  │   └─ dki.core.recall (可选)
   │       ├─ MultiSignalRecall
   │       ├─ SuffixBuilder
   │       └─ PromptFormatter
@@ -1420,8 +1422,8 @@ dki.core.dki_plugin (Facade)
   ├─ dki.core.plugin.injection_executor (执行)
   │   ├─ dki.core.plugin.injection_plan (数据结构)
   │   ├─ dki.models.base (BaseModelAdapter)
-  │   ├─ dki.core.injection.full_attention_injector (⚠️ 已弃用)
-  │   └─ dki.core.recall (v3.1, 可选)
+  │   ├─ (v3.2) dki.cache.user_isolation (InferenceContextGuard)
+  │   └─ dki.core.recall (可选)
   │       ├─ FactRetriever
   │       └─ PromptFormatter
   │
