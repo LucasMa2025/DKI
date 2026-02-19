@@ -200,14 +200,19 @@ class TestKVValueScaling:
         assert torch.allclose(scaled_v, value)
     
     def test_scale_kv_zero_alpha(self, mis):
-        """Test K/V scaling with alpha=0.0."""
+        """Test K/V scaling with alpha=0.0.
+        
+        Key is NEVER scaled (Value-Only Scaling Principle).
+        Only Value should be zeroed when alpha=0.
+        """
         key = torch.randn(1, 4, 10, 32)
         value = torch.randn(1, 4, 10, 32)
         
         scaled_k, scaled_v = mis.scale_kv_values(key, value, alpha=0.0)
         
-        # Should be zeroed
-        assert torch.all(scaled_k == 0)
+        # Key is always unchanged (Value-Only Scaling)
+        assert torch.allclose(scaled_k, key)
+        # Value should be zeroed
         assert torch.all(scaled_v == 0)
     
     def test_scale_kv_partial_alpha(self, mis):

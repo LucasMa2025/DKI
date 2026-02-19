@@ -152,21 +152,35 @@ class TestFiLMModulation:
     
     @pytest.fixture
     def projection(self):
+        torch.manual_seed(42)  # 固定模型权重种子
         return QueryConditionedProjection(hidden_dim=128, rank=16, dropout=0.0)
     
     def test_different_queries_different_modulation(self, projection):
-        """Test that different queries produce different outputs."""
-        torch.manual_seed(42)
+        """Test that different queries produce different modulation after weight perturbation.
+        
+        NOTE: 默认初始化的 gamma_net/beta_net 权重为零 (identity-like 初始化)，
+        因此未训练时所有输入产生相同的 gamma/beta。
+        为测试 FiLM 的区分能力，手动设置非零权重模拟训练后状态。
+        """
+        # 模拟训练后: 给 gamma_net 和 beta_net 设置非零权重
+        with torch.no_grad():
+            projection.gamma_net.weight.copy_(torch.randn_like(projection.gamma_net.weight) * 0.1)
+            projection.beta_net.weight.copy_(torch.randn_like(projection.beta_net.weight) * 0.1)
+        
+        torch.manual_seed(100)
         X_mem = torch.randn(10, 128)
-        X_user_1 = torch.randn(5, 128) * 10  # Larger values
-        torch.manual_seed(123)
-        X_user_2 = torch.randn(5, 128) * -10  # Different query with opposite sign
+        X_user_1 = torch.ones(5, 128) * 5.0
+        X_user_2 = torch.ones(5, 128) * -5.0
         
-        output_1, _, _ = projection(X_mem, X_user_1, return_modulation=True)
-        output_2, _, _ = projection(X_mem, X_user_2, return_modulation=True)
+        _, gamma_1, beta_1 = projection(X_mem, X_user_1, return_modulation=True)
+        _, gamma_2, beta_2 = projection(X_mem, X_user_2, return_modulation=True)
         
-        # Different queries should produce different outputs
-        assert not torch.allclose(output_1, output_2)
+        # 非零权重 + 极端不同的输入 → 不同的调制参数
+        gamma_diff = not torch.allclose(gamma_1, gamma_2, atol=1e-4)
+        beta_diff = not torch.allclose(beta_1, beta_2, atol=1e-4)
+        assert gamma_diff or beta_diff, (
+            "Trained projection should produce different modulation for different queries"
+        )
     
     def test_same_query_same_modulation(self, projection):
         """Test that same query produces same modulation."""

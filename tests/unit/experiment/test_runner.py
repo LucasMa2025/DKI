@@ -661,3 +661,341 @@ class TestExperimentRunnerUtils:
             
             MockSigner.assert_called_once()
             assert runner._cache_key_signer is not None
+
+
+# ============================================================
+# _run_session 测试
+# ============================================================
+
+class TestRunSession:
+    """_run_session 方法测试"""
+
+    @pytest.fixture
+    def mock_runner(self, tmp_path):
+        """创建一个带 mock 依赖的 ExperimentRunner"""
+        with patch("dki.experiment.runner.ConfigLoader") as MockConfigLoader, \
+             patch("dki.experiment.runner.DatabaseManager") as MockDBManager:
+            
+            mock_config = MagicMock()
+            mock_config.database.path = str(tmp_path / "test.db")
+            mock_config.experiment = None
+            MockConfigLoader.return_value.config = mock_config
+            
+            mock_dki = MagicMock()
+            mock_rag = MagicMock()
+            
+            runner = ExperimentRunner(
+                dki_system=mock_dki,
+                rag_system=mock_rag,
+                output_dir=str(tmp_path / "results"),
+            )
+            runner.config = mock_config
+            runner._experiment_user_map = {
+                "exp_user_vegetarian": "uid_veg",
+                "exp_user_tech": "uid_tech",
+            }
+            return runner
+
+    def _make_mock_dki_response(self):
+        """创建模拟 DKI 响应"""
+        response = MagicMock()
+        response.text = "I recommend vegetarian food for you."
+        response.latency_ms = 42.5
+        response.metadata = {
+            'hybrid_injection': {
+                'preference_text': '我是素食主义者',
+                'preference_tokens': 15,
+                'history_suffix_text': '[历史] 之前的对话',
+                'history_tokens': 20,
+                'history_messages': [],
+                'final_input': '推荐餐厅',
+            }
+        }
+        response.gating_decision = MagicMock()
+        response.gating_decision.alpha = 0.7
+        response.gating_decision.should_inject = True
+        return response
+
+    def _make_mock_rag_response(self):
+        """创建模拟 RAG 响应"""
+        response = MagicMock()
+        response.text = "Based on your preferences, I suggest..."
+        response.latency_ms = 55.0
+        response.metadata = {}
+        response.prompt_info = MagicMock()
+        response.prompt_info.retrieved_context = "User prefers vegetarian"
+        response.prompt_info.final_prompt = "Based on: User prefers vegetarian\nQuestion: ..."
+        return response
+
+    def test_run_session_short_dki(self, mock_runner):
+        """短会话 DKI 模式应正确运行"""
+        mock_runner.dki_system.chat.return_value = self._make_mock_dki_response()
+        
+        session_data = {
+            'session_id': 'test_sess_001',
+            'experiment_user': 'exp_user_vegetarian',
+            'personas': ['我是素食主义者'],
+            'turns': [
+                {'query': '推荐一家餐厅', 'expected_keywords': ['素食', '餐厅']},
+                {'query': '附近有什么好吃的', 'expected_keywords': ['附近']},
+            ],
+        }
+        
+        result = mock_runner._run_session('dki', session_data, session_type='short')
+        
+        assert result['session_type'] == 'short'
+        assert result['user_id'] == 'uid_veg'
+        assert result['turn_count'] == 2
+        assert len(result['turns']) == 2
+        # DKI chat 应被调用 2 次
+        assert mock_runner.dki_system.chat.call_count == 2
+
+    def test_run_session_long_rag(self, mock_runner):
+        """长会话 RAG 模式应正确运行"""
+        mock_runner.rag_system.chat.return_value = self._make_mock_rag_response()
+        
+        session_data = {
+            'session_id': 'long_sess_001',
+            'experiment_user': 'exp_user_tech',
+            'personas': ['我是数据科学家'],
+            'turns': [
+                {'query': '推荐技术书籍', 'expected_keywords': ['技术', '书籍']},
+            ],
+        }
+        
+        result = mock_runner._run_session('rag', session_data, session_type='long')
+        
+        assert result['session_type'] == 'long'
+        assert result['user_id'] == 'uid_tech'
+        assert result['turn_count'] == 1
+
+    def test_run_session_injection_info(self, mock_runner):
+        """_run_session 应记录注入信息"""
+        mock_runner.dki_system.chat.return_value = self._make_mock_dki_response()
+        
+        session_data = {
+            'session_id': 'inject_test',
+            'experiment_user': 'exp_user_vegetarian',
+            'personas': ['素食主义者'],
+            'turns': [
+                {'query': '推荐餐厅', 'expected_keywords': ['素食']},
+            ],
+        }
+        
+        result = mock_runner._run_session('dki', session_data, session_type='short')
+        
+        turn = result['turns'][0]
+        assert 'injection_info' in turn
+        assert turn['injection_info']['mode'] == 'dki'
+        assert turn['injection_info']['preference_text'] == '我是素食主义者'
+        assert turn['injection_info']['alpha'] == 0.7
+
+    def test_run_session_recall_score(self, mock_runner):
+        """_run_session 应计算召回分数"""
+        response = self._make_mock_dki_response()
+        response.text = "这是一家素食餐厅，推荐给你。"
+        mock_runner.dki_system.chat.return_value = response
+        
+        session_data = {
+            'session_id': 'recall_test',
+            'experiment_user': 'exp_user_vegetarian',
+            'personas': ['素食主义者'],
+            'turns': [
+                {'query': '推荐餐厅', 'expected_keywords': ['素食', '餐厅']},
+            ],
+        }
+        
+        result = mock_runner._run_session('dki', session_data, session_type='short')
+        
+        turn = result['turns'][0]
+        assert turn['recall_score'] is not None
+        assert turn['recall_score'] == 1.0  # '素食' 和 '餐厅' 都在响应中
+
+    def test_run_session_error_handling(self, mock_runner):
+        """_run_session 应优雅处理错误"""
+        mock_runner.dki_system.chat.side_effect = Exception("Connection failed")
+        
+        session_data = {
+            'session_id': 'error_test',
+            'experiment_user': 'exp_user_vegetarian',
+            'personas': [],
+            'turns': [
+                {'query': '测试', 'expected_keywords': []},
+            ],
+        }
+        
+        result = mock_runner._run_session('dki', session_data, session_type='short')
+        
+        assert result['turn_count'] == 1
+        assert 'ERROR' in result['turns'][0]['response']
+        assert result['turns'][0]['latency_ms'] == 0
+
+    def test_run_session_empty_turns(self, mock_runner):
+        """空 turns 应返回空结果"""
+        session_data = {
+            'session_id': 'empty_test',
+            'experiment_user': 'exp_user_vegetarian',
+            'personas': [],
+            'turns': [],
+        }
+        
+        result = mock_runner._run_session('dki', session_data, session_type='short')
+        
+        assert result['turn_count'] == 0
+        assert result['turns'] == []
+
+    def test_run_session_writes_preferences_for_dki(self, mock_runner):
+        """DKI 模式下 _run_session 应写入偏好"""
+        mock_runner.dki_system.chat.return_value = self._make_mock_dki_response()
+        mock_runner.db_manager = MagicMock()
+        mock_db = MagicMock()
+        mock_runner.db_manager.session_scope.return_value.__enter__ = MagicMock(return_value=mock_db)
+        mock_runner.db_manager.session_scope.return_value.__exit__ = MagicMock(return_value=False)
+        
+        mock_pref_repo = MagicMock()
+        mock_pref_repo.get_by_user.return_value = []
+        
+        session_data = {
+            'session_id': 'pref_test',
+            'experiment_user': 'exp_user_vegetarian',
+            'personas': ['素食主义者', '海鲜过敏'],
+            'turns': [
+                {'query': '推荐餐厅', 'expected_keywords': ['素食']},
+            ],
+        }
+        
+        with patch("dki.experiment.runner.UserPreferenceRepository", return_value=mock_pref_repo):
+            mock_runner._run_session('dki', session_data, session_type='short')
+        
+        # 应调用 clear_preference_cache
+        mock_runner.dki_system.clear_preference_cache.assert_called()
+
+
+# ============================================================
+# run_persona_chat_experiment 测试
+# ============================================================
+
+class TestRunPersonaChatExperiment:
+    """run_persona_chat_experiment 方法测试"""
+
+    @pytest.fixture
+    def mock_runner(self, tmp_path):
+        """创建一个带 mock 依赖的 ExperimentRunner"""
+        with patch("dki.experiment.runner.ConfigLoader") as MockConfigLoader, \
+             patch("dki.experiment.runner.DatabaseManager") as MockDBManager:
+            
+            mock_config = MagicMock()
+            mock_config.database.path = str(tmp_path / "test.db")
+            mock_config.experiment = None
+            MockConfigLoader.return_value.config = mock_config
+            
+            mock_dki = MagicMock()
+            mock_rag = MagicMock()
+            
+            runner = ExperimentRunner(
+                dki_system=mock_dki,
+                rag_system=mock_rag,
+                output_dir=str(tmp_path / "results"),
+            )
+            runner.config = mock_config
+            return runner
+
+    def _make_mock_response(self, mode='dki'):
+        """创建模拟响应"""
+        response = MagicMock()
+        response.text = "Mock response with 素食 keyword."
+        response.latency_ms = 30.0
+        response.metadata = {
+            'hybrid_injection': {
+                'preference_text': '素食主义者',
+                'preference_tokens': 10,
+                'history_suffix_text': '',
+                'history_tokens': 0,
+                'history_messages': [],
+                'final_input': 'test query',
+            }
+        }
+        response.gating_decision = MagicMock()
+        response.gating_decision.alpha = 0.6
+        response.gating_decision.should_inject = True
+        response.cache_hit = False
+        response.cache_tier = 'L1'
+        response.prompt_info = MagicMock()
+        response.prompt_info.retrieved_context = "context"
+        response.prompt_info.final_prompt = "prompt"
+        response.prompt_info.history_messages = []
+        return response
+
+    def test_persona_chat_loads_short_data(self, mock_runner, tmp_path):
+        """应加载短会话数据"""
+        mock_runner.dki_system.chat.return_value = self._make_mock_response('dki')
+        mock_runner.rag_system.chat.return_value = self._make_mock_response('rag')
+        
+        # 创建模拟数据文件
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        short_data = [
+            {
+                'session_id': 'test_001',
+                'experiment_user': 'exp_user_vegetarian',
+                'personas': ['素食主义者'],
+                'turns': [{'query': '推荐餐厅', 'expected_keywords': ['素食']}],
+            }
+        ]
+        with open(data_dir / "persona_chat.json", 'w', encoding='utf-8') as f:
+            json.dump(short_data, f, ensure_ascii=False)
+        
+        # Mock setup_experiment_users
+        mock_runner.setup_experiment_users = MagicMock(return_value={"exp_user_vegetarian": "uid_veg"})
+        mock_runner._experiment_user_map = {"exp_user_vegetarian": "uid_veg"}
+        
+        with patch("dki.experiment.runner.Path") as MockPath:
+            # 让 data_path 直接提供
+            result = mock_runner.run_persona_chat_experiment(
+                data_path=str(data_dir / "persona_chat.json"),
+                include_long_sessions=False,
+                setup_users=False,
+            )
+        
+        assert 'short_sessions' in result
+        assert 'long_sessions' in result
+        assert 'summary' in result
+
+    def test_persona_chat_result_structure(self, mock_runner, tmp_path):
+        """结果应包含正确的结构"""
+        mock_runner.dki_system.chat.return_value = self._make_mock_response('dki')
+        mock_runner.rag_system.chat.return_value = self._make_mock_response('rag')
+        mock_runner._experiment_user_map = {"exp_user_vegetarian": "uid_veg"}
+        
+        # 创建模拟数据文件
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        short_data = [
+            {
+                'session_id': 'test_001',
+                'experiment_user': 'exp_user_vegetarian',
+                'personas': ['素食主义者'],
+                'turns': [
+                    {'query': '推荐餐厅', 'expected_keywords': ['素食']},
+                ],
+            }
+        ]
+        with open(data_dir / "persona_chat.json", 'w', encoding='utf-8') as f:
+            json.dump(short_data, f, ensure_ascii=False)
+        
+        result = mock_runner.run_persona_chat_experiment(
+            data_path=str(data_dir / "persona_chat.json"),
+            include_long_sessions=False,
+            setup_users=False,
+        )
+        
+        # 短会话结果应有 dki 和 rag 两种模式
+        assert 'dki' in result['short_sessions']
+        assert 'rag' in result['short_sessions']
+        
+        # 每个模式应有 session 结果
+        for mode in ['dki', 'rag']:
+            sessions = result['short_sessions'][mode]
+            assert len(sessions) == 1
+            assert sessions[0]['session_type'] == 'short'
+            assert sessions[0]['turn_count'] == 1

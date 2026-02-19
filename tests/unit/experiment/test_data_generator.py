@@ -343,3 +343,151 @@ class TestExperimentDataGenerator:
         assert len(data) == 1
         # 应返回所有可用的 personas
         assert len(data[0]['personas']) <= 20
+
+    # ============ 长会话 PersonaChat 测试 ============
+
+    def test_generate_long_session_basic(self):
+        """基本长会话 PersonaChat 数据生成"""
+        data = self.generator.generate_long_session_persona_chat(
+            n_sessions=4,
+            n_turns_per_session=5,
+        )
+        
+        assert len(data) == 4
+        for session in data:
+            assert 'session_id' in session
+            assert 'personas' in session
+            assert 'turns' in session
+            assert 'experiment_user' in session
+            assert session.get('session_type') == 'long'
+
+    def test_long_session_structure(self):
+        """长会话数据结构验证"""
+        data = self.generator.generate_long_session_persona_chat(
+            n_sessions=2,
+            n_turns_per_session=3,
+        )
+        
+        for session in data:
+            assert len(session['personas']) >= 3  # 长会话场景有丰富的 personas
+            assert len(session['turns']) <= 3  # 不超过请求的轮次
+            
+            for turn in session['turns']:
+                assert 'turn_id' in turn
+                assert 'query' in turn
+                assert 'expected_keywords' in turn
+                assert 'relevant_memories' in turn
+                assert 'expected_length_range' in turn
+                # 每轮查询应较长 (长会话特征)
+                assert len(turn['query']) > 50
+
+    def test_long_session_metadata(self):
+        """长会话元数据应正确"""
+        data = self.generator.generate_long_session_persona_chat(n_sessions=1)
+        
+        meta = data[0]['metadata']
+        assert meta['dataset'] == 'long_session_persona_chat'
+        assert meta['session_type'] == 'long'
+        assert meta['language'] == 'zh'
+        assert 'min_turn_length' in meta
+        assert 'max_turn_length' in meta
+        assert 'experiment_user' in meta
+        assert 'generated_at' in meta
+
+    def test_long_session_experiment_user_cycling(self):
+        """长会话应循环分配实验用户 (4 个场景)"""
+        data = self.generator.generate_long_session_persona_chat(n_sessions=8)
+        
+        users = [d['experiment_user'] for d in data]
+        unique_users = set(users)
+        
+        # 有 4 个场景模板
+        assert len(unique_users) == 4
+
+    def test_long_session_saves_file(self):
+        """长会话应保存到 JSON 文件"""
+        self.generator.generate_long_session_persona_chat(n_sessions=2)
+        
+        filepath = Path(self.output_dir) / 'long_session_persona_chat.json'
+        assert filepath.exists()
+        
+        with open(filepath, 'r', encoding='utf-8') as f:
+            loaded = json.load(f)
+        assert len(loaded) == 2
+
+    def test_long_session_turn_limit(self):
+        """n_turns_per_session 应限制每个会话的轮次"""
+        data = self.generator.generate_long_session_persona_chat(
+            n_sessions=1,
+            n_turns_per_session=3,
+        )
+        
+        # 场景模板有 8-10 轮, 但应被限制为 3 轮
+        assert len(data[0]['turns']) == 3
+
+    def test_long_session_relevant_memories(self):
+        """每轮的 relevant_memories 应基于 expected_keywords 从 personas 中匹配"""
+        data = self.generator.generate_long_session_persona_chat(n_sessions=1)
+        
+        session = data[0]
+        personas_text = " ".join(session['personas']).lower()
+        
+        for turn in session['turns']:
+            for mem in turn['relevant_memories']:
+                # 相关记忆应来自 personas
+                assert mem in session['personas']
+
+    def test_long_session_chinese_content(self):
+        """长会话应包含中文内容"""
+        data = self.generator.generate_long_session_persona_chat(n_sessions=1)
+        
+        session = data[0]
+        # personas 应包含中文
+        assert any('\u4e00' <= c <= '\u9fff' for p in session['personas'] for c in p)
+        # turns 的 query 应包含中文
+        assert any(
+            '\u4e00' <= c <= '\u9fff'
+            for t in session['turns']
+            for c in t['query']
+        )
+
+    def test_long_session_zero_sessions(self):
+        """零会话应返回空列表"""
+        data = self.generator.generate_long_session_persona_chat(n_sessions=0)
+        assert data == []
+
+    # ============ generate_all 更新测试 ============
+
+    def test_generate_all_with_long_sessions(self):
+        """generate_all 应包含长会话数据集"""
+        result = self.generator.generate_all(
+            persona_sessions=2,
+            hotpot_samples=2,
+            memory_qa_samples=2,
+            include_chinese=True,
+            include_advanced=True,
+            include_long_sessions=True,
+        )
+        
+        assert 'persona_chat' in result
+        assert 'hotpot_qa' in result
+        assert 'memory_qa' in result
+        assert 'cn_persona_chat' in result
+        assert 'multi_turn_coherence' in result
+        assert 'ablation' in result
+        assert 'long_session_persona_chat' in result
+
+    def test_generate_all_without_long_sessions(self):
+        """generate_all 可以排除长会话数据集"""
+        result = self.generator.generate_all(
+            persona_sessions=2,
+            hotpot_samples=2,
+            memory_qa_samples=2,
+            include_chinese=False,
+            include_advanced=False,
+            include_long_sessions=False,
+        )
+        
+        assert 'persona_chat' in result
+        assert 'long_session_persona_chat' not in result
+        assert 'cn_persona_chat' not in result
