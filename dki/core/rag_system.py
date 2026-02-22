@@ -1,0 +1,527 @@
+"""
+RAG System for DKI
+Retrieval-Augmented Generation implementation as baseline
+"""
+
+import time
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
+
+from loguru import logger
+
+from dki.core.memory_router import MemoryRouter, MemorySearchResult
+from dki.core.embedding_service import EmbeddingService
+from dki.models.factory import ModelFactory
+from dki.models.base import BaseModelAdapter, ModelOutput
+from dki.database.connection import DatabaseManager
+from dki.database.repository import (
+    SessionRepository, MemoryRepository, ConversationRepository, AuditLogRepository
+)
+from dki.config.config_loader import ConfigLoader
+
+
+@dataclass
+class RAGPromptInfo:
+    """RAG 提示词构造信息 - 用于显示"""
+    original_query: str = ""
+    system_prompt: str = ""
+    retrieved_context: str = ""  # 检索到的上下文
+    history_text: str = ""  # 历史对话文本
+    history_messages: List[Dict[str, str]] = None  # 历史消息列表
+    final_prompt: str = ""  # 最终构造的提示词
+    
+    def __post_init__(self):
+        if self.history_messages is None:
+            self.history_messages = []
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'original_query': self.original_query,
+            'system_prompt': self.system_prompt,
+            'retrieved_context': self.retrieved_context,
+            'history_text': self.history_text,
+            'history_messages': self.history_messages,
+            'final_prompt': self.final_prompt,
+        }
+
+
+@dataclass
+class RAGResponse:
+    """RAG system response."""
+    text: str
+    memories_used: List[MemorySearchResult]
+    latency_ms: float
+    input_tokens: int
+    output_tokens: int
+    metadata: Dict[str, Any] = None
+    # 新增: 提示词构造信息
+    prompt_info: Optional[RAGPromptInfo] = None
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'text': self.text,
+            'memories_used': [m.to_dict() for m in self.memories_used],
+            'latency_ms': self.latency_ms,
+            'input_tokens': self.input_tokens,
+            'output_tokens': self.output_tokens,
+            'metadata': self.metadata or {},
+            'prompt_info': self.prompt_info.to_dict() if self.prompt_info else None,
+        }
+
+
+class RAGSystem:
+    """
+    Retrieval-Augmented Generation System.
+    
+    Implements the standard RAG paradigm:
+    1. Retrieve relevant memories
+    2. Concatenate to prompt
+    3. Generate response
+    """
+    
+    def __init__(
+        self,
+        model_adapter: Optional[BaseModelAdapter] = None,
+        memory_router: Optional[MemoryRouter] = None,
+        embedding_service: Optional[EmbeddingService] = None,
+        engine: Optional[str] = None,
+    ):
+        self.config = ConfigLoader().config
+        
+        # Initialize components
+        self.embedding_service = embedding_service or EmbeddingService()
+        self.memory_router = memory_router or MemoryRouter(self.embedding_service)
+        
+        # Model adapter (lazy loaded)
+        self._model_adapter = model_adapter
+        self._engine = engine
+        
+        # Database
+        self.db_manager = DatabaseManager(
+            db_path=self.config.database.path,
+            echo=self.config.database.echo,
+        )
+        
+        logger.info("RAG System initialized")
+    
+    @property
+    def model(self) -> BaseModelAdapter:
+        """Get or create model adapter."""
+        if self._model_adapter is None:
+            self._model_adapter = ModelFactory.get_or_create(engine=self._engine)
+        return self._model_adapter
+    
+    def add_memory(
+        self,
+        session_id: str,
+        content: str,
+        memory_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        skip_db: bool = False,
+    ) -> str:
+        """
+        Add a memory to the system.
+        
+        Args:
+            session_id: Session identifier
+            content: Memory content
+            memory_id: Optional memory ID
+            metadata: Optional metadata
+            skip_db: If True, skip database insertion (memory already in DB,
+                      only add to in-memory router). This avoids UNIQUE constraint
+                      violations when DKI and RAG share the same database.
+            
+        Returns:
+            Memory ID
+        """
+        # Compute embedding
+        embedding = self.embedding_service.embed(content)
+        
+        if not skip_db:
+            # Store in database
+            with self.db_manager.session_scope() as db:
+                session_repo = SessionRepository(db)
+                memory_repo = MemoryRepository(db)
+                
+                # Ensure session exists
+                session_repo.get_or_create(session_id)
+                
+                # Check if memory already exists (avoid UNIQUE constraint violation)
+                if memory_id:
+                    existing = memory_repo.get(memory_id)
+                    if existing:
+                        logger.debug(f"Memory {memory_id} already exists in DB, skipping insert")
+                        memory_id = existing.id
+                    else:
+                        memory = memory_repo.create(
+                            session_id=session_id,
+                            content=content,
+                            embedding=embedding,
+                            memory_id=memory_id,
+                            metadata=metadata,
+                        )
+                        memory_id = memory.id
+                else:
+                    memory = memory_repo.create(
+                        session_id=session_id,
+                        content=content,
+                        embedding=embedding,
+                        memory_id=memory_id,
+                        metadata=metadata,
+                    )
+                    memory_id = memory.id
+        else:
+            # skip_db mode: memory_id must be provided
+            if not memory_id:
+                from dki.database.repository import BaseRepository
+                memory_id = BaseRepository.generate_id("mem_")
+        
+        # Add to router (in-memory index)
+        self.memory_router.add_memory(
+            memory_id=memory_id,
+            content=content,
+            embedding=embedding,
+            metadata=metadata,
+        )
+        
+        logger.debug(f"Added memory: {memory_id} (skip_db={skip_db})")
+        return memory_id
+    
+    def load_memories_from_db(self, session_id: str) -> int:
+        """
+        Load memories from database into router.
+        
+        Args:
+            session_id: Session to load memories for
+            
+        Returns:
+            Number of memories loaded
+        """
+        with self.db_manager.session_scope() as db:
+            memory_repo = MemoryRepository(db)
+            memories = memory_repo.get_by_session(session_id)
+            
+            count = 0
+            for mem in memories:
+                embedding = memory_repo.get_embedding(mem.id)
+                self.memory_router.add_memory(
+                    memory_id=mem.id,
+                    content=mem.content,
+                    embedding=embedding,
+                    metadata=mem.get_metadata(),
+                )
+                count += 1
+        
+        logger.info(f"Loaded {count} memories for session {session_id}")
+        return count
+    
+    def _estimate_tokens(self, text: str) -> int:
+        """估算 token 数 (使用 tokenizer 或字符数近似)"""
+        if self.model and hasattr(self.model, 'tokenizer') and self.model.tokenizer:
+            try:
+                return len(self.model.tokenizer.encode(text))
+            except Exception:
+                pass
+        # 粗略估算: 中文约 1.5 字/token, 英文约 4 字符/token, 取平均 2.5
+        return max(1, len(text) // 2)
+    
+    def _get_max_context_length(self) -> int:
+        """获取模型最大上下文长度"""
+        if self.model:
+            if hasattr(self.model, 'max_model_len'):
+                return self.model.max_model_len
+            if hasattr(self.model, 'tokenizer') and self.model.tokenizer:
+                try:
+                    return self.model.tokenizer.model_max_length
+                except Exception:
+                    pass
+        return 4096  # 默认安全长度
+    
+    def _build_prompt(
+        self,
+        query: str,
+        memories: List[MemorySearchResult],
+        system_prompt: Optional[str] = None,
+        history: Optional[List[Dict[str, str]]] = None,
+    ) -> tuple:
+        """
+        Build prompt with retrieved memories and conversation history.
+        
+        Includes automatic truncation to prevent exceeding model context length.
+        
+        Args:
+            query: User query
+            memories: Retrieved memories
+            system_prompt: Optional system prompt
+            history: Optional conversation history [{"role": "user/assistant", "content": "..."}]
+            
+        Returns:
+            Tuple of (formatted_prompt, RAGPromptInfo)
+        """
+        # 获取模型最大上下文长度, 预留 generation 空间
+        max_context = self._get_max_context_length()
+        max_prompt_tokens = max_context - 512  # 预留 512 tokens 给生成
+        
+        # 用于记录的信息
+        prompt_info = RAGPromptInfo(
+            original_query=query,
+            system_prompt=system_prompt or "",
+            history_messages=history or [],
+        )
+        
+        # === 1. 构建必须保留的部分 (system prompt + query + footer) ===
+        fixed_parts = []
+        if system_prompt:
+            fixed_parts.append(f"System: {system_prompt}\n")
+        fixed_parts.append(f"User: {query}")
+        fixed_parts.append("\nAssistant:")
+        fixed_text = "\n".join(fixed_parts)
+        fixed_tokens = self._estimate_tokens(fixed_text)
+        
+        remaining_tokens = max_prompt_tokens - fixed_tokens
+        
+        # === 2. 构建 retrieved context (优先保留) ===
+        context_parts = []
+        context_text = ""
+        if memories and remaining_tokens > 50:
+            context_header = "Relevant information:\n"
+            context_tokens = self._estimate_tokens(context_header)
+            
+            for i, mem in enumerate(memories, 1):
+                line = f"[{i}] {mem.content}"
+                line_tokens = self._estimate_tokens(line)
+                if context_tokens + line_tokens > remaining_tokens * 0.5:
+                    # 最多使用剩余空间的 50% 给 context
+                    break
+                context_parts.append(line)
+                context_tokens += line_tokens
+            
+            if context_parts:
+                context_text = context_header + "\n".join(context_parts) + "\n"
+                remaining_tokens -= self._estimate_tokens(context_text)
+        
+        prompt_info.retrieved_context = "\n".join(context_parts)
+        
+        # === 3. 构建 conversation history (截断最旧的) ===
+        history_parts = []
+        history_text = ""
+        if history and remaining_tokens > 50:
+            history_header = "Previous conversation:\n"
+            header_tokens = self._estimate_tokens(history_header)
+            
+            # 从最新开始，保留尽可能多的历史
+            selected_history = []
+            used_tokens = header_tokens
+            
+            for msg in reversed(history):
+                role = "User" if msg["role"] == "user" else "Assistant"
+                line = f"{role}: {msg['content']}"
+                line_tokens = self._estimate_tokens(line)
+                if used_tokens + line_tokens > remaining_tokens:
+                    break
+                selected_history.insert(0, line)
+                used_tokens += line_tokens
+            
+            if selected_history:
+                history_parts = selected_history
+                history_text = history_header + "\n".join(selected_history) + "\n"
+            
+            if len(selected_history) < len(history):
+                logger.info(
+                    f"RAG prompt truncated: kept {len(selected_history)}/{len(history)} "
+                    f"history messages to fit model context ({max_context} tokens)"
+                )
+        
+        prompt_info.history_text = "\n".join(history_parts)
+        
+        # === 4. 组装最终 prompt ===
+        parts = []
+        if system_prompt:
+            parts.append(f"System: {system_prompt}\n")
+        if context_text:
+            parts.append(context_text)
+        if history_text:
+            parts.append(history_text)
+        parts.append(f"User: {query}")
+        parts.append("\nAssistant:")
+        
+        final_prompt = "\n".join(parts)
+        prompt_info.final_prompt = final_prompt
+        
+        # 最终安全检查
+        final_tokens = self._estimate_tokens(final_prompt)
+        if final_tokens > max_prompt_tokens:
+            logger.warning(
+                f"RAG prompt still too long ({final_tokens} > {max_prompt_tokens}), "
+                f"forcefully truncating"
+            )
+            # 强制截断: 只保留 query
+            final_prompt = f"User: {query}\nAssistant:"
+            prompt_info.final_prompt = final_prompt
+            prompt_info.history_text = ""
+            prompt_info.retrieved_context = ""
+        
+        return final_prompt, prompt_info
+    
+    def _get_conversation_history(
+        self,
+        session_id: str,
+        max_turns: int = 5,
+    ) -> List[Dict[str, str]]:
+        """
+        Get conversation history for a session.
+        
+        Args:
+            session_id: Session identifier
+            max_turns: Maximum number of conversation turns to retrieve
+            
+        Returns:
+            List of conversation messages
+        """
+        with self.db_manager.session_scope() as db:
+            conv_repo = ConversationRepository(db)
+            messages = conv_repo.get_recent(session_id, n_turns=max_turns)
+            
+            return [
+                {"role": msg.role, "content": msg.content}
+                for msg in messages
+            ]
+    
+    def chat(
+        self,
+        query: str,
+        session_id: str,
+        user_id: Optional[str] = None,
+        top_k: Optional[int] = None,
+        system_prompt: Optional[str] = None,
+        max_new_tokens: int = 512,
+        temperature: float = 0.7,
+        include_history: bool = True,
+        max_history_turns: int = 5,
+        **kwargs
+    ) -> RAGResponse:
+        """
+        Generate response using RAG with conversation history.
+        
+        Args:
+            query: User query
+            session_id: Session identifier
+            user_id: User identifier (optional)
+            top_k: Number of memories to retrieve
+            system_prompt: Optional system prompt
+            max_new_tokens: Maximum tokens to generate
+            temperature: Sampling temperature
+            include_history: Whether to include conversation history
+            max_history_turns: Maximum history turns to include
+            
+        Returns:
+            RAGResponse with generated text and metadata
+        """
+        start_time = time.perf_counter()
+        
+        # Retrieve relevant memories
+        top_k = top_k or self.config.rag.top_k
+        memories = self.memory_router.search(query, top_k=top_k)
+        
+        # Get conversation history if enabled
+        history = None
+        if include_history:
+            try:
+                history = self._get_conversation_history(session_id, max_turns=max_history_turns)
+                logger.debug(f"Retrieved {len(history)} history messages for session {session_id}")
+            except Exception as e:
+                logger.warning(f"Failed to get conversation history: {e}")
+                history = None
+        
+        # Build prompt with history (now returns tuple)
+        prompt, prompt_info = self._build_prompt(query, memories, system_prompt, history)
+        
+        # Generate response
+        output = self.model.generate(
+            prompt=prompt,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            **kwargs
+        )
+        
+        end_time = time.perf_counter()
+        total_latency = (end_time - start_time) * 1000
+        
+        # Log to database
+        try:
+            with self.db_manager.session_scope() as db:
+                # Ensure session exists before inserting conversation
+                session_repo = SessionRepository(db)
+                session_repo.get_or_create(session_id=session_id, user_id=user_id)
+                
+                conv_repo = ConversationRepository(db)
+                audit_repo = AuditLogRepository(db)
+                
+                # Store user message
+                conv_repo.create(
+                    session_id=session_id,
+                    role='user',
+                    content=query,
+                )
+                
+                # Store assistant response
+                conv_repo.create(
+                    session_id=session_id,
+                    role='assistant',
+                    content=output.text,
+                    injection_mode='rag',
+                    memory_ids=[m.memory_id for m in memories],
+                    latency_ms=total_latency,
+                )
+                
+                # Audit log
+                audit_repo.log(
+                    action='rag_generate',
+                    session_id=session_id,
+                    memory_ids=[m.memory_id for m in memories],
+                    mode='rag',
+                )
+        except Exception as e:
+            logger.error(f"Failed to log conversation: {e}")
+        
+        return RAGResponse(
+            text=output.text,
+            memories_used=memories,
+            latency_ms=total_latency,
+            input_tokens=output.input_tokens,
+            output_tokens=output.output_tokens,
+            metadata={
+                'prompt_length': len(prompt),
+                'model': self.model.model_name,
+                'history_turns': len(history) if history else 0,
+            },
+            prompt_info=prompt_info,
+        )
+    
+    def search_memories(
+        self,
+        query: str,
+        top_k: Optional[int] = None,
+    ) -> List[MemorySearchResult]:
+        """
+        Search memories without generation.
+        
+        Args:
+            query: Search query
+            top_k: Number of results
+            
+        Returns:
+            List of search results
+        """
+        return self.memory_router.search(query, top_k=top_k)
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get system statistics."""
+        return {
+            'router_stats': self.memory_router.get_stats(),
+            'model_info': self.model.get_model_info() if self._model_adapter else None,
+            'config': {
+                'top_k': self.config.rag.top_k,
+                'similarity_threshold': self.config.rag.similarity_threshold,
+            },
+        }
