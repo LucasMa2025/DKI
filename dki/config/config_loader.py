@@ -173,11 +173,12 @@ class EngineConfig(BaseModel):
     max_model_len: int = 8192
     gpu_memory_utilization: float = 0.9
     load_in_8bit: bool = False
-    # v4.0: DKI 偏好注入模式 (仅 vllm 引擎生效)
-    # - "prompt_prefix": 偏好作为 prompt 前缀, 完整利用 vLLM (推荐)
-    # - "hf_kv": 回退到 HuggingFace 模型进行 K/V 注入 (兼容旧行为)
-    # - "auto": 自动选择 (等同于 prompt_prefix)
-    injection_mode: str = "prompt_prefix"
+    # v5.0: DKI 偏好注入模式 (仅 vllm 引擎生效)
+    # - "auto" (推荐): vLLM 原生 KV 注入 (prefix_caching)
+    # - "prompt_prefix": 等同于 auto
+    # - "vllm_kv": 等同于 auto
+    # - "hf_kv": 已废弃, 接受但内部走 vLLM 原生推理 (向后兼容)
+    injection_mode: str = "auto"
     # v4.0: 是否启用 AGA 全局知识注入 (仅 vllm 引擎生效)
     aga_enabled: bool = False
     aga_config: Dict[str, Any] = Field(default_factory=dict)
