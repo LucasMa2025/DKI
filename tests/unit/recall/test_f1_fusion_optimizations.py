@@ -167,9 +167,10 @@ class TestGetWeightsForMode:
         default = RecallScoreWeights()
         
         weights = get_weights_for_mode("clarification", config, default)
-        assert weights.keyword_weight == 0.50
+        assert weights.keyword_weight == 0.35
+        assert weights.bm25_weight == 0.20
         assert weights.vector_weight == 0.10
-        assert weights.recency_weight == 0.40
+        assert weights.recency_weight == 0.35
 
     def test_unknown_mode_returns_default(self):
         """未知模式返回默认权重"""

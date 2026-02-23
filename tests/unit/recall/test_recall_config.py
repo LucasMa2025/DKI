@@ -99,7 +99,7 @@ class TestRecallScoreWeights:
 
     def test_default_weights_sum_to_one(self):
         w = RecallScoreWeights()
-        total = w.keyword_weight + w.vector_weight + w.recency_weight
+        total = w.keyword_weight + w.bm25_weight + w.vector_weight + w.recency_weight
         assert abs(total - 1.0) < 1e-6, f"Weights should sum to 1.0, got {total}"
 
     def test_keyword_ge_vector(self):
