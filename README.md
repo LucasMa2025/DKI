@@ -49,15 +49,16 @@ This focused scope enables:
 ### Key Features
 
 -   **🧠 Attention Hook Injection**: Injects K/V at attention level via PyTorch Hooks, not prompt tokens
--   **🔀 Hybrid Injection Strategy**: Preferences (K/V negative position) + History (suffix prompt positive position)
+-   **🔀 Recall v4 Memory Recall**: Multi-signal retrieval + dynamic summary + fact supplementation (primary), stable hybrid injection as automatic fallback
 -   **🔧 Configuration-Driven Adapter**: SQLAlchemy dynamic table mapping, no interface implementation required
+-   **🔐 User-Level Isolation**: HMAC-signed cache keys + UserIsolationContext + post-inference K/V cleanup
 -   **🎚️ Memory Influence Scaling (MIS)**: Continuous α ∈ [0, 1] control
 -   **🔄 Query-Conditioned Projection**: FiLM-style memory-centric transformation
 -   **🚦 Dual-Factor Gating**: Relevance-driven decision, entropy-modulated strength
 -   **💾 Tiered KV Cache**: L1(GPU) → L2(CPU) → L3(SSD) → L4(Recompute)
 -   **📊 Monitoring API**: Statistics, injection logs, health checks
 -   **🔌 Multi-Engine Support**: vLLM, LLaMA, DeepSeek, GLM
--   **✅ Graceful Degradation**: α → 0 smoothly recovers vanilla LLM behavior
+-   **✅ Graceful Degradation**: recall_v4 → stable → plain LLM, three-tier fallback
 
 ## 🏗️ Architecture
 
@@ -95,22 +96,25 @@ DKI operates as an **attention-level plugin** for LLMs, implementing K/V injecti
 
 ### Injection Strategy Selection
 
-DKI provides two injection strategies, configurable via settings:
+DKI v3.2 uses **recall_v4** as the primary strategy with **stable** as the fallback:
 
-| Strategy             | Use Case   | Context Usage | Stability  | Research Value |
-| -------------------- | ---------- | ------------- | ---------- | -------------- |
-| **stable** (default) | Production | Medium        | ⭐⭐⭐⭐⭐ | ⭐⭐           |
-| **full_attention**   | Research   | Minimal       | ⭐⭐⭐     | ⭐⭐⭐⭐⭐     |
+| Strategy                | Status        | Use Case               | Context Usage | Stability  |
+| ----------------------- | ------------- | ---------------------- | ------------- | ---------- |
+| **recall_v4** (default) | ✅ Primary    | Long history scenarios | Dynamic       | ⭐⭐⭐⭐⭐ |
+| **stable** (fallback)   | ✅ Fallback   | recall_v4 failure      | Medium        | ⭐⭐⭐⭐⭐ |
+| **full_attention**      | ⚠️ Deprecated | Research only          | Minimal       | ⭐⭐⭐     |
+
+**Fallback Mechanism**: When recall_v4 fails (e.g., components not initialized, recall errors), the system automatically falls back to the stable strategy using hybrid injection (preference K/V + history suffix prompt). If stable also fails, it degrades to plain LLM inference without injection.
 
 ```yaml
 # config.yaml
 dki:
-    injection_strategy: "stable" # stable | full_attention
+    injection_strategy: "recall_v4" # recall_v4 (recommended) | stable (fallback)
 ```
 
-### Hybrid Injection Strategy (Stable)
+### Hybrid Injection Strategy (Stable) — Fallback
 
-**Default strategy**, uses a **layered injection approach** that mirrors human cognition:
+**Fallback strategy**, automatically activated when recall_v4 fails. Uses a **layered injection approach** that mirrors human cognition:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -196,11 +200,11 @@ The `FullAttentionInjector` class (`dki/core/injection/full_attention_injector.p
 
 **Position Encoding Modes**: Three modes are supported, configurable via `position_mode`:
 
-| Mode               | Description                                        | Use Case                        |
-| ------------------ | -------------------------------------------------- | ------------------------------- |
-| `fixed_negative`   | Memory tokens mapped to negative positions (RoPE)  | Default, clean separation       |
-| `constant`         | All memory tokens share the same position           | Tests position-independence     |
-| `nope`             | No position encoding applied to memory K/V          | Tests NoPE hypothesis           |
+| Mode             | Description                                       | Use Case                    |
+| ---------------- | ------------------------------------------------- | --------------------------- |
+| `fixed_negative` | Memory tokens mapped to negative positions (RoPE) | Default, clean separation   |
+| `constant`       | All memory tokens share the same position         | Tests position-independence |
+| `nope`           | No position encoding applied to memory K/V        | Tests NoPE hypothesis       |
 
 **Value-Only Scaling (Engram-Inspired)**: The injector applies α scaling exclusively to Value tensors, keeping Keys unscaled. This preserves attention addressing precision while modulating memory influence strength—a principle adopted from Engram [arXiv:2601.07372]:
 
@@ -218,9 +222,10 @@ Merged layout per layer: [History K/V (far negative)] [Preference K/V (near nega
 ```
 
 **Safety Mechanisms**:
-- **Token limit**: If total K/V tokens exceed `max_total_kv_tokens` (default: 600), the injector either falls back to the Stable strategy or truncates history (most recent messages preserved)
-- **Attention pattern logging**: When enabled, logs position distributions, token counts, and compute times for research analysis
-- **Graceful fallback**: On any error, returns a non-injected result so the vanilla LLM can proceed normally
+
+-   **Token limit**: If total K/V tokens exceed `max_total_kv_tokens` (default: 600), the injector either falls back to the Stable strategy or truncates history (most recent messages preserved)
+-   **Attention pattern logging**: When enabled, logs position distributions, token counts, and compute times for research analysis
+-   **Graceful fallback**: On any error, returns a non-injected result so the vanilla LLM can proceed normally
 
 **Configuration Example**:
 
@@ -276,16 +281,16 @@ logs = dki.get_full_attention_logs(limit=50)
 │                                                                         │
 │  Phase 1: Multi-Signal Recall                                           │
 │  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  User Input → [Keywords+Weights] + [Anaphora] + [Vector Sim]   │    │
+│  │  User Input → [Keywords+Weights] + [Anaphora] + [Vector Sim]    │    │
 │  │            →  Weighted Merge + Normalization → Message List     │    │
 │  └─────────────────────────────────────────────────────────────────┘    │
 │                          ↓                                              │
 │  Phase 2: Dynamic History Construction                                  │
 │  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  Iterate messages:                                               │    │
+│  │  Iterate messages:                                              │    │
 │  │    Over threshold → [SUMMARY] + trace_id (traceable)            │    │
-│  │    Under threshold → Original message                            │    │
-│  │  + Recent N turns of complete conversation                       │    │
+│  │    Under threshold → Original message                           │    │
+│  │  + Recent N turns of complete conversation                      │    │
 │  └─────────────────────────────────────────────────────────────────┘    │
 │                          ↓                                              │
 │  Phase 3: Model-Adaptive Assembly + Inference                           │
@@ -297,11 +302,11 @@ logs = dki.get_full_attention_logs(limit=50)
 │                                                                         │
 │  Advantages:                                                            │
 │  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  ✅ Stable and reliable for long history                         │    │
-│  │  ✅ Facts are traceable (trace_id → original message)            │    │
-│  │  ✅ Dynamic context budget management                            │    │
-│  │  ✅ Multi-model support (DeepSeek, GLM, Generic)                 │    │
-│  │  ✅ Preferences still via K/V injection (reuses existing infra)  │    │
+│  │  ✅ Stable and reliable for long history                        │    │
+│  │  ✅ Facts are traceable (trace_id → original message)           │    │
+│  │  ✅ Dynamic context budget management                           │    │
+│  │  ✅ Multi-model support (DeepSeek, GLM, Generic)                │    │
+│  │  ✅ Preferences still via K/V injection (reuses existing infra) │    │
 │  └─────────────────────────────────────────────────────────────────┘    │
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
@@ -331,7 +336,7 @@ dki:
 
         summary:
             per_message_threshold: 200
-            strategy: "extractive"    # extractive (jieba TextRank) | llm
+            strategy: "extractive" # extractive (jieba TextRank) | llm
 
         fact_call:
             enabled: true
@@ -339,14 +344,14 @@ dki:
             max_fact_tokens: 800
 ```
 
-**Runtime Strategy Switching**:
+**Fallback Mechanism**:
 
-```python
-# Switch to recall_v4 strategy
-dki.switch_injection_strategy("recall_v4")
-
-# Switch back to stable strategy
-dki.switch_injection_strategy("stable")
+```
+recall_v4 execution fails
+    ↓ automatic fallback
+stable (hybrid injection: preference K/V + history suffix)
+    ↓ if also fails
+plain LLM inference (no injection)
 ```
 
 ### Data Flow
@@ -806,25 +811,27 @@ DKI/
 
 ## 📊 Project Status
 
-| Module                  | Status     | Description                                |
-| ----------------------- | ---------- | ------------------------------------------ |
-| DKI Core Plugin         | ✅ Done    | K/V injection, hybrid strategy, gating     |
-| Full Attention Strategy | ⚠️ Deprecated | Deprecated: limited by long history scenarios |
-| Recall v4 Memory Recall | ✅ Done    | Multi-signal retrieval + dynamic summary + fact call |
-| Config-Driven Adapter   | ✅ Done    | SQLAlchemy dynamic table mapping           |
-| JSON Content Extraction | ✅ Done    | Auto-parse JSON content fields             |
-| Memory Trigger          | ✅ Done    | Memory trigger detection, configurable     |
-| Reference Resolver      | ✅ Done    | Reference parsing, configurable recall     |
-| Redis Distributed Cache | ✅ Done    | L1+L2 cache, multi-instance support        |
-| FlashAttention          | ✅ Done    | FA3/FA2 auto-detection, graceful fallback  |
-| Injection Visualization | ✅ Done    | Flow diagram, token distribution, history  |
-| Vue3 Example UI         | ✅ Done    | Chat, preferences, stats, visualization    |
-| Monitoring API          | ✅ Done    | Statistics, logs, health check             |
-| Architecture Diagrams   | ✅ Done    | System architecture & injection flow docs  |
-| Unit Tests              | ✅ Done    | Core component test coverage               |
-| Attention Heatmap       | 🔄 Planned | Debug attention weight visualization       |
-| LangChain/LlamaIndex    | 🔄 Planned | Ecosystem integration                      |
-| Multimodal Memory       | 📋 TBD     | Image/audio memory support                 |
+| Module                  | Status        | Description                                                            |
+| ----------------------- | ------------- | ---------------------------------------------------------------------- |
+| DKI Core Plugin         | ✅ Done       | K/V injection, hybrid strategy, gating                                 |
+| Recall v4 Memory Recall | ✅ Done       | Multi-signal retrieval + dynamic summary + fact call (primary)         |
+| Stable Hybrid Injection | ✅ Done       | Preference K/V + history suffix (recall_v4 fallback)                   |
+| Full Attention Strategy | ⚠️ Deprecated | Deprecated: limited by long history scenarios                          |
+| User-Level Isolation    | ✅ Done       | HMAC-signed cache keys + UserIsolationContext + post-inference cleanup |
+| Config-Driven Adapter   | ✅ Done       | SQLAlchemy dynamic table mapping                                       |
+| JSON Content Extraction | ✅ Done       | Auto-parse JSON content fields                                         |
+| Memory Trigger          | ✅ Done       | Memory trigger detection, configurable                                 |
+| Reference Resolver      | ✅ Done       | Reference parsing, configurable recall                                 |
+| Redis Distributed Cache | ✅ Done       | L1+L2 cache, multi-instance support                                    |
+| FlashAttention          | ✅ Done       | FA3/FA2 auto-detection, graceful fallback                              |
+| Injection Visualization | ✅ Done       | Flow diagram, token distribution, history                              |
+| Vue3 Example UI         | ✅ Done       | Chat, preferences, stats, visualization                                |
+| Monitoring API          | ✅ Done       | Statistics, logs, health check                                         |
+| Architecture Diagrams   | ✅ Done       | System architecture & injection flow docs                              |
+| Unit Tests              | ✅ Done       | Core component test coverage                                           |
+| Attention Heatmap       | 🔄 Planned    | Debug attention weight visualization                                   |
+| LangChain/LlamaIndex    | 🔄 Planned    | Ecosystem integration                                                  |
+| Multimodal Memory       | 📋 TBD        | Image/audio memory support                                             |
 
 ## ⚙️ Configuration
 
@@ -844,9 +851,25 @@ model:
 # DKI Plugin Settings
 dki:
     enabled: true
-    version: "2.5"
+    version: "3.2"
+    injection_strategy: "recall_v4" # recall_v4 (recommended) | stable (fallback)
 
-    # Hybrid Injection Strategy
+    # Recall v4 Memory Recall config (primary strategy)
+    recall:
+        enabled: true
+        strategy: "summary_with_fact_call"
+        signals:
+            keyword_enabled: true
+            vector_enabled: true
+        budget:
+            generation_reserve: 512
+            min_recent_turns: 2
+            max_recent_turns: 5
+        fact_call:
+            enabled: true
+            max_rounds: 3
+
+    # Hybrid Injection Strategy (used when stable fallback activates)
     hybrid_injection:
         enabled: true
         language: "cn" # en | cn
@@ -1134,8 +1157,9 @@ DKI's supported token range depends on session complexity and relevance:
 1. **Storage Model-Agnostic**: Store only original text + routing vectors
 2. **Injection Model-Consistent**: K/V computed with target model parameters
 3. **Session Cache Disposable**: Inference-time enhancement, not persistent
-4. **Graceful Degradation**: α → 0 falls back to vanilla LLM
-5. **Audit Logging**: All injection decisions logged for compliance
+4. **Three-Tier Graceful Degradation**: recall_v4 → stable → plain LLM
+5. **User-Level Isolation**: HMAC-signed cache keys + post-inference K/V cleanup, preventing cross-user data leakage
+6. **Audit Logging**: All injection decisions logged for compliance
 
 ### Memory Hierarchy (Tiered KV Cache)
 
@@ -1416,7 +1440,7 @@ A:
 4. Monitor injection rate and latency
 5. Adjust alpha and cache strategy based on metrics
 
-### Latest Optimizations (v2.5)
+### Latest Optimizations (v3.2)
 
 #### Memory Trigger
 
@@ -1469,15 +1493,24 @@ Unlike ChatGPT/Claude/Grok, DKI **does not need** Rolling Summary:
 
 -   [x] Core DKI implementation (Attention Hook K/V injection)
 -   [x] vLLM/LLaMA/DeepSeek/GLM adapters
--   [x] Hybrid injection strategy (preference K/V + history suffix)
+-   [x] Hybrid injection strategy (preference K/V + history suffix) — as stable fallback
+-   [x] ~~Full Attention strategy~~ (deprecated, limited by long history scenarios)
+-   [x] Recall v4 memory recall (multi-signal retrieval + dynamic summary + fact supplementation) — primary strategy
+-   [x] Recall v4 → Stable automatic fallback mechanism
+-   [x] User-level isolation (HMAC-signed cache keys + UserIsolationContext + post-inference K/V cleanup)
 -   [x] Config-driven adapter (SQLAlchemy dynamic table mapping)
+-   [x] JSON content extraction (nested key support)
 -   [x] Dynamic vector processing (BM25 + Embedding hybrid search)
--   [x] Preference K/V cache (memory level)
--   [x] Monitoring API (stats/logs/health)
--   [x] Vue3 Example Frontend UI
--   [x] Experiment framework
--   [x] Memory Trigger
+-   [x] Preference K/V cache (memory level L1)
+-   [x] Redis distributed cache (L2, optional)
+-   [x] FlashAttention-3/2 integration (auto backend detection)
+-   [x] Memory Trigger (configurable rules)
 -   [x] Reference Resolver (configurable recall turns)
+-   [x] Injection visualization (flow diagram, token distribution, history)
+-   [x] Monitoring API (stats/logs/health)
+-   [x] Vue3 Example Frontend UI (chat/preferences/stats/visualization)
+-   [x] Experiment framework (DKI vs RAG, short and long sessions)
+-   [x] Full unit tests + integration tests + behavior tests
 
 **In Progress**:
 
@@ -1486,8 +1519,7 @@ Unlike ChatGPT/Claude/Grok, DKI **does not need** Rolling Summary:
 
 **Future Work**:
 
--   [ ] Redis distributed cache integration
--   [ ] Attention visualization tools
+-   [ ] Attention visualization tools (attention weight heatmaps)
 -   [ ] Multi-modal extension (image/audio memory)
 -   [ ] LangChain/LlamaIndex integration
 
