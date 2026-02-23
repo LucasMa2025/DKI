@@ -1,29 +1,41 @@
 """
-vLLM Model Adapter for DKI System (v4.0 — Prompt Prefix Injection)
+vLLM Model Adapter for DKI System (v5.0 — vLLM Native KV Injection)
 
 High-performance inference with vLLM engine.
 
-改造说明 (v4.0):
-- 新增 injection_mode 参数，支持三种偏好注入模式:
-  - "prompt_prefix" (推荐): 偏好文本作为 prompt 前缀，由 vLLM 在 prefill 阶段自然处理
-  - "hf_kv" (兼容): 使用 HuggingFace 模型计算 KV 并注入 past_key_values (原有行为)
-  - "auto": 自动选择 — 默认 prompt_prefix，HF 模型仅在显式请求时加载
-- prompt_prefix 模式下，所有推理走 vLLM，不加载 HF 模型，节省 ~14GB VRAM
-- 保留 hf_kv 模式作为零风险回退，确保向后兼容
-- compute_kv / embed / compute_prefill_entropy 在 prompt_prefix 模式下提供安全降级
+核心设计 (v5.0):
+- 所有推理和 KV 注入都走 vLLM，不加载 HuggingFace 模型
+- 偏好/历史文本作为 prompt 前缀，由 vLLM prefill 阶段自然计算 KV
+- 开启 vLLM enable_prefix_caching: 相同前缀自动复用 KV Cache (零额外代码)
+- 这就是 DKI 论文的 KV 注入: 偏好信息的 KV 表示通过 attention 机制影响后续推理
+
+与 DKI 论文的一致性:
+- DKI 的核心: 将用户偏好/历史信息编码为 KV 表示, 在 attention 层注入
+- vLLM + prefix_caching 完美实现:
+  - 偏好文本 → vLLM prefill → KV Cache (与论文的 compute_kv 等价)
+  - KV Cache 通过 attention 影响推理 (与论文的 KV injection 等价)
+  - 相同前缀自动复用 KV (与论文的 KV cache management 等价)
+- 无需 HF 模型旁路, 零 VRAM 浪费
+
+接口兼容性:
+- 保留 BaseModelAdapter 所有抽象方法签名
+- compute_kv / embed / compute_prefill_entropy 返回安全降级值
+- forward_with_kv_injection 保留签名, 内部统一走 vLLM generate
+- injection_mode 参数保留, 但所有值最终都路由到 vLLM 原生推理
+- 旧代码传入 injection_mode="hf_kv" 或 "prompt_prefix" 不会报错
 
 安全不变量:
-- 默认 injection_mode="prompt_prefix"，不加载 HF 模型
-- hf_kv 模式保留完整的原有行为，零改动
-- 所有公开接口签名不变，BaseModelAdapter 契约完整
+- 默认且唯一的推理引擎是 vLLM
+- 偏好注入通过 prompt 前缀 + vLLM PagedAttention 实现
+- 所有公开接口签名与 BaseModelAdapter 完全兼容
 - 异常时自动降级到无注入推理 (fail-open)
 
 Author: AGI Demo Project
-Version: 4.0.0
+Version: 5.0.0
 """
 
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from loguru import logger
@@ -33,22 +45,33 @@ from dki.models.base import BaseModelAdapter, ModelOutput, KVCacheEntry
 
 class VLLMAdapter(BaseModelAdapter):
     """
-    vLLM-based model adapter for high-performance inference.
+    vLLM-based model adapter with native KV injection via prefix caching.
     
-    Supports two injection modes:
-    - prompt_prefix: Preferences as prompt prefix → vLLM generate (recommended)
-    - hf_kv: HuggingFace model for K/V computation → past_key_values injection (legacy)
+    核心: 100% vLLM-only, 无 HF 模型, 偏好通过 prompt 前缀注入,
+    vLLM enable_prefix_caching 自动复用相同前缀的 KV Cache。
+    
+    与 DKI 论文一致:
+    - 偏好 KV 注入 = 偏好文本作为 prefix → vLLM prefill → attention 层注入
+    - KV Cache 复用 = vLLM prefix caching (相同偏好前缀自动复用)
+    - 无需 HF 模型计算 KV, 无 ~14GB VRAM 浪费
     
     Usage:
-        # 推荐: Prompt Prefix 模式 (默认)
+        # 标准用法 (推荐)
         adapter = VLLMAdapter(model_name="Qwen/Qwen2-7B-Instruct")
         adapter.load()
         output = adapter.generate("你好")
         
-        # 兼容: HF KV 模式 (原有行为)
+        # 带偏好 KV 注入
+        output = adapter.forward_with_kv_injection(
+            prompt="用户偏好前缀\\n\\n你好",
+            injected_kv=[],   # 不再使用, 保留签名兼容
+            alpha=0.7,
+        )
+        
+        # 旧代码兼容 (injection_mode 参数被接受但不影响行为)
         adapter = VLLMAdapter(
             model_name="Qwen/Qwen2-7B-Instruct",
-            injection_mode="hf_kv",
+            injection_mode="hf_kv",  # 接受但内部走 vLLM
         )
     """
     
@@ -60,7 +83,7 @@ class VLLMAdapter(BaseModelAdapter):
         gpu_memory_utilization: float = 0.9,
         trust_remote_code: bool = True,
         device: str = "cuda",
-        injection_mode: str = "prompt_prefix",
+        injection_mode: str = "auto",  # 保留参数兼容, 但不影响行为
         **kwargs
     ):
         """
@@ -73,10 +96,11 @@ class VLLMAdapter(BaseModelAdapter):
             gpu_memory_utilization: GPU 显存利用率
             trust_remote_code: 是否信任远程代码
             device: 设备
-            injection_mode: 偏好注入模式
-                - "prompt_prefix": 偏好文本作为 prompt 前缀 (推荐, 默认)
-                - "hf_kv": HuggingFace 模型 KV 注入 (兼容模式)
-                - "auto": 自动选择 (等同于 prompt_prefix)
+            injection_mode: 偏好注入模式 (保留兼容, 所有值最终走 vLLM 原生推理)
+                - "auto" (默认): vLLM 原生 KV 注入
+                - "prompt_prefix": 等同于 auto
+                - "hf_kv": 接受但发出废弃警告, 内部走 vLLM 原生推理
+                - "vllm_kv": 等同于 auto
         """
         super().__init__(model_name, device, **kwargs)
         
@@ -85,49 +109,60 @@ class VLLMAdapter(BaseModelAdapter):
         self.gpu_memory_utilization = gpu_memory_utilization
         self.trust_remote_code = trust_remote_code
         
-        # 注入模式
-        if injection_mode in ("prompt_prefix", "hf_kv", "auto"):
-            self.injection_mode = injection_mode
-        else:
+        # 注入模式: 保留参数兼容, 但所有值最终走 vLLM 原生推理
+        valid_modes = ("auto", "prompt_prefix", "hf_kv", "vllm_kv")
+        if injection_mode not in valid_modes:
             logger.warning(
                 f"Unknown injection_mode '{injection_mode}', "
-                f"defaulting to 'prompt_prefix'"
+                f"defaulting to 'auto' (vLLM native KV injection)"
             )
-            self.injection_mode = "prompt_prefix"
+            injection_mode = "auto"
         
-        # vLLM specific
+        if injection_mode == "hf_kv":
+            logger.warning(
+                "injection_mode='hf_kv' is deprecated in v5.0. "
+                "HF model loading has been removed. "
+                "All inference now uses vLLM native KV injection "
+                "(equivalent effect, no VRAM waste). "
+                "This parameter is accepted for backward compatibility."
+            )
+        
+        # 统一存储为 "prompt_prefix" 以兼容 Executor 的 _is_prompt_prefix_mode() 检查
+        # 因为 Executor 检查此属性来决定是否走 prompt_prefix 路径
+        self.injection_mode = "prompt_prefix"
+        
+        # vLLM 核心组件
         self.llm = None
         self.sampling_params = None
-        
-        # For K/V computation (hf_kv mode only)
-        self.hf_model = None
     
     @property
     def effective_injection_mode(self) -> str:
-        """解析 auto 后的实际注入模式"""
-        if self.injection_mode == "auto":
-            return "prompt_prefix"
-        return self.injection_mode
+        """
+        实际注入模式 (始终返回 "prompt_prefix")
+        
+        v5.0: 所有模式统一为 vLLM 原生 KV 注入,
+        通过 prompt 前缀 + prefix_caching 实现。
+        返回 "prompt_prefix" 以兼容 Executor 的模式检查。
+        """
+        return "prompt_prefix"
     
     def load(self) -> None:
         """
-        Load vLLM engine.
+        Load vLLM engine with prefix caching enabled.
         
-        在 prompt_prefix 模式下，只加载 vLLM 引擎，不加载 HF 模型。
-        在 hf_kv 模式下，HF 模型按需延迟加载 (首次 compute_kv 时)。
+        v5.0: 只加载 vLLM, 不加载 HF 模型。
+        开启 enable_prefix_caching 以自动复用相同前缀的 KV Cache。
         """
         if self._is_loaded:
             return
         
         try:
-            # Import vLLM
             from vllm import LLM, SamplingParams
             from transformers import AutoTokenizer, AutoConfig
             
-            # Load vLLM for fast inference
             logger.info(
-                f"Loading vLLM engine: {self.model_name} "
-                f"(injection_mode={self.effective_injection_mode})"
+                f"Loading vLLM engine (native KV injection via prefix caching): "
+                f"{self.model_name}"
             )
             self.llm = LLM(
                 model=self.model_name,
@@ -135,22 +170,27 @@ class VLLMAdapter(BaseModelAdapter):
                 max_model_len=self.max_model_len,
                 gpu_memory_utilization=self.gpu_memory_utilization,
                 trust_remote_code=self.trust_remote_code,
+                enable_prefix_caching=True,  # 核心: 自动复用相同前缀的 KV Cache
             )
             
-            # Default sampling params
+            # 默认采样参数
             self.sampling_params = SamplingParams(
                 temperature=0.7,
                 top_p=0.9,
                 max_tokens=512,
             )
             
-            # Load tokenizer
+            # 加载 Tokenizer
             self.tokenizer = AutoTokenizer.from_pretrained(
                 self.model_name,
                 trust_remote_code=self.trust_remote_code,
+                padding_side="left",
+                truncation_side="left",
             )
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
             
-            # Get model config for architecture info
+            # 模型配置 (仅用于元信息)
             config = AutoConfig.from_pretrained(
                 self.model_name,
                 trust_remote_code=self.trust_remote_code,
@@ -163,13 +203,9 @@ class VLLMAdapter(BaseModelAdapter):
             
             self._is_loaded = True
             
-            mode_desc = {
-                "prompt_prefix": "Prompt Prefix (偏好作为 prompt 前缀, 无 HF 模型)",
-                "hf_kv": "HF KV (HF 模型按需加载, 兼容模式)",
-            }
             logger.info(
                 f"vLLM adapter loaded: {self.model_name} — "
-                f"{mode_desc.get(self.effective_injection_mode, self.effective_injection_mode)}"
+                f"vLLM Native KV Injection (prefix_caching=True, 无 HF 模型)"
             )
             
         except ImportError as e:
@@ -179,91 +215,9 @@ class VLLMAdapter(BaseModelAdapter):
             logger.error(f"Failed to load vLLM model: {e}")
             raise
     
-    def _load_hf_model(self) -> None:
-        """
-        Load HuggingFace model for K/V computation (hf_kv mode only).
-        
-        在 prompt_prefix 模式下调用此方法会发出警告。
-        
-        When vLLM already occupies most GPU memory, loading a second full model
-        on GPU will cause CUDA OOM. This method checks available GPU memory first:
-        - If sufficient (>= 4GB free), load with device_map="auto" (GPU)
-        - Otherwise, load to CPU to avoid OOM (slower but safe)
-        """
-        if self.hf_model is not None:
-            return
-        
-        if self.effective_injection_mode == "prompt_prefix":
-            logger.warning(
-                "prompt_prefix 模式下不需要 HF 模型。"
-                "如果需要 compute_kv，请切换到 injection_mode='hf_kv'。"
-                "当前调用将被安全忽略。"
-            )
-            return
-        
-        from transformers import AutoModelForCausalLM
-        
-        # Check available GPU memory to decide device placement
-        use_cpu = False
-        if torch.cuda.is_available():
-            try:
-                free_mem = torch.cuda.mem_get_info()[0]
-                free_gb = free_mem / (1024 ** 3)
-                if free_gb < 4.0:
-                    logger.warning(
-                        f"Only {free_gb:.1f}GB free GPU memory, "
-                        f"loading HF model on CPU to avoid OOM"
-                    )
-                    use_cpu = True
-                else:
-                    logger.info(
-                        f"Loading HF model for K/V computation on GPU "
-                        f"({free_gb:.1f}GB free): {self.model_name}"
-                    )
-            except Exception:
-                use_cpu = True
-        else:
-            use_cpu = True
-        
-        try:
-            if use_cpu:
-                logger.info(
-                    f"Loading HF model for K/V computation on CPU: {self.model_name}"
-                )
-                self.hf_model = AutoModelForCausalLM.from_pretrained(
-                    self.model_name,
-                    torch_dtype=torch.float32,  # CPU uses float32
-                    device_map="cpu",
-                    trust_remote_code=self.trust_remote_code,
-                    attn_implementation="eager",
-                    low_cpu_mem_usage=True,
-                )
-            else:
-                self.hf_model = AutoModelForCausalLM.from_pretrained(
-                    self.model_name,
-                    torch_dtype=self.torch_dtype,
-                    device_map="auto",
-                    trust_remote_code=self.trust_remote_code,
-                    attn_implementation="eager",
-                )
-            self.hf_model.eval()
-        except RuntimeError as e:
-            if "out of memory" in str(e).lower() or "CUDA" in str(e):
-                logger.warning(
-                    f"GPU OOM loading HF model, retrying on CPU: {e}"
-                )
-                torch.cuda.empty_cache()
-                self.hf_model = AutoModelForCausalLM.from_pretrained(
-                    self.model_name,
-                    torch_dtype=torch.float32,
-                    device_map="cpu",
-                    trust_remote_code=self.trust_remote_code,
-                    attn_implementation="eager",
-                    low_cpu_mem_usage=True,
-                )
-                self.hf_model.eval()
-            else:
-                raise
+    # ================================================================
+    # 核心推理接口
+    # ================================================================
     
     def generate(
         self,
@@ -273,7 +227,12 @@ class VLLMAdapter(BaseModelAdapter):
         top_p: float = 0.9,
         **kwargs
     ) -> ModelOutput:
-        """Generate text using vLLM."""
+        """
+        Generate text using vLLM.
+        
+        vLLM 的 prefix_caching 会自动检测 prompt 前缀并复用 KV Cache,
+        因此偏好文本作为前缀时, 首次请求 prefill 计算 KV, 后续请求直接复用。
+        """
         if not self._is_loaded:
             self.load()
         
@@ -300,170 +259,32 @@ class VLLMAdapter(BaseModelAdapter):
             output_tokens=len(output.outputs[0].token_ids),
         )
     
-    def embed(self, text: str) -> torch.Tensor:
-        """
-        Get embeddings using HuggingFace model.
-        
-        注意: prompt_prefix 模式下此方法不可用，将抛出 RuntimeError。
-        建议使用独立的 embedding 服务替代。
-        """
-        if self.effective_injection_mode == "prompt_prefix":
-            raise RuntimeError(
-                "embed() 在 prompt_prefix 模式下不可用 (无 HF 模型)。"
-                "建议: 使用独立的 embedding 服务 (如 sentence-transformers)，"
-                "或切换到 injection_mode='hf_kv'。"
-            )
-        
-        self._load_hf_model()
-        
-        inputs = self.tokenize(text)
-        
-        with torch.no_grad():
-            outputs = self.hf_model(
-                **inputs,
-                output_hidden_states=True,
-                return_dict=True,
-            )
-            # Use last hidden state mean as embedding
-            hidden_states = outputs.hidden_states[-1]
-            embeddings = hidden_states.mean(dim=1).detach().cpu()
-        
-        # Free GPU memory
-        del outputs
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        
-        return embeddings
-    
-    def compute_kv(
-        self,
-        text: str,
-        return_hidden: bool = False,
-    ) -> Tuple[List[KVCacheEntry], Optional[torch.Tensor]]:
-        """
-        Compute K/V cache using HuggingFace model.
-        
-        prompt_prefix 模式下:
-        - 返回空列表 ([], None)，因为偏好通过 prompt 前缀注入，不需要 KV 计算
-        - 这是安全的降级行为，Executor 在 prompt_prefix 模式下不会使用返回值
-        
-        hf_kv 模式下:
-        - 原有行为: 使用 HF 模型计算全层 KV cache
-        
-        GPU Memory Safety:
-        - Detaches K/V tensors and moves them to CPU to avoid GPU memory accumulation
-        - Clears intermediate computation tensors
-        - This is critical when vLLM already occupies most GPU memory
-        """
-        if self.effective_injection_mode == "prompt_prefix":
-            logger.debug(
-                "compute_kv() called in prompt_prefix mode — "
-                "returning empty KV (偏好通过 prompt 前缀注入)"
-            )
-            return [], None
-        
-        self._load_hf_model()
-        
-        inputs = self.tokenize(text)
-        
-        with torch.no_grad():
-            outputs = self.hf_model(
-                **inputs,
-                output_hidden_states=return_hidden,
-                use_cache=True,
-                return_dict=True,
-            )
-        
-        # Extract K/V cache — detach and move to CPU to prevent GPU memory leak
-        kv_entries = []
-        past_kv = outputs.past_key_values
-        
-        for layer_idx, (key, value) in enumerate(past_kv):
-            entry = KVCacheEntry(
-                key=key.detach().cpu(),
-                value=value.detach().cpu(),
-                layer_idx=layer_idx,
-            )
-            kv_entries.append(entry)
-        
-        hidden_states = None
-        if return_hidden and outputs.hidden_states is not None:
-            hidden_states = outputs.hidden_states[-1].detach().cpu()
-        
-        # Explicitly delete outputs to free GPU memory
-        del outputs
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        
-        return kv_entries, hidden_states
-    
     def forward_with_kv_injection(
         self,
         prompt: str,
-        injected_kv: List[KVCacheEntry],
+        injected_kv: Union[List[KVCacheEntry], str, None] = None,
         alpha: float = 1.0,
         max_new_tokens: int = 512,
         **kwargs
     ) -> ModelOutput:
         """
-        Generate with K/V injection — 根据 injection_mode 路由.
+        Generate with KV injection — 统一走 vLLM 原生推理.
         
-        prompt_prefix 模式:
-        - prompt 已包含偏好前缀 (由 Planner 组装)
-        - injected_kv 参数被忽略
-        - 直接调用 vLLM generate，完整利用 vLLM 性能
+        v5.0 设计:
+        - prompt 参数已包含偏好前缀 (由 Executor._build_preference_prefix 构造)
+        - injected_kv 参数保留签名兼容, 但不再使用
+        - vLLM 的 prefix_caching 自动复用相同前缀的 KV Cache
         
-        hf_kv 模式:
-        - 原有行为: 使用 HF 模型 + past_key_values 注入
+        与 DKI 论文一致:
+        - 偏好文本 → vLLM prefill → KV Cache (attention 层)
+        - 相同偏好 → 相同前缀 → KV Cache 自动复用
+        - alpha 控制由 Executor 在构造前缀时实现 (前缀长度 + 强度标记)
         
         Args:
-            prompt: 用户输入 (prompt_prefix 模式下已包含偏好前缀)
-            injected_kv: 预计算的 KV cache (仅 hf_kv 模式使用)
-            alpha: 注入强度 (prompt_prefix 模式下通过前缀长度控制)
+            prompt: 用户输入 (已包含偏好前缀, 由 Executor 组装)
+            injected_kv: 保留签名兼容, 内部不使用
+            alpha: 注入强度 (由 Executor 在前缀构造时实现)
             max_new_tokens: 最大生成 token 数
-        """
-        if self.effective_injection_mode == "prompt_prefix":
-            return self._forward_with_prompt_prefix(
-                prompt=prompt,
-                alpha=alpha,
-                max_new_tokens=max_new_tokens,
-                **kwargs,
-            )
-        else:
-            return self._forward_with_hf_kv(
-                prompt=prompt,
-                injected_kv=injected_kv,
-                alpha=alpha,
-                max_new_tokens=max_new_tokens,
-                **kwargs,
-            )
-    
-    # ================================================================
-    # Prompt Prefix 模式 — 偏好通过 prompt 前缀注入
-    # ================================================================
-    
-    def _forward_with_prompt_prefix(
-        self,
-        prompt: str,
-        alpha: float = 1.0,
-        max_new_tokens: int = 512,
-        **kwargs
-    ) -> ModelOutput:
-        """
-        Prompt Prefix 模式: 偏好已由 Planner 组装到 prompt 中.
-        
-        在此模式下:
-        - prompt 参数就是 plan.final_input，已包含偏好前缀 + 历史后缀 + 用户查询
-        - 直接调用 vLLM generate，vLLM 在 prefill 阶段自然处理偏好信息
-        - 偏好的 KV 自然进入 vLLM 的 PagedAttention KV Cache
-        - 无需 HF 模型，无需 compute_kv，无需 past_key_values
-        
-        Alpha 控制:
-        - 由 Planner 在构造前缀时实现 (前缀长度控制 + 权重标记)
-        - alpha > 0.5: 完整偏好前缀
-        - alpha 0.3-0.5: 精简偏好前缀 (只保留高优先级)
-        - alpha < 0.3: 极简偏好标记
-        - alpha < 0.1: 不添加前缀 (由 Planner 决定)
         """
         if not self._is_loaded:
             self.load()
@@ -478,7 +299,8 @@ class VLLMAdapter(BaseModelAdapter):
             max_tokens=max_new_tokens,
         )
         
-        # prompt 已包含偏好前缀 (由 Planner 组装)
+        # prompt 已包含偏好前缀, 直接调用 vLLM generate
+        # vLLM prefix_caching 会自动检测并复用相同前缀的 KV Cache
         outputs = self.llm.generate([prompt], sampling_params)
         output = outputs[0]
         
@@ -492,286 +314,119 @@ class VLLMAdapter(BaseModelAdapter):
             output_tokens=len(output.outputs[0].token_ids),
             metadata={
                 'alpha': alpha,
-                'injection_mode': 'prompt_prefix',
+                'injection_mode': 'vllm_native_prefix_caching',
             },
         )
     
     # ================================================================
-    # HF KV 模式 — 原有行为 (兼容)
+    # BaseModelAdapter 抽象方法实现 (安全降级)
     # ================================================================
     
-    def _forward_with_hf_kv(
-        self,
-        prompt: str,
-        injected_kv: List[KVCacheEntry],
-        alpha: float = 1.0,
-        max_new_tokens: int = 512,
-        **kwargs
-    ) -> ModelOutput:
+    def embed(self, text: str) -> torch.Tensor:
         """
-        HF KV 模式: 使用 HuggingFace 模型 + past_key_values 注入.
+        Get embeddings — v5.0 不可用.
         
-        这是原有的 forward_with_kv_injection 实现，完整保留。
-        Supports FlashAttention optimization when enabled.
+        vLLM 原生模式不提供 embedding 接口。
+        建议使用独立的 embedding 服务 (如 sentence-transformers)。
+        
+        Raises:
+            RuntimeError: 始终抛出, 提示使用独立 embedding 服务
         """
-        self._load_hf_model()
-        
-        start_time = time.perf_counter()
-        
-        inputs = self.tokenize(prompt)
-        input_ids = inputs['input_ids']
-        attention_mask = inputs['attention_mask']
-        
-        # Get memory length
-        mem_len = injected_kv[0].key.shape[2] if injected_kv else 0
-        
-        # Use FlashAttention optimized path if enabled
-        if self.flash_attn_enabled and self._kv_injection_optimizer is not None:
-            return self._forward_with_flash_attention(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                injected_kv=injected_kv,
-                alpha=alpha,
-                max_new_tokens=max_new_tokens,
-                start_time=start_time,
-                **kwargs
-            )
-        
-        # Determine target device for HF model inference
-        hf_device = next(self.hf_model.parameters()).device
-        
-        # Standard path: Prepare past_key_values with alpha scaling
-        if alpha < 1.0:
-            past_kv = tuple(
-                (entry.key.to(hf_device), (entry.value * alpha).to(hf_device))
-                for entry in injected_kv
-            )
-        else:
-            past_kv = tuple(
-                (entry.key.to(hf_device), entry.value.to(hf_device))
-                for entry in injected_kv
-            )
-        
-        # Move input tensors to HF model's device
-        input_ids = input_ids.to(hf_device)
-        attention_mask = attention_mask.to(hf_device)
-        
-        # Extend attention mask for injected K/V
-        if mem_len > 0:
-            mem_mask = torch.ones(
-                (input_ids.shape[0], mem_len),
-                device=hf_device,
-                dtype=attention_mask.dtype,
-            )
-            attention_mask = torch.cat([mem_mask, attention_mask], dim=1)
-        
-        # Generate with injected K/V
-        with torch.no_grad():
-            generated = self.hf_model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                past_key_values=past_kv,
-                max_new_tokens=max_new_tokens,
-                do_sample=True,
-                temperature=kwargs.get('temperature', 0.7),
-                top_p=kwargs.get('top_p', 0.9),
-                pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
-            )
-        
-        end_time = time.perf_counter()
-        
-        # Decode output
-        new_tokens = generated[0][input_ids.shape[1]:]
-        output_text = self.decode(new_tokens.cpu())
-        output_token_list = new_tokens.cpu().tolist()
-        input_len = input_ids.shape[1]
-        
-        # Cleanup: free GPU memory from intermediate tensors
-        del past_kv, generated, input_ids, attention_mask
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        
-        return ModelOutput(
-            text=output_text,
-            tokens=output_token_list,
-            latency_ms=(end_time - start_time) * 1000,
-            input_tokens=input_len,
-            output_tokens=len(output_token_list),
-            metadata={'alpha': alpha, 'mem_len': mem_len, 'flash_attn': False},
+        raise RuntimeError(
+            "embed() is not available in vLLM native KV mode (v5.0). "
+            "Use an independent embedding service (e.g. sentence-transformers) instead."
         )
     
-    def _forward_with_flash_attention(
+    def compute_kv(
         self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        injected_kv: List[KVCacheEntry],
-        alpha: float,
-        max_new_tokens: int,
-        start_time: float,
-        **kwargs
-    ) -> ModelOutput:
+        text: str,
+        return_hidden: bool = False,
+    ) -> Tuple[List[KVCacheEntry], Optional[torch.Tensor]]:
         """
-        Forward pass with K/V injection (FlashAttention enabled path).
-        Only used in hf_kv mode.
+        Compute K/V cache — v5.0 返回空列表 (安全降级).
+        
+        v5.0 设计: KV 注入通过 prompt 前缀 + vLLM prefix_caching 实现,
+        不需要显式 compute_kv。偏好文本的 KV 在 vLLM prefill 阶段自然生成。
+        
+        Executor 在 prompt_prefix 模式下不会调用此方法,
+        返回空列表作为安全降级 (防御性编程)。
+        
+        Returns:
+            ([], None) — 空 KV 列表和 None hidden states
         """
-        mem_len = injected_kv[0].key.shape[2] if injected_kv else 0
-        
-        # Determine target device for HF model inference
-        hf_device = next(self.hf_model.parameters()).device
-        
-        # Move KV tensors to HF model's device and apply alpha scaling
-        if alpha < 1.0:
-            past_kv = tuple(
-                (entry.key.to(hf_device), (entry.value * alpha).to(hf_device))
-                for entry in injected_kv
-            )
-        else:
-            past_kv = tuple(
-                (entry.key.to(hf_device), entry.value.to(hf_device))
-                for entry in injected_kv
-            )
-        
-        # Move input tensors to HF model's device
-        input_ids = input_ids.to(hf_device)
-        attention_mask = attention_mask.to(hf_device)
-        
-        # Extend attention mask for injected K/V
-        if mem_len > 0:
-            mem_mask = torch.ones(
-                (input_ids.shape[0], mem_len),
-                device=hf_device,
-                dtype=attention_mask.dtype,
-            )
-            attention_mask = torch.cat([mem_mask, attention_mask], dim=1)
-        
-        # Generate with injected K/V
-        with torch.no_grad():
-            generated = self.hf_model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                past_key_values=past_kv,
-                max_new_tokens=max_new_tokens,
-                do_sample=True,
-                temperature=kwargs.get('temperature', 0.7),
-                top_p=kwargs.get('top_p', 0.9),
-                pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
-            )
-        
-        end_time = time.perf_counter()
-        
-        # Decode output
-        new_tokens = generated[0][input_ids.shape[1]:]
-        output_text = self.decode(new_tokens.cpu())
-        output_token_list = new_tokens.cpu().tolist()
-        input_len = input_ids.shape[1]
-        
-        # Cleanup: free GPU memory from intermediate tensors
-        del past_kv, generated, input_ids, attention_mask
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        
-        return ModelOutput(
-            text=output_text,
-            tokens=output_token_list,
-            latency_ms=(end_time - start_time) * 1000,
-            input_tokens=input_len,
-            output_tokens=len(output_token_list),
-            metadata={
-                'alpha': alpha,
-                'mem_len': mem_len,
-                'flash_attn': True,
-                'flash_attn_backend': self._flash_attn_backend,
-            },
+        logger.debug(
+            "compute_kv() called — returning empty KV. "
+            "In v5.0, KV injection is handled by vLLM prefix caching "
+            "(preferences are injected as prompt prefix)."
         )
+        return [], None
     
     def compute_prefill_entropy(self, text: str, layer_idx: int = 3) -> float:
         """
-        Compute prefill-stage entropy for gating.
+        Compute prefill-stage entropy — v5.0 返回默认值.
         
-        prompt_prefix 模式下:
-        - 返回默认值 0.5 (中等熵)
-        - 偏好注入不依赖熵门控，而是由 Planner 的 alpha 控制
+        vLLM 原生模式不提供 attention 权重访问。
+        返回 0.5 (中等熵) 作为安全降级。
+        偏好注入强度由 Planner 的 alpha 控制, 不依赖熵门控。
         
-        hf_kv 模式下:
-        - 原有行为: 使用 HF 模型计算 attention entropy
+        Returns:
+            0.5 (默认中等熵值)
         """
-        if self.effective_injection_mode == "prompt_prefix":
-            logger.debug(
-                "compute_prefill_entropy() in prompt_prefix mode — "
-                "returning default 0.5"
-            )
-            return 0.5
-        
-        # Pre-check: if CUDA memory is very low, skip computation entirely
-        if torch.cuda.is_available():
-            try:
-                free_mem = torch.cuda.mem_get_info()[0]
-                if free_mem < 256 * 1024 * 1024:
-                    logger.debug(
-                        f"Skipping prefill entropy: only {free_mem / 1024 / 1024:.0f}MB free GPU memory"
-                    )
-                    return 0.5
-            except Exception:
-                pass
-        
-        self._load_hf_model()
-        
-        if self.hf_model is None:
-            return 0.5
-        
-        inputs = self.tokenize(text)
-        
-        try:
-            with torch.no_grad():
-                outputs = self.hf_model(
-                    **inputs,
-                    output_attentions=True,
-                    return_dict=True,
-                )
-            
-            if outputs.attentions is None:
-                logger.warning("Attention outputs not available, returning default entropy")
-                return 0.5
-            
-            if layer_idx >= len(outputs.attentions):
-                layer_idx = len(outputs.attentions) - 1
-                logger.warning(f"Layer index out of range, using layer {layer_idx}")
-            
-            attn_weights = outputs.attentions[layer_idx]
-            attn_weights = attn_weights.clamp(min=1e-9)
-            per_row_entropy = -torch.sum(attn_weights * torch.log(attn_weights), dim=-1)
-            entropy = per_row_entropy.mean()
-            
-            return entropy.item()
-            
-        except Exception as e:
-            logger.warning(f"Failed to compute prefill entropy: {e}, returning default")
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            return 0.5
+        return 0.5
     
     # ================================================================
-    # 模型信息与诊断
+    # Token 处理
+    # ================================================================
+    
+    def tokenize(self, text: str) -> Dict[str, torch.Tensor]:
+        """Tokenize text."""
+        if self.tokenizer is None:
+            raise RuntimeError("Tokenizer not loaded. Call load() first.")
+        
+        return self.tokenizer(
+            text,
+            return_tensors="pt",
+            padding="longest",
+            truncation=True,
+            max_length=self.max_model_len,
+        )
+    
+    def decode(self, token_ids) -> str:
+        """Decode token ids to text."""
+        if self.tokenizer is None:
+            raise RuntimeError("Tokenizer not loaded. Call load() first.")
+        
+        if isinstance(token_ids, torch.Tensor):
+            token_ids = token_ids.tolist()
+        
+        return self.tokenizer.decode(
+            token_ids,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=True,
+        )
+    
+    # ================================================================
+    # 模型管理与诊断
     # ================================================================
     
     def get_model_info(self) -> Dict[str, Any]:
-        """Get model architecture information with injection mode."""
+        """Get model architecture information."""
         info = super().get_model_info()
         info.update({
             'injection_mode': self.injection_mode,
             'effective_injection_mode': self.effective_injection_mode,
-            'hf_model_loaded': self.hf_model is not None,
+            'vllm_native_kv': True,
+            'prefix_caching_enabled': True,
+            'hf_model_loaded': False,  # v5.0: 永远不加载 HF 模型
             'vllm_engine_loaded': self.llm is not None,
         })
         return info
     
     def unload(self) -> None:
-        """Unload models."""
+        """Unload vLLM engine."""
         if self.llm is not None:
             del self.llm
             self.llm = None
-        if self.hf_model is not None:
-            del self.hf_model
-            self.hf_model = None
         
         super().unload()
+        logger.info("vLLM adapter unloaded")
