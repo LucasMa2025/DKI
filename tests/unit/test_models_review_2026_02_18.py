@@ -87,11 +87,12 @@ class TestComputeKVDetachCPU:
             f"{adapter_class}.compute_kv should call torch.cuda.empty_cache()"
         )
 
-    def test_vllm_adapter_already_has_detach_cpu(self):
-        """vllm_adapter 的 compute_kv 应已经有 detach().cpu()"""
+    def test_vllm_adapter_compute_kv_is_safe_noop(self):
+        """v5.0: vllm_adapter 的 compute_kv 应返回空列表 (安全降级, 不做 GPU 计算)"""
         from dki.models.vllm_adapter import VLLMAdapter
         source = inspect.getsource(VLLMAdapter.compute_kv)
-        assert "detach().cpu()" in source
+        # v5.0: compute_kv 返回 [], None (不做 GPU 计算, 不需要 detach/cpu)
+        assert "return [], None" in source
 
 
 # ============================================================================
@@ -149,10 +150,9 @@ class TestForwardKVInjectionCleanup:
         ("dki.models.deepseek_adapter", "DeepSeekAdapter"),
         ("dki.models.llama_adapter", "LlamaAdapter"),
         ("dki.models.glm_adapter", "GLMAdapter"),
-        ("dki.models.vllm_adapter", "VLLMAdapter"),
     ])
     def test_forward_kv_injection_cleans_up(self, adapter_module, adapter_class):
-        """forward_with_kv_injection 应有显存清理"""
+        """forward_with_kv_injection 应有显存清理 (HF 模型适配器)"""
         import importlib
         mod = importlib.import_module(adapter_module)
         cls = getattr(mod, adapter_class)
@@ -162,6 +162,15 @@ class TestForwardKVInjectionCleanup:
             f"{adapter_class}.forward_with_kv_injection should call "
             f"torch.cuda.empty_cache()"
         )
+
+    def test_vllm_forward_delegates_to_vllm(self):
+        """v5.0: VLLMAdapter.forward_with_kv_injection 应委托给 vLLM generate (不需要手动清理)"""
+        from dki.models.vllm_adapter import VLLMAdapter
+        source = inspect.getsource(VLLMAdapter.forward_with_kv_injection)
+        # v5.0: 委托给 vLLM generate, vLLM 管理自己的 GPU 显存
+        assert "self.llm.generate" in source
+        # 不应该有 HF 模型相关代码
+        assert "hf_model" not in source
 
     @pytest.mark.parametrize("adapter_module,adapter_class", [
         ("dki.models.deepseek_adapter", "DeepSeekAdapter"),
@@ -609,50 +618,65 @@ class TestDeepSeekAdapterSpecifics:
 # ============================================================================
 
 class TestVLLMAdapterSpecifics:
-    """验证 vLLM 适配器的特殊处理"""
+    """验证 vLLM 适配器 v5.0 的特殊处理"""
 
-    def test_vllm_has_hf_model_lazy_loading(self):
-        """vLLM 应有 HF 模型的懒加载"""
+    def test_vllm_no_hf_model(self):
+        """v5.0: VLLMAdapter 不应有 HF 模型相关方法"""
         from dki.models.vllm_adapter import VLLMAdapter
         
-        assert hasattr(VLLMAdapter, "_load_hf_model")
+        # v5.0 已移除 HF 模型旁路
+        assert not hasattr(VLLMAdapter, "_load_hf_model")
+        assert not hasattr(VLLMAdapter, "_forward_with_hf_kv")
+        assert not hasattr(VLLMAdapter, "_forward_with_flash_attention")
 
-    def test_vllm_load_hf_checks_gpu_memory(self):
-        """_load_hf_model 应检查 GPU 显存"""
+    def test_vllm_compute_kv_returns_empty(self):
+        """v5.0: compute_kv 应返回空列表 (KV 注入通过 prompt 前缀实现)"""
         from dki.models.vllm_adapter import VLLMAdapter
         
-        source = inspect.getsource(VLLMAdapter._load_hf_model)
-        assert "mem_get_info" in source, (
-            "_load_hf_model should check GPU memory before loading"
-        )
-        assert "use_cpu" in source, (
-            "_load_hf_model should have CPU fallback"
-        )
+        source = inspect.getsource(VLLMAdapter.compute_kv)
+        assert "return [], None" in source
 
-    def test_vllm_prefill_entropy_pre_check(self):
-        """compute_prefill_entropy 应有 GPU 显存预检查"""
+    def test_vllm_prefill_entropy_returns_default(self):
+        """v5.0: compute_prefill_entropy 应返回默认值 0.5"""
         from dki.models.vllm_adapter import VLLMAdapter
         
         source = inspect.getsource(VLLMAdapter.compute_prefill_entropy)
-        assert "mem_get_info" in source, (
-            "compute_prefill_entropy should pre-check GPU memory"
-        )
-        assert "256" in source, (
-            "Should skip if less than 256MB free"
-        )
+        assert "return 0.5" in source
 
-    def test_vllm_unload_cleans_both_models(self):
-        """vLLM unload 应清理 llm 和 hf_model"""
+    def test_vllm_unload_cleans_llm(self):
+        """v5.0: vLLM unload 应清理 llm"""
         from dki.models.vllm_adapter import VLLMAdapter
         
         source = inspect.getsource(VLLMAdapter.unload)
         assert "self.llm" in source
-        assert "self.hf_model" in source
 
-    def test_vllm_flash_attention_path(self):
-        """vLLM forward_with_kv_injection 应有 FlashAttention 路径"""
+    def test_vllm_injection_mode_always_prompt_prefix(self):
+        """v5.0: injection_mode 始终设为 prompt_prefix (兼容 Executor)"""
+        from dki.models.vllm_adapter import VLLMAdapter
+        
+        source = inspect.getsource(VLLMAdapter.__init__)
+        assert 'self.injection_mode = "prompt_prefix"' in source
+
+    def test_vllm_prefix_caching_enabled(self):
+        """v5.0: load 应开启 enable_prefix_caching"""
+        from dki.models.vllm_adapter import VLLMAdapter
+        
+        source = inspect.getsource(VLLMAdapter.load)
+        assert "enable_prefix_caching=True" in source
+
+    def test_vllm_embed_raises_runtime_error(self):
+        """v5.0: embed 应抛出 RuntimeError"""
+        from dki.models.vllm_adapter import VLLMAdapter
+        
+        source = inspect.getsource(VLLMAdapter.embed)
+        assert "raise RuntimeError" in source
+
+    def test_vllm_forward_kv_injection_uses_vllm(self):
+        """v5.0: forward_with_kv_injection 应使用 vLLM generate"""
         from dki.models.vllm_adapter import VLLMAdapter
         
         source = inspect.getsource(VLLMAdapter.forward_with_kv_injection)
-        assert "flash_attn_enabled" in source
-        assert "_forward_with_flash_attention" in source
+        assert "self.llm.generate" in source
+        # 不应有 HF 模型或 past_key_values
+        assert "hf_model" not in source
+        assert "past_key_values" not in source
