@@ -412,16 +412,22 @@ class InjectionExecutor:
     
     def _is_prompt_prefix_mode(self) -> bool:
         """
-        检查模型是否处于 prompt_prefix 注入模式
+        检查模型是否处于 vLLM 原生 KV 注入模式
+        
+        v5.0: VLLMAdapter 的 injection_mode 始终为 "prompt_prefix",
+        偏好通过 prompt 前缀 + vLLM prefix_caching 实现 KV 注入。
+        
+        非 vLLM 适配器 (LLaMA/DeepSeek/GLM) 没有 injection_mode 属性,
+        此方法返回 False, Executor 走 HF 模型 KV 注入路径。
         
         安全检查: 使用 getattr 避免非 VLLMAdapter 模型报错
         """
         injection_mode = getattr(self.model, 'injection_mode', None)
-        if injection_mode == "prompt_prefix":
+        if injection_mode in ("prompt_prefix", "vllm_kv"):
             return True
         if injection_mode == "auto":
             effective = getattr(self.model, 'effective_injection_mode', None)
-            return effective == "prompt_prefix"
+            return effective in ("prompt_prefix", "vllm_kv")
         return False
     
     @staticmethod
@@ -472,14 +478,13 @@ class InjectionExecutor:
         """
         执行 K/V 注入推理 (recall_v4 统一策略)
         
-        v4.0 改造:
-        - prompt_prefix 模式: 偏好已在 plan.final_input 中作为前缀，
-          跳过 compute_kv，直接调用 vLLM generate
-        - hf_kv 模式: 原有行为 (compute_kv → past_key_values 注入)
+        v5.0 路由:
+        - VLLMAdapter (prompt_prefix): 偏好作为 prompt 前缀，
+          vLLM prefix_caching 自动复用相同偏好的 KV Cache,
+          不需要 compute_kv, 不加载 HF 模型
+        - 非 vLLM 适配器 (LLaMA/DeepSeek/GLM): 原有 HF 模型 KV 注入
         
-        偏好: prompt_prefix → prompt 前缀 / hf_kv → K/V 注入 (负位置)
         历史: 由 recall_v4 后缀组装 (已包含在 plan.final_input 中)
-        
         安全: 使用 InferenceContextGuard 确保推理上下文隔离
         """
         result = ExecutionResult()
@@ -487,12 +492,13 @@ class InjectionExecutor:
         # 使用 effective alpha (受 override_cap 约束)
         alpha = plan.alpha_profile.effective_preference_alpha
         
-        # ============ prompt_prefix 模式: 跳过 KV 计算 ============
+        # ============ vLLM 原生 KV 注入 (v5.0 默认路径) ============
         if self._is_prompt_prefix_mode():
-            # Prompt Prefix 模式: 将偏好文本作为前缀拼接到 final_input
-            # 不需要 compute_kv，不需要 KV 缓存，直接用 vLLM 推理
+            # vLLM 原生 KV 注入: 偏好作为 prompt 前缀 → vLLM prefill → KV Cache
+            # vLLM prefix_caching 自动复用相同偏好前缀的 KV Cache
+            # 不需要 compute_kv, 不需要 HF 模型, 不需要 KV 缓存管理
             result.preference_cache_hit = False
-            result.preference_cache_tier = "prompt_prefix"
+            result.preference_cache_tier = "vllm_prefix_caching"
             
             # 构造带偏好前缀的 prompt
             prompt_with_prefix = plan.final_input
@@ -503,8 +509,7 @@ class InjectionExecutor:
             
             inference_start = time.time()
             
-            # forward_with_kv_injection 在 prompt_prefix 模式下
-            # 会自动路由到 _forward_with_prompt_prefix
+            # vLLM 原生推理: prompt 已含偏好前缀, prefix_caching 自动复用 KV
             output = self.model.forward_with_kv_injection(
                 prompt=prompt_with_prefix,
                 injected_kv=[],           # 不使用
@@ -531,7 +536,7 @@ class InjectionExecutor:
             
             return result
         
-        # ============ hf_kv 模式: 原有 KV 注入逻辑 ============
+        # ============ HF 模型 KV 注入 (非 vLLM 适配器: LLaMA/DeepSeek/GLM) ============
         
         # 获取偏好 K/V (含用户级隔离缓存)
         preference_kv, cache_hit, cache_tier = self._get_preference_kv(
@@ -656,14 +661,14 @@ class InjectionExecutor:
         **kwargs,
     ) -> ExecutionResult:
         """
-        Stable 策略降级: 使用偏好 K/V + 平铺历史后缀
+        Stable 策略降级: 使用偏好 + 平铺历史后缀
         
-        v4.0 改造:
-        - prompt_prefix 模式: 偏好前缀 + stable_input, 直接 vLLM 推理
-        - hf_kv 模式: 原有行为 (偏好 K/V 注入 + stable_input)
+        v5.0 路由:
+        - VLLMAdapter: 偏好前缀 + stable_input → vLLM 原生推理 (prefix_caching)
+        - 非 vLLM 适配器: 偏好 K/V 注入 + stable_input (原有行为)
         
         当 recall_v4 执行失败时, 回退到 stable 策略:
-        - 偏好: prompt_prefix → prompt 前缀 / hf_kv → K/V 注入
+        - 偏好: vLLM → prompt 前缀 / 其他 → K/V 注入
         - 历史: 使用 plan.history_suffix (平铺历史后缀)
         """
         self._stats.setdefault("stable_fallbacks", 0)
@@ -683,10 +688,10 @@ class InjectionExecutor:
         
         alpha = plan.alpha_profile.effective_preference_alpha
         
-        # ============ prompt_prefix 模式: 跳过 KV 计算 ============
+        # ============ vLLM 原生 KV 注入 (v5.0 默认路径) ============
         if self._is_prompt_prefix_mode():
             result.preference_cache_hit = False
-            result.preference_cache_tier = "prompt_prefix"
+            result.preference_cache_tier = "vllm_prefix_caching"
             
             # 将偏好前缀拼接到 stable_input 前面
             if plan.preference_text and alpha > 0.1:
@@ -721,10 +726,10 @@ class InjectionExecutor:
             self._stats.setdefault("stable_executions", 0)
             self._stats["stable_executions"] += 1
             
-            logger.info("Stable fallback (prompt_prefix) executed successfully")
+            logger.info("Stable fallback (vLLM native KV) executed successfully")
             return result
         
-        # ============ hf_kv 模式: 原有 KV 注入逻辑 ============
+        # ============ HF 模型 KV 注入 (非 vLLM 适配器) ============
         
         # 获取偏好 K/V
         preference_kv, cache_hit, cache_tier = self._get_preference_kv(
