@@ -437,7 +437,7 @@
           </div>
           
           <!-- ==================== Common: Final Input Preview ==================== -->
-          <div class="injection-text-card final-card">
+          <div class="injection-text-card final-card" style="grid-column: 1 / -1;">
             <div class="card-header">
               <span class="card-title">
                 <el-icon><View /></el-icon>
@@ -460,19 +460,122 @@
         </div>
       </section>
 
-      <!-- Recall v4 Information Section -->
+      <!-- ==================== Complete Raw Prompt Section (v5.4) ==================== -->
+      <section class="raw-prompt-section" v-if="latestData">
+        <h2>
+          <el-icon><Document /></el-icon>
+          Complete Raw Prompt (Final Input to LLM)
+          <el-tag :type="rawPromptViewMode === 'raw' ? 'danger' : 'success'" size="small" style="margin-left: 12px;">
+            {{ rawPromptViewMode === 'raw' ? 'Raw' : 'Formatted' }}
+          </el-tag>
+          <el-button-group style="margin-left: auto;">
+            <el-button size="small" :type="rawPromptViewMode === 'formatted' ? 'primary' : 'default'" @click="rawPromptViewMode = 'formatted'">
+              Formatted
+            </el-button>
+            <el-button size="small" :type="rawPromptViewMode === 'raw' ? 'primary' : 'default'" @click="rawPromptViewMode = 'raw'">
+              Raw
+            </el-button>
+            <el-button size="small" @click="copyRawPrompt">
+              <el-icon><CopyDocument /></el-icon>
+              Copy
+            </el-button>
+            <el-button size="small" @click="rawPromptExpanded = !rawPromptExpanded">
+              {{ rawPromptExpanded ? 'Collapse' : 'Expand' }}
+            </el-button>
+          </el-button-group>
+        </h2>
+        
+        <div class="raw-prompt-container" :class="{ expanded: rawPromptExpanded }">
+          <!-- Raw mode: show exact prompt text as-is -->
+          <template v-if="rawPromptViewMode === 'raw'">
+            <pre class="raw-prompt-pre" :class="{ expanded: rawPromptExpanded }">{{ fullRawPrompt }}</pre>
+          </template>
+          
+          <!-- Formatted mode: highlight special tokens and roles -->
+          <template v-else>
+            <div class="formatted-prompt" :class="{ expanded: rawPromptExpanded }">
+              <div
+                v-for="(segment, idx) in formattedPromptSegments"
+                :key="idx"
+                class="prompt-segment"
+                :class="[`segment-${segment.type}`]"
+              >
+                <span class="segment-role-badge" v-if="segment.role">{{ segment.role }}</span>
+                <span class="segment-content" :class="{ 'special-token': segment.isSpecialToken }">{{ segment.content }}</span>
+              </div>
+            </div>
+          </template>
+          
+          <div class="raw-prompt-meta">
+            <span>Total Characters: {{ (fullRawPrompt || '').length }}</span>
+            <span>Mode: {{ latestData?.mode || 'dki' }}</span>
+            <span v-if="latestData?.session_id">Session: {{ latestData.session_id }}</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- Recall v4 Information Section (v5.4: enhanced with signal details) -->
       <section class="recall-section" v-if="latestData?.recall_v4_enabled">
         <h2>
           <el-icon><DataLine /></el-icon>
-          Recall v4 Information
+          Recall v4 Multi-Signal Fusion
           <el-tag type="success" size="small" style="margin-left: 12px;">
             {{ latestData?.recall_strategy || 'summary_with_fact_call' }}
           </el-tag>
         </h2>
-        <div class="recall-info-grid">
+        
+        <!-- Signal Stats Grid -->
+        <div class="recall-signals-grid">
+          <!-- Keyword Signal -->
+          <div class="signal-card signal-keyword">
+            <div class="signal-header">
+              <span class="signal-icon">K</span>
+              <span class="signal-name">Keyword (TF-IDF)</span>
+            </div>
+            <div class="signal-value">{{ recallSignals.keyword_hits }} hits</div>
+            <div class="signal-desc">jieba + TF-IDF weighted matching</div>
+          </div>
+          
+          <!-- BM25 Signal -->
+          <div class="signal-card signal-bm25">
+            <div class="signal-header">
+              <span class="signal-icon">B</span>
+              <span class="signal-name">BM25</span>
+            </div>
+            <div class="signal-value">{{ recallSignals.bm25_hits }} hits</div>
+            <div class="signal-desc">Full-text relevance ranking</div>
+          </div>
+          
+          <!-- Vector Signal -->
+          <div class="signal-card signal-vector">
+            <div class="signal-header">
+              <span class="signal-icon">V</span>
+              <span class="signal-name">Vector (Semantic)</span>
+            </div>
+            <div class="signal-value">{{ recallSignals.vector_hits }} hits</div>
+            <div class="signal-desc">Embedding cosine similarity</div>
+          </div>
+          
+          <!-- Recency Signal -->
+          <div class="signal-card signal-recency">
+            <div class="signal-header">
+              <span class="signal-icon">R</span>
+              <span class="signal-name">Recency</span>
+            </div>
+            <div class="signal-value">{{ recallSignals.recent_turns_added }} turns</div>
+            <div class="signal-desc">Fixed recent turns supplement</div>
+          </div>
+        </div>
+        
+        <!-- General Stats -->
+        <div class="recall-info-grid" style="margin-top: 16px;">
           <div class="recall-stat">
             <div class="recall-stat-label">Recall Strategy</div>
             <div class="recall-stat-value">{{ latestData?.recall_strategy || 'N/A' }}</div>
+          </div>
+          <div class="recall-stat">
+            <div class="recall-stat-label">Total Recalled</div>
+            <div class="recall-stat-value">{{ recallSignals.total_recalled || 0 }}</div>
           </div>
           <div class="recall-stat">
             <div class="recall-stat-label">Fact Call Rounds</div>
@@ -485,6 +588,10 @@
           <div class="recall-stat">
             <div class="recall-stat-label">Original Messages</div>
             <div class="recall-stat-value">{{ latestData?.recall_message_count || 0 }}</div>
+          </div>
+          <div class="recall-stat" v-if="recallSignals.reference_scope">
+            <div class="recall-stat-label">Reference Scope</div>
+            <div class="recall-stat-value">{{ recallSignals.reference_scope }}</div>
           </div>
           <div class="recall-stat" v-if="latestData?.recall_trace_ids?.length > 0">
             <div class="recall-stat-label">Trace IDs</div>
@@ -995,6 +1102,109 @@ function truncateText(text: string, maxLen: number): string {
   if (text.length <= maxLen) return text
   return text.substring(0, maxLen) + '...'
 }
+
+// ===== Raw Prompt Display (v5.4) =====
+const rawPromptViewMode = ref<'raw' | 'formatted'>('formatted')
+const rawPromptExpanded = ref(false)
+
+const fullRawPrompt = computed(() => {
+  if (!latestData.value) return ''
+  // Priority: final_input > final_input_preview > original_query
+  return latestData.value.final_input
+    || latestData.value.final_input_preview
+    || latestData.value.original_query
+    || ''
+})
+
+/**
+ * Parse the raw prompt into structured segments for formatted display.
+ * Recognises chat template tokens from DeepSeek / Qwen / ChatML / Llama-3.
+ */
+const formattedPromptSegments = computed(() => {
+  const raw = fullRawPrompt.value
+  if (!raw) return []
+
+  const segments: { type: string; role: string; content: string; isSpecialToken: boolean }[] = []
+
+  // Split on common chat template delimiters
+  // DeepSeek v2/v3:  <｜begin▁of▁sentence｜>  <｜User｜>  <｜Assistant｜>
+  // ChatML:          <|im_start|>system  <|im_end|>
+  // Llama-3:         <|begin_of_text|>  <|start_header_id|>...<|end_header_id|>
+  const tokenPattern = /(<[｜|][^>]*[｜|]>|<\|im_start\|>\w+|<\|im_end\|>|<\|begin_of_text\|>|<\|start_header_id\|>.*?<\|end_header_id\|>)/g
+
+  let lastIndex = 0
+  let match: RegExpExecArray | null
+
+  while ((match = tokenPattern.exec(raw)) !== null) {
+    // Text before the token
+    if (match.index > lastIndex) {
+      const text = raw.slice(lastIndex, match.index)
+      if (text.trim()) {
+        segments.push({ type: 'content', role: '', content: text, isSpecialToken: false })
+      }
+    }
+
+    const token = match[0]
+    let role = ''
+    if (/user/i.test(token)) role = 'user'
+    else if (/assistant/i.test(token)) role = 'assistant'
+    else if (/system/i.test(token)) role = 'system'
+
+    segments.push({ type: 'token', role, content: token, isSpecialToken: true })
+    lastIndex = tokenPattern.lastIndex
+  }
+
+  // Remaining text after last token
+  if (lastIndex < raw.length) {
+    const text = raw.slice(lastIndex)
+    if (text.trim()) {
+      segments.push({ type: 'content', role: '', content: text, isSpecialToken: false })
+    }
+  }
+
+  // If no tokens found, return the whole thing as a single segment
+  if (segments.length === 0 && raw.trim()) {
+    segments.push({ type: 'content', role: '', content: raw, isSpecialToken: false })
+  }
+
+  return segments
+})
+
+function copyRawPrompt() {
+  const text = fullRawPrompt.value
+  if (!text) {
+    ElMessage.warning('No prompt data to copy')
+    return
+  }
+  navigator.clipboard.writeText(text).then(() => {
+    ElMessage.success('Raw prompt copied to clipboard')
+  }).catch(() => {
+    ElMessage.error('Copy failed')
+  })
+}
+
+// ===== Recall v4 Signal Details (v5.4) =====
+const recallSignals = computed(() => {
+  if (!latestData.value) {
+    return {
+      keyword_hits: 0,
+      bm25_hits: 0,
+      vector_hits: 0,
+      recent_turns_added: 0,
+      total_recalled: 0,
+      reference_scope: '',
+    }
+  }
+  const d = latestData.value
+  return {
+    keyword_hits: d.keyword_hits ?? d.recall_keyword_hits ?? 0,
+    bm25_hits: d.bm25_hits ?? d.recall_bm25_hits ?? 0,
+    vector_hits: d.vector_hits ?? d.recall_vector_hits ?? 0,
+    recent_turns_added: d.recent_turns_added ?? d.recall_recent_turns ?? 0,
+    total_recalled: (d.keyword_hits ?? 0) + (d.bm25_hits ?? 0) + (d.vector_hits ?? 0) + (d.recent_turns_added ?? 0),
+    reference_scope: d.reference_scope ?? d.recall_reference_scope ?? '',
+  }
+})
 
 // Lifecycle
 onMounted(() => {
