@@ -24,12 +24,12 @@ model:
     engines:
         vllm:
             enabled: true
-            model_name: "/opt/ai-demo/models/deepseek-llm-7b-chat"
+            model_name: "/opt/ai-demo/models/deepseek-r1-distill-qwen-7b"
             # ============ GPU Parallelism ============
             # tensor_parallel_size: 模型张量并行度
             #   - 1: 单 GPU (默认，适合显存充足的场景)
             #   - 2: 双 GPU (适合 2×V100 32G 等显存受限场景)
-            # 
+            #
             # 2×V100 32G 环境建议:
             #   tensor_parallel_size: 2  (模型分布到两张 GPU)
             #   gpu_memory_utilization: 0.85  (留出余量给 K/V cache)
@@ -39,10 +39,30 @@ model:
             #   1. 设置 CUDA_VISIBLE_DEVICES=0,1
             #   2. 确保两张 GPU 通过 NVLink/PCIe 互联
             #   3. vLLM 会自动处理模型分片和通信
-            tensor_parallel_size: 2
+            tensor_parallel_size: 1
             max_model_len: 4096
             gpu_memory_utilization: 0.85
             trust_remote_code: true
+
+            # ============ v4.0: DKI 偏好注入模式 ============
+            # injection_mode: DKI 用户偏好的注入方式
+            #   - "prompt_prefix": 偏好作为 prompt 前缀, 完整利用 vLLM 推理 (推荐)
+            #     优势: 无需加载 HuggingFace 模型, 节省 ~14GB VRAM, 3-4x 吞吐提升
+            #     原理: 偏好文本拼接在 prompt 前面, vLLM 在 prefill 阶段自然处理
+            #   - "hf_kv": 回退到 HuggingFace 模型进行 past_key_values 注入
+            #     适用: 需要精确 K/V 负位置注入的研究场景
+            #     注意: 会额外加载一个 HF 模型, 显存占用翻倍
+            #   - "auto": 自动选择 (等同于 prompt_prefix)
+            injection_mode: "prompt_prefix"
+
+            # ============ v4.0: AGA 全局知识注入 (可选) ============
+            # 启用后, AGA 会通过 register_forward_hook 在推理过程中
+            # 根据 entropy gating 动态注入全局知识
+            # 与 DKI 的用户级偏好注入互不干扰, 可同时启用
+            aga_enabled: false
+            aga_config:
+                bottleneck_dim: 64
+                num_slots: 100
 
 # ============ Embedding Settings ============
 embedding:
@@ -60,6 +80,35 @@ rag:
     similarity_threshold: 0.5
     index_type: "faiss" # faiss, annoy
 
+# ============ Routing Settings (v6.0) ============
+# 动态路由系统: 根据会话上下文自动选择 RAG 或 DKI
+# 路由器零 GPU 依赖, O(1) 延迟, 不影响请求性能
+routing:
+    enabled: false # 路由器总开关 (false 时使用 default_mode)
+    default_mode: "dki" # 路由器禁用时的默认模式
+
+    # DKI 激活阈值 (评分范围 0-1)
+    dki_threshold: 0.45 # Score_DKI > 此值 → DKI
+    rag_threshold: 0.25 # Score_DKI < 此值 → 确定 RAG
+
+    # 五维评分权重 (总和 = 1.0)
+    weight_history: 0.25 # 会话历史深度
+    weight_preference: 0.20 # 偏好依赖度
+    weight_trigger: 0.20 # 记忆触发信号
+    weight_session_depth: 0.20 # 会话轮次深度
+    weight_cross_session: 0.15 # 跨会话连续性
+
+    # 会话轮次阈值
+    turn_threshold_low: 2 # 低于此值 → 短会话 (倾向 RAG)
+    turn_threshold_high: 6 # 高于此值 → 长会话 (倾向 DKI)
+
+    # 奖惩参数
+    first_turn_rag_bonus: 0.3 # 首轮对话 RAG 加分
+    knowledge_query_rag_bonus: 0.2 # 知识检索查询 RAG 加分
+    preference_dki_bonus: 0.15 # 有偏好时 DKI 加分
+    memory_trigger_dki_bonus: 0.25 # 记忆触发信号 DKI 加分
+    cross_session_dki_bonus: 0.2 # 跨会话历史 DKI 加分
+
 # ============ DKI Settings ============
 # DKI is a User-Level Cross-Session Memory System
 # Scope: User preferences, session history, personal context
@@ -76,9 +125,9 @@ dki:
     # - 偏好: K/V 注入 (负位置)
     # - 历史: 多信号召回 + 后缀组装 (recall_v4)
     # - 事实补充: Function Call 循环
-    # 
-    # 注: stable 和 full_attention 策略已移除 (v3.2)
-    injection_strategy: "recall_v4"
+    #
+    # 注: full_attention 策略已移除 (v3.2)
+    injection_strategy: "recall_v4" # recall_v4 | stable
 
     # ============ Hybrid Injection (偏好 K/V 注入) ============
     hybrid_injection:
@@ -97,7 +146,7 @@ dki:
         history:
             enabled: false
             method: "recall_v4" # recall_v4 (新) — 历史由多信号召回处理
-            max_tokens: 500
+            max_tokens: 1000
             max_messages: 10
 
     # ============ 用户隔离配置 (v3.1) ============
@@ -114,12 +163,12 @@ dki:
         audit_max_entries: 10000
         # 推理上下文隔离
         enable_inference_guard: true
-    
+
     # ============ 偏好缓存配置 ============
     preference_store:
         max_users: 1000
         ttl_seconds: 3600
-    
+
     # ============ Executor 缓存配置 ============
     executor_cache:
         max_total: 10000
@@ -213,42 +262,51 @@ dki:
 
         # 多信号召回
         signals:
-            keyword_enabled: true       # 关键词+权重检索 (jieba)
-            keyword_topk: 5             # 提取关键词数量
-            keyword_method: "tfidf"     # tfidf | textrank
-            vector_enabled: true        # 向量相似度检索 (FAISS)
-            vector_top_k: 10            # 向量检索返回数
-            vector_threshold: 0.5       # 向量相似度阈值
-            reference_enabled: true     # 指代解析 (已有 ReferenceResolver)
+            keyword_enabled: true # 关键词+权重检索 (jieba TF-IDF/TextRank)
+            keyword_topk: 5 # 提取关键词数量
+            keyword_method: "tfidf" # tfidf | textrank
+            # P1: BM25 全文检索 (补充关键词信号)
+            # BM25 与 jieba TF-IDF 互补:
+            #   - TF-IDF: 提取关键词 → 精确匹配 → 侧重"关键词权重"
+            #   - BM25: 全文分词 → 文档相关性排序 → 侧重"整体相关性"
+            # BM25 对长查询和词频分布更鲁棒, 能捕获 TF-IDF 遗漏的相关消息
+            bm25_enabled: true # BM25 全文检索 (rank_bm25)
+            bm25_top_k: 15 # BM25 返回候选数
+            vector_enabled: true # 向量相似度检索 (FAISS)
+            vector_top_k: 10 # 向量检索返回数
+            vector_threshold: 0.5 # 向量相似度阈值
+            reference_enabled: true # 指代解析 (已有 ReferenceResolver)
 
-        # 召回分数融合权重 (w1 >= w2, 事实准确优先)
+        # 召回分数融合权重 (四路信号)
+        # 权重之和应为 1.0, 门控后会动态归一化
         score_weights:
-            keyword_weight: 0.4         # w1: 关键词权重
-            vector_weight: 0.35         # w2: 向量相似度权重
-            recency_weight: 0.25        # w3: 时间近度权重
+            keyword_weight: 0.3 # w1: 关键词权重 (jieba TF-IDF)
+            bm25_weight: 0.2 # w2: BM25 全文检索权重 (P1 新增)
+            vector_weight: 0.3 # w3: 向量相似度权重
+            recency_weight: 0.2 # w4: 时间近度权重
 
         # 动态 History 预算
         budget:
-            generation_reserve: 512     # 生成预留 tokens
-            instruction_reserve: 150    # 限定提示预留 tokens
-            min_recent_turns: 2         # 至少补充的近期完整轮次
-            max_recent_turns: 5         # 最多补充的近期完整轮次
+            generation_reserve: 512 # 生成预留 tokens
+            instruction_reserve: 150 # 限定提示预留 tokens
+            min_recent_turns: 2 # 至少补充的近期完整轮次
+            max_recent_turns: 5 # 最多补充的近期完整轮次
 
         # 逐消息 Summary 阈值
         summary:
-            per_message_threshold: 200  # 单条消息超过此 token 数 → summary
+            per_message_threshold: 200 # 单条消息超过此 token 数 → summary
             max_tokens_per_summary: 150 # 每条 summary 最大 tokens
-            strategy: "extractive"      # extractive (jieba TextRank) | llm
+            strategy: "extractive" # extractive (jieba TextRank) | llm
 
         # Function Call (事实补充)
         fact_call:
             enabled: true
-            max_rounds: 3               # 最大事实补充轮次
-            max_fact_tokens: 800        # 事实段落总 token 上限
-            batch_size: 5               # 每次返回的消息数 (offset+limit)
+            max_rounds: 3 # 最大事实补充轮次
+            max_fact_tokens: 1500 # 事实段落总 token 上限
+            batch_size: 5 # 每次返回的消息数 (offset+limit)
 
         # 提示格式化器
-        prompt_formatter: "auto"        # auto | generic | deepseek | glm
+        prompt_formatter: "auto" # auto | generic | deepseek | glm
 
     # ============ A/B Testing ============
     ab_test:
