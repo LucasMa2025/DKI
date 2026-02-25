@@ -213,9 +213,18 @@ def create_dki_router() -> APIRouter:
             preference_tokens = hybrid_info.get("preference_tokens", 0)
             history_tokens = hybrid_info.get("history_tokens", 0)
             
+            # v5.3: 使用 preference_alpha (来自配置, 非门控决策)
+            _gating_alpha = response.gating_decision.alpha if response.gating_decision else 0.0
+            _pref_alpha = hybrid_info.get("preference_alpha", 0.0)
+            _display_alpha = max(_pref_alpha, _gating_alpha)
+            
             dki_metadata = DKIMetadataResponse(
-                injection_enabled=response.gating_decision.should_inject if response.gating_decision else False,
-                alpha=response.gating_decision.alpha if response.gating_decision else 0.0,
+                injection_enabled=(
+                    (response.gating_decision.should_inject if response.gating_decision else False)
+                    or bool(preference_tokens)  # v5.3: 偏好注入也算 enabled
+                    or bool(history_tokens)
+                ),
+                alpha=_display_alpha,
                 preference_tokens=preference_tokens,
                 history_tokens=history_tokens,
                 cache_hit=response.cache_hit,
@@ -237,8 +246,8 @@ def create_dki_router() -> APIRouter:
                     "query": request.query,
                     "user_id": verified_user_id,
                     "session_id": request.session_id or verified_user_id,
-                    "injection_enabled": response.gating_decision.should_inject if response.gating_decision else False,
-                    "alpha": response.gating_decision.alpha if response.gating_decision else 0.0,
+                    "injection_enabled": dki_metadata.injection_enabled,
+                    "alpha": _display_alpha,
                     "preference_tokens": preference_tokens,
                     "history_tokens": history_tokens,
                     "query_tokens": max(0, response.input_tokens - preference_tokens - history_tokens),
@@ -263,14 +272,12 @@ def create_dki_router() -> APIRouter:
             except Exception as viz_error:
                 logger.warning(f"Failed to record visualization: {viz_error}")
             
-            # 记录 DKI 统计数据
+            # 记录 DKI 统计数据 (v5.3: 使用 preference_alpha)
             try:
-                _alpha = response.gating_decision.alpha if response.gating_decision else 0.0
-                _injected = response.gating_decision.should_inject if response.gating_decision else False
                 record_dki_request(
                     cache_tier=response.cache_tier or "L3",
-                    alpha=_alpha,
-                    injected=_injected,
+                    alpha=_display_alpha,
+                    injected=dki_metadata.injection_enabled,
                 )
             except Exception as stats_error:
                 logger.warning(f"Failed to record stats: {stats_error}")

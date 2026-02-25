@@ -51,15 +51,18 @@ from dki.cache import (
     RedisConfig,
     REDIS_AVAILABLE,
 )
+from dki.core.conversation_router import (
+    ConversationRouter, RouterConfig, RoutingDecision, RouteMode,
+)
 
 
 # Request/Response Models
 class ChatRequest(BaseModel):
     query: str
     session_id: Optional[str] = None
-    mode: str = "dki"  # dki, rag, baseline
+    mode: str = "auto"  # auto, dki, rag, baseline (v6.0: 默认 auto, 由路由器决策)
     force_alpha: Optional[float] = None
-    max_new_tokens: int = 256
+    max_new_tokens: int = 1024  # v5.1: 从 256 提升到 1024, 防止中文/thinking 模型输出截断
     temperature: float = 0.7
     # User isolation: identify user via token or user_id
     token: Optional[str] = None     # Bearer token (priority, resolves user_id from auth system)
@@ -75,6 +78,8 @@ class ChatResponse(BaseModel):
     alpha: Optional[float] = None
     cache_hit: bool = False
     metadata: Dict[str, Any] = {}
+    # v6.0: 路由决策信息 (mode=auto 时填充)
+    routing: Optional[Dict[str, Any]] = None
 
 
 class MemoryRequest(BaseModel):
@@ -142,6 +147,17 @@ def create_app() -> FastAPI:
         if 'rag' not in _systems:
             _systems['rag'] = RAGSystem()
         return _systems['rag']
+    
+    def get_router() -> ConversationRouter:
+        """Get or create the conversation router (v6.0)"""
+        if 'router' not in _systems:
+            # 从 config.yaml 的 routing 段加载配置 (如果存在)
+            routing_dict = {}
+            if hasattr(config, 'routing'):
+                routing_dict = config.routing.__dict__ if hasattr(config.routing, '__dict__') else {}
+            router_config = RouterConfig.from_dict(routing_dict)
+            _systems['router'] = ConversationRouter(config=router_config)
+        return _systems['router']
     
     # Initialize user data adapter (ExampleAdapter for demo/dev, ConfigDrivenAdapter for production)
     def get_user_adapter():
@@ -318,8 +334,10 @@ def create_app() -> FastAPI:
     @app.post("/api/chat", response_model=ChatResponse)
     async def chat(request: ChatRequest):
         """
-        Chat endpoint supporting DKI, RAG, and baseline modes.
-        Also records visualization and statistics data.
+        Chat endpoint supporting DKI, RAG, baseline, and auto modes.
+        
+        v6.0: mode="auto" 使用 ConversationRouter 动态路由。
+        路由器根据会话深度、偏好、记忆触发等信号自动选择 DKI 或 RAG。
         
         User Isolation (v3.1):
         - Identifies user via request.token or request.user_id
@@ -327,9 +345,64 @@ def create_app() -> FastAPI:
         """
         session_id = request.session_id or f"session_{uuid.uuid4().hex[:8]}"
         resolved_user_id = _resolve_user_id(request)
+        routing_decision_dict = None  # v6.0: 路由决策 (auto 模式)
+        
+        # ---- v6.0: Auto-routing ----
+        actual_mode = request.mode
+        if request.mode == "auto":
+            try:
+                router = get_router()
+                db_manager = DatabaseManager(
+                    db_path=config.database.path,
+                    echo=config.database.echo,
+                )
+                
+                # 采集路由信号 (轻量级 DB 查询)
+                session_turn_count = 0
+                user_total_sessions = 0
+                user_total_messages = 0
+                has_preferences = False
+                preference_count = 0
+                
+                try:
+                    with db_manager.session_scope() as db:
+                        conv_repo = ConversationRepository(db)
+                        session_msgs = conv_repo.get_by_session(session_id, limit=200)
+                        session_turn_count = len(session_msgs) // 2  # 每轮 = user + assistant
+                        
+                        # 用户历史统计 (简化: 查询当前用户的偏好数量)
+                        pref_repo = UserPreferenceRepository(db)
+                        prefs = pref_repo.get_by_user(resolved_user_id, active_only=True)
+                        has_preferences = len(prefs) > 0
+                        preference_count = len(prefs)
+                except Exception as sig_err:
+                    logger.warning(f"Router signal collection failed: {sig_err}")
+                
+                decision = router.route(
+                    query=request.query,
+                    session_id=session_id,
+                    user_id=resolved_user_id,
+                    session_turn_count=session_turn_count,
+                    has_user_preferences=has_preferences,
+                    preference_count=preference_count,
+                    user_total_sessions=user_total_sessions,
+                    user_total_messages=user_total_messages,
+                    dki_available=True,
+                    rag_available=True,
+                )
+                
+                actual_mode = decision.mode.value
+                routing_decision_dict = decision.to_dict()
+                logger.info(
+                    f"[Auto-Router] {request.mode} → {actual_mode} "
+                    f"(conf={decision.confidence:.2f}, reason={decision.reason.value})"
+                )
+            except Exception as router_err:
+                logger.warning(f"Router failed, defaulting to dki: {router_err}")
+                actual_mode = "dki"
         
         try:
-            if request.mode == "dki":
+            if actual_mode == "dki":
                 dki = get_dki_system()
                 response = dki.chat(
                     query=request.query,
@@ -347,6 +420,19 @@ def create_app() -> FastAPI:
                     history_tokens = hybrid_info.get("history_tokens", 0)
                     lb = response.latency_breakdown
                     
+                    # v5.2: DKI 注入判定和 alpha 来源修正
+                    # injection_enabled: 有偏好或历史注入即为 True (不仅仅看门控)
+                    # alpha: 优先使用偏好配置 alpha (0.4), 而非门控 alpha (依赖记忆搜索)
+                    dki_injection_enabled = hybrid_info.get("enabled", False)
+                    dki_alpha = hybrid_info.get("preference_alpha", 0.0)
+                    # 如果门控也触发了注入 (有记忆), 取更高的 alpha
+                    gating_alpha = response.gating_decision.alpha if response.gating_decision else 0.0
+                    if gating_alpha > dki_alpha:
+                        dki_alpha = gating_alpha
+                    
+                    # v5.4: 提取 recall_v4 元数据
+                    recall_v4_info = response.metadata.get("recall_v4", {})
+                    
                     viz_data = {
                         "request_id": f"chat-dki-{uuid.uuid4().hex[:8]}",
                         "timestamp": datetime.utcnow().isoformat(),
@@ -354,8 +440,8 @@ def create_app() -> FastAPI:
                         "query": request.query,
                         "user_id": resolved_user_id,
                         "session_id": session_id,
-                        "injection_enabled": response.gating_decision.should_inject if response.gating_decision else False,
-                        "alpha": response.gating_decision.alpha if response.gating_decision else 0.0,
+                        "injection_enabled": dki_injection_enabled,
+                        "alpha": dki_alpha,
                         "preference_tokens": preference_tokens,
                         "history_tokens": history_tokens,
                         "query_tokens": max(0, response.input_tokens - preference_tokens - history_tokens),
@@ -372,6 +458,13 @@ def create_app() -> FastAPI:
                         "adapter_latency_ms": (lb.router_ms if lb else 0),
                         "injection_latency_ms": ((lb.kv_compute_ms + lb.projection_ms) if lb else 0),
                         "inference_latency_ms": ((lb.prefill_ms + lb.decode_ms) if lb else 0),
+                        # v5.4: Recall v4 多信号召回详情
+                        "recall_v4": recall_v4_info,
+                        "recall_strategy": recall_v4_info.get("strategy", ""),
+                        "trace_ids": recall_v4_info.get("trace_ids", []),
+                        "fact_rounds_used": recall_v4_info.get("fact_rounds_used", 0),
+                        "summary_count": recall_v4_info.get("summary_count", 0),
+                        "message_count": recall_v4_info.get("message_count", 0),
                     }
                     record_visualization(viz_data)
                 except Exception as viz_err:
@@ -379,13 +472,23 @@ def create_app() -> FastAPI:
                 
                 # Record statistics data
                 try:
+                    # v5.2: 统计 alpha 使用偏好配置值 (不仅仅看门控)
+                    _hybrid_info = response.metadata.get("hybrid_injection", {})
+                    _stat_alpha = _hybrid_info.get("preference_alpha", 0.0)
+                    _stat_injected = _hybrid_info.get("enabled", False)
                     record_dki_request(
                         cache_tier=response.cache_tier or "L3",
-                        alpha=response.gating_decision.alpha if response.gating_decision else 0.0,
-                        injected=response.gating_decision.should_inject if response.gating_decision else False,
+                        alpha=_stat_alpha,
+                        injected=_stat_injected,
                     )
                 except Exception:
                     pass
+                
+                # v5.2: alpha 优先使用偏好配置值
+                _resp_hybrid_info = response.metadata.get("hybrid_injection", {})
+                _resp_alpha = _resp_hybrid_info.get("preference_alpha", 0.0)
+                _gating_alpha = response.gating_decision.alpha if response.gating_decision else 0.0
+                _display_alpha = max(_resp_alpha, _gating_alpha)
                 
                 return ChatResponse(
                     response=response.text,
@@ -393,9 +496,10 @@ def create_app() -> FastAPI:
                     session_id=session_id,
                     latency_ms=response.latency_ms,
                     memories_used=[m.to_dict() for m in response.memories_used],
-                    alpha=response.gating_decision.alpha if response.gating_decision else None,
+                    alpha=_display_alpha,
                     cache_hit=response.cache_hit,
                     metadata=response.metadata,
+                    routing=routing_decision_dict,
                 )
                 
             elif request.mode == "rag":
@@ -451,6 +555,7 @@ def create_app() -> FastAPI:
                     latency_ms=response.latency_ms,
                     memories_used=[m.to_dict() for m in response.memories_used],
                     metadata=response.metadata,
+                    routing=routing_decision_dict,
                 )
                 
             else:  # baseline
@@ -466,10 +571,91 @@ def create_app() -> FastAPI:
                     session_id=session_id,
                     latency_ms=output.latency_ms,
                     memories_used=[],
+                    routing=routing_decision_dict,
                 )
                 
         except Exception as e:
             logger.error(f"Chat error: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    # ================================================================
+    # v6.0: 路由器管理 API
+    # ================================================================
+    
+    @app.get("/api/router/stats")
+    async def router_stats():
+        """获取路由器统计数据"""
+        try:
+            router = get_router()
+            return {
+                "enabled": router.config.enabled,
+                "stats": router.get_stats(),
+                "config": {
+                    "dki_threshold": router.config.dki_threshold,
+                    "rag_threshold": router.config.rag_threshold,
+                    "weights": {
+                        "history": router.config.weight_history,
+                        "preference": router.config.weight_preference,
+                        "trigger": router.config.weight_trigger,
+                        "session_depth": router.config.weight_session_depth,
+                        "cross_session": router.config.weight_cross_session,
+                    },
+                },
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    @app.post("/api/router/config")
+    async def update_router_config(config_update: Dict[str, Any]):
+        """动态更新路由器配置 (用于 A/B 测试)"""
+        try:
+            router = get_router()
+            router.update_config(**config_update)
+            return {"status": "ok", "updated_keys": list(config_update.keys())}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    @app.post("/api/router/test")
+    async def test_router(request: ChatRequest):
+        """测试路由决策 (不实际执行推理)"""
+        try:
+            router = get_router()
+            session_id = request.session_id or "test_session"
+            resolved_user_id = _resolve_user_id(request)
+            
+            # 简化信号采集
+            session_turn_count = 0
+            has_preferences = False
+            preference_count = 0
+            
+            try:
+                db_manager = DatabaseManager(
+                    db_path=config.database.path,
+                    echo=False,
+                )
+                with db_manager.session_scope() as db:
+                    conv_repo = ConversationRepository(db)
+                    session_msgs = conv_repo.get_by_session(session_id, limit=200)
+                    session_turn_count = len(session_msgs) // 2
+                    
+                    pref_repo = UserPreferenceRepository(db)
+                    prefs = pref_repo.get_by_user(resolved_user_id, active_only=True)
+                    has_preferences = len(prefs) > 0
+                    preference_count = len(prefs)
+            except Exception:
+                pass
+            
+            decision = router.route(
+                query=request.query,
+                session_id=session_id,
+                user_id=resolved_user_id,
+                session_turn_count=session_turn_count,
+                has_user_preferences=has_preferences,
+                preference_count=preference_count,
+            )
+            
+            return decision.to_dict()
+        except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
     
     @app.post("/api/memory", response_model=MemoryResponse)
@@ -1611,7 +1797,7 @@ def get_index_html() -> str:
                     query: query,
                     session_id: sessionId,
                     mode: currentMode,
-                    max_new_tokens: 256,
+                    max_new_tokens: 1024,
                     temperature: 0.7,
                     token: authToken,
                     user_id: currentUserId

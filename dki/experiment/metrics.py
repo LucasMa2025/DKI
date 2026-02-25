@@ -168,7 +168,7 @@ class MetricsCalculator:
         known_facts: Optional[List[str]] = None,
     ) -> Tuple[float, List[str]]:
         """
-        Estimate hallucination rate.
+        Estimate hallucination rate (aggregate).
         
         This is a simplified heuristic-based approach.
         For production, use model-based hallucination detection.
@@ -181,32 +181,146 @@ class MetricsCalculator:
         Returns:
             (hallucination_rate, detected_hallucinations)
         """
+        decomposed = self.compute_hallucination_decomposed(
+            response=response,
+            grounding_texts=grounding_texts,
+            known_facts=known_facts,
+        )
+        total_rate = decomposed['total_rate']
+        all_hallucinations = decomposed['fabricated_claims'] + decomposed['irrelevant_claims']
+        return total_rate, all_hallucinations
+
+    def compute_hallucination_decomposed(
+        self,
+        response: str,
+        grounding_texts: List[str],
+        known_facts: Optional[List[str]] = None,
+        query: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Decomposed hallucination analysis (论文 Table 1b).
+        
+        将幻觉分解为两类:
+        1. fabricated-detail: 编造细节型 — 响应包含具体数字、日期、地址等
+           细节，但在 grounding 文本中找不到支撑
+        2. irrelevant/off-topic: 无关/跑题型 — 响应内容与查询或 grounding
+           文本的主题不相关
+        
+        Args:
+            response: Generated response
+            grounding_texts: Source texts (memories, context)
+            known_facts: Additional known facts
+            query: Original query (用于 off-topic 检测)
+            
+        Returns:
+            Dict with:
+              - fabricated_rate: float
+              - irrelevant_rate: float  
+              - total_rate: float
+              - fabricated_claims: List[str]
+              - irrelevant_claims: List[str]
+              - total_claims: int
+        """
         # Combine grounding sources
         all_grounding = ' '.join(grounding_texts)
         if known_facts:
             all_grounding += ' ' + ' '.join(known_facts)
         
         grounding_lower = all_grounding.lower()
+        query_lower = (query or '').lower()
         
         # Extract claims from response
         claims = self._extract_claims(response)
         
         if not claims:
-            return 0.0, []
+            return {
+                'fabricated_rate': 0.0,
+                'irrelevant_rate': 0.0,
+                'total_rate': 0.0,
+                'fabricated_claims': [],
+                'irrelevant_claims': [],
+                'total_claims': 0,
+            }
         
-        hallucinations = []
+        fabricated_claims = []
+        irrelevant_claims = []
+        
         for claim in claims:
+            claim_lower = claim.lower()
             claim_keywords = self._extract_keywords(claim)
             if not claim_keywords:
                 continue
             
             # Check if claim is grounded
-            grounded = any(kw.lower() in grounding_lower for kw in claim_keywords)
-            if not grounded:
-                hallucinations.append(claim)
+            grounded_count = sum(1 for kw in claim_keywords if kw.lower() in grounding_lower)
+            grounded_ratio = grounded_count / len(claim_keywords) if claim_keywords else 0.0
+            
+            if grounded_ratio >= 0.3:
+                # Claim is at least partially grounded — not hallucination
+                continue
+            
+            # Determine hallucination type
+            has_specifics = self._has_specific_details(claim)
+            
+            if has_specifics:
+                # Contains specific numbers/dates/addresses but not grounded
+                fabricated_claims.append(claim)
+            else:
+                # No specific details, check if off-topic
+                # Off-topic: claim keywords don't overlap with query or grounding topic
+                topic_overlap = False
+                if query_lower:
+                    query_keywords = self._extract_keywords(query_lower)
+                    topic_overlap = any(
+                        kw.lower() in claim_lower for kw in query_keywords
+                    )
+                if not topic_overlap:
+                    # Also check grounding topic overlap
+                    grounding_keywords = self._extract_keywords(all_grounding)[:20]
+                    topic_overlap = any(
+                        kw.lower() in claim_lower for kw in grounding_keywords
+                    )
+                
+                if not topic_overlap:
+                    irrelevant_claims.append(claim)
+                else:
+                    # On-topic but ungrounded — classify as fabricated
+                    fabricated_claims.append(claim)
         
-        rate = len(hallucinations) / len(claims) if claims else 0.0
-        return rate, hallucinations
+        total_hallucinations = len(fabricated_claims) + len(irrelevant_claims)
+        
+        return {
+            'fabricated_rate': len(fabricated_claims) / len(claims) if claims else 0.0,
+            'irrelevant_rate': len(irrelevant_claims) / len(claims) if claims else 0.0,
+            'total_rate': total_hallucinations / len(claims) if claims else 0.0,
+            'fabricated_claims': fabricated_claims,
+            'irrelevant_claims': irrelevant_claims,
+            'total_claims': len(claims),
+        }
+    
+    def _has_specific_details(self, text: str) -> bool:
+        """
+        检测文本是否包含具体细节 (数字、日期、地址、价格等)。
+        
+        用于区分 fabricated-detail vs irrelevant hallucination。
+        """
+        # 数字 (电话、价格、数量等)
+        if re.search(r'\d{2,}', text):
+            return True
+        # 日期模式
+        if re.search(r'\d{4}[-/年]\d{1,2}[-/月]', text):
+            return True
+        # 地址关键词 + 具体信息
+        address_indicators = ['路', '街', '号', '区', '市', '省', 'street', 'road', 'avenue', 'blvd']
+        if any(ind in text.lower() for ind in address_indicators):
+            return True
+        # 价格模式
+        if re.search(r'[¥$€£]\s*\d+|[\d]+\s*[元块美元]', text):
+            return True
+        # 百分比
+        if re.search(r'\d+\.?\d*\s*%', text):
+            return True
+        return False
     
     def _extract_claims(self, text: str) -> List[str]:
         """Extract factual claims from text."""
@@ -215,7 +329,8 @@ class MetricsCalculator:
         
         # Filter for factual claims (simple heuristic)
         claims = []
-        fact_indicators = ['is', 'are', 'was', 'were', 'has', 'have', '是', '有']
+        fact_indicators = ['is', 'are', 'was', 'were', 'has', 'have', '是', '有',
+                          '在', '为', '于', '约', '大约', '位于', '包含', '提供']
         
         for sent in sentences:
             sent = sent.strip()

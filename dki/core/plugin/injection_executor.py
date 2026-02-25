@@ -363,7 +363,14 @@ class InjectionExecutor:
         self._stats["executions"] += 1
         
         try:
-            if plan.injection_enabled and plan.preference_text:
+            # v5.1: 注入条件扩展 — 只要有偏好或结构化历史, 就走注入路径
+            # 之前条件仅检查 preference_text, 导致有历史但无偏好时走 plain 路径
+            has_injectable_content = (
+                plan.injection_enabled
+                and (plan.preference_text or plan.history_items)
+            )
+            
+            if has_injectable_content:
                 # K/V 注入推理 (recall_v4 和 stable 共用)
                 # v3.3: 不再有 Fact Call 循环, Planner 已将事实内联到 plan.final_input
                 result = await self._execute_with_kv_injection(
@@ -392,7 +399,7 @@ class InjectionExecutor:
             logger.error(f"Execution failed: {e}")
             
             # 第一级降级: 尝试 stable 策略 (如果当前是 recall_v4)
-            if plan.strategy == "recall_v4" and plan.preference_text:
+            if plan.strategy == "recall_v4" and (plan.preference_text or plan.history_items):
                 logger.info("Falling back to stable strategy")
                 try:
                     return await self._execute_stable_fallback(
@@ -468,6 +475,155 @@ class InjectionExecutor:
         )
         return prefix
     
+    def _build_chat_template_prompt(
+        self,
+        system_content: str,
+        user_content: str,
+    ) -> str:
+        """
+        使用 tokenizer.apply_chat_template 构造符合官方标准的 prompt
+        
+        将偏好指令放入 system message, 将用户查询(含历史后缀)放入 user message,
+        确保 prompt 格式与模型训练时的 chat template 一致。
+        
+        注意: 此方法仅构造 system + user 两条消息,
+        不支持多轮历史。如需多轮历史, 请使用 _build_multiturn_chat_prompt。
+        
+        Args:
+            system_content: 系统级指令 (偏好前缀 + 记忆元数据等)
+            user_content: 用户级内容 (历史后缀 + 当前查询)
+            
+        Returns:
+            使用 chat template 格式化的完整 prompt
+        """
+        tokenizer = getattr(self.model, 'tokenizer', None)
+        
+        messages = []
+        if system_content:
+            messages.append({"role": "system", "content": system_content})
+        messages.append({"role": "user", "content": user_content})
+        
+        if tokenizer and hasattr(tokenizer, 'apply_chat_template'):
+            try:
+                return tokenizer.apply_chat_template(
+                    messages,
+                    add_generation_prompt=True,
+                    tokenize=False,
+                )
+            except Exception as e:
+                logger.warning(f"apply_chat_template failed in Executor: {e}")
+        
+        # 回退: 直接拼接 (adapter 层会检测并包装)
+        if system_content:
+            return system_content + "\n\n" + user_content
+        return user_content
+    
+    def _build_multiturn_chat_prompt(
+        self,
+        plan: InjectionPlan,
+        system_content: str = "",
+    ) -> str:
+        """
+        v5.1: 使用 chat template 构造正确的多轮对话格式 (修复角色混乱)
+        
+        之前的做法是将所有历史扁平化为单一 user message, 导致模型无法区分
+        历史中的 User/Assistant 角色。
+        
+        新做法:
+        1. 偏好信息 → system message
+        2. plan.history_items (AdapterChatMessage) → 独立的 user/assistant messages
+        3. 当前查询 → 最后一个 user message
+        4. 通过 tokenizer.apply_chat_template 生成正确的多轮 prompt
+        
+        回退策略: 如果没有 tokenizer 或 apply_chat_template 失败,
+        使用 ChatML 格式 (兼容 DeepSeek/Qwen)。
+        
+        Args:
+            plan: InjectionPlan, 包含 history_items, original_query, preference_text 等
+            system_content: 系统级指令 (偏好前缀 + 元数据), 若为空则从 plan 构造
+            
+        Returns:
+            格式化后的完整 prompt (已含 chat template 特殊标记)
+        """
+        tokenizer = getattr(self.model, 'tokenizer', None)
+        
+        # ============ 1. System message ============
+        if not system_content and plan.preference_text:
+            alpha = plan.alpha_profile.effective_preference_alpha
+            if alpha >= 0.7:
+                strength = "严格遵循以下用户偏好"
+            elif alpha >= 0.4:
+                strength = "适当参考以下用户偏好"
+            else:
+                strength = "轻微参考以下用户偏好（可酌情忽略）"
+            system_content = f"请{strength}:\n{plan.preference_text}"
+        
+        # ============ 2. 构造 messages 列表 ============
+        messages = []
+        if system_content:
+            messages.append({"role": "system", "content": system_content})
+        
+        # 添加历史消息 (保留原始角色)
+        # 注入标记列表 (assistant 消息中包含这些标记时应过滤)
+        _injection_markers = [
+            "[会话历史参考]", "[Session History Reference]",
+            "[会话历史结束]", "[End of Session History]",
+            "[AI助手]",
+            "[DMI 记忆状态]", "[DMI 记忆状态结束]",
+            "[DMI Memory Context]", "[DMI Memory Context End]",
+        ]
+        
+        for item in plan.history_items:
+            role = getattr(item, 'role', 'user') or 'user'
+            content = getattr(item, 'content', str(item))
+            
+            # 确保 role 是标准角色
+            if role not in ('user', 'assistant', 'system'):
+                role = 'user'
+            
+            # 过滤包含注入标记的 assistant 消息 (防止递归注入)
+            if role == 'assistant' and any(m in content for m in _injection_markers):
+                continue
+            
+            if content and content.strip():
+                messages.append({"role": role, "content": content})
+        
+        # 添加当前用户查询 (始终是最后一个 user message)
+        messages.append({"role": "user", "content": plan.original_query})
+        
+        history_count = len(plan.history_items)
+        
+        # ============ 3. 使用 apply_chat_template 格式化 ============
+        if tokenizer and hasattr(tokenizer, 'apply_chat_template'):
+            try:
+                formatted = tokenizer.apply_chat_template(
+                    messages,
+                    add_generation_prompt=True,
+                    tokenize=False,
+                )
+                logger.debug(
+                    f"Multiturn chat prompt built: "
+                    f"{len(messages)} messages, "
+                    f"{history_count} history items, "
+                    f"system={'yes' if system_content else 'no'}"
+                )
+                return formatted
+            except Exception as e:
+                logger.warning(f"apply_chat_template failed in multiturn: {e}")
+        
+        # ============ 回退: ChatML 格式 (DeepSeek/Qwen 通用) ============
+        parts = []
+        for msg in messages:
+            parts.append(f"<|im_start|>{msg['role']}\n{msg['content']}<|im_end|>")
+        parts.append("<|im_start|>assistant")
+        
+        formatted = "\n".join(parts) + "\n"
+        logger.debug(
+            f"Multiturn chat prompt built (ChatML fallback): "
+            f"{len(messages)} messages, {history_count} history items"
+        )
+        return formatted
+    
     async def _execute_with_kv_injection(
         self,
         plan: InjectionPlan,
@@ -483,6 +639,10 @@ class InjectionExecutor:
           vLLM prefix_caching 自动复用相同偏好的 KV Cache,
           不需要 compute_kv, 不加载 HF 模型
         - 非 vLLM 适配器 (LLaMA/DeepSeek/GLM): 原有 HF 模型 KV 注入
+        
+        Chat Template 处理:
+        - vLLM 路径: 使用 apply_chat_template 将偏好放入 system, 查询放入 user
+        - HF 路径: adapter 层负责 chat template 包装
         
         历史: 由 recall_v4 后缀组装 (已包含在 plan.final_input 中)
         安全: 使用 InferenceContextGuard 确保推理上下文隔离
@@ -500,16 +660,29 @@ class InjectionExecutor:
             result.preference_cache_hit = False
             result.preference_cache_tier = "vllm_prefix_caching"
             
-            # 构造带偏好前缀的 prompt
-            prompt_with_prefix = plan.final_input
-            if plan.preference_text and alpha > 0.1:
-                prompt_with_prefix = self._build_preference_prefix(
-                    plan.preference_text, alpha
-                ) + plan.final_input
+            # v5.1: 如果有结构化历史消息, 使用多轮 chat template (修复角色混乱)
+            if plan.history_items:
+                prompt_with_prefix = self._build_multiturn_chat_prompt(plan=plan)
+            else:
+                # 无历史消息时, 使用简单的 system + user 格式
+                system_content = ""
+                if plan.preference_text and alpha > 0.1:
+                    if alpha >= 0.7:
+                        strength = "严格遵循以下用户偏好"
+                    elif alpha >= 0.4:
+                        strength = "适当参考以下用户偏好"
+                    else:
+                        strength = "轻微参考以下用户偏好（可酌情忽略）"
+                    system_content = f"请{strength}:\n{plan.preference_text}"
+                
+                prompt_with_prefix = self._build_chat_template_prompt(
+                    system_content=system_content,
+                    user_content=plan.final_input,
+                )
             
             inference_start = time.time()
             
-            # vLLM 原生推理: prompt 已含偏好前缀, prefix_caching 自动复用 KV
+            # vLLM 原生推理: prompt 已含 chat template, prefix_caching 自动复用 KV
             output = self.model.forward_with_kv_injection(
                 prompt=prompt_with_prefix,
                 injected_kv=[],           # 不使用
@@ -693,16 +866,30 @@ class InjectionExecutor:
             result.preference_cache_hit = False
             result.preference_cache_tier = "vllm_prefix_caching"
             
-            # 将偏好前缀拼接到 stable_input 前面
-            if plan.preference_text and alpha > 0.1:
-                stable_input = self._build_preference_prefix(
-                    plan.preference_text, alpha
-                ) + stable_input
+            # v5.1: 如果有结构化历史消息, 使用多轮 chat template
+            if plan.history_items:
+                stable_prompt = self._build_multiturn_chat_prompt(plan=plan)
+            else:
+                # 使用 chat template 构造 prompt (偏好 → system, 查询 → user)
+                system_content = ""
+                if plan.preference_text and alpha > 0.1:
+                    if alpha >= 0.7:
+                        strength = "严格遵循以下用户偏好"
+                    elif alpha >= 0.4:
+                        strength = "适当参考以下用户偏好"
+                    else:
+                        strength = "轻微参考以下用户偏好（可酌情忽略）"
+                    system_content = f"请{strength}:\n{plan.preference_text}"
+                
+                stable_prompt = self._build_chat_template_prompt(
+                    system_content=system_content,
+                    user_content=stable_input,
+                )
             
             inference_start = time.time()
             
             output = self.model.forward_with_kv_injection(
-                prompt=stable_input,
+                prompt=stable_prompt,
                 injected_kv=[],
                 alpha=alpha,
                 max_new_tokens=max_new_tokens,

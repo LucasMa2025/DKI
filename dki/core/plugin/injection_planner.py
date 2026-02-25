@@ -341,6 +341,8 @@ class InjectionPlanner:
                     plan.history_suffix = self._format_history_suffix(relevant_history)
                     plan.relevant_history_count = len(relevant_history)
                     plan.history_tokens = self._estimate_tokens(plan.history_suffix)
+                    # v5.1: 填充结构化历史消息, 用于 Executor 构造多轮 chat template
+                    plan.history_items = relevant_history
         elif strategy == "stable" or not (self._multi_signal_recall and self._suffix_builder):
             # ============ Stable 策略: 平铺历史后缀 ============
             plan.strategy = "stable"
@@ -349,6 +351,8 @@ class InjectionPlanner:
                 plan.relevant_history_count = len(relevant_history)
                 plan.history_tokens = self._estimate_tokens(plan.history_suffix)
                 plan.recall_strategy = "flat_history"
+                # v5.1: 填充结构化历史消息, 用于 Executor 构造多轮 chat template
+                plan.history_items = relevant_history
         
         # ============ Step 2.5: Planner-only Fact Resolution (v3.3) ============
         # 如果 recall_v4 产生了 summary 条目 (has_fact_call_instruction),
@@ -491,6 +495,14 @@ class InjectionPlanner:
                 plan.message_count = assembled.message_count
                 plan.trace_ids = assembled.trace_ids
                 plan.has_fact_call_instruction = assembled.has_fact_call_instruction
+                
+                # v5.1: 填充结构化历史条目, 用于 Executor 构造多轮 chat template
+                # 优先使用 assembled.items (HistoryItem 列表, 含角色信息)
+                # 回退: 使用原始 recall_result.messages
+                if hasattr(assembled, 'items') and assembled.items:
+                    plan.history_items = assembled.items
+                else:
+                    plan.history_items = recall_result.messages
             
             self._stats["recall_v4_plans"] += 1
             

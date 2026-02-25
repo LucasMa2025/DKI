@@ -79,10 +79,43 @@ class DeepSeekAdapter(BaseModelAdapter):
             logger.error(f"Failed to load DeepSeek model: {e}")
             raise
     
-    def _format_prompt(self, prompt: str) -> str:
-        """Format prompt for DeepSeek chat model."""
-        # DeepSeek chat format
-        return f"User: {prompt}\n\nAssistant:"
+    def _format_prompt(self, prompt: str, system_prompt: Optional[str] = None) -> str:
+        """
+        Format prompt for DeepSeek chat model using official chat template.
+        
+        Official DeepSeek chat template (ChatML format):
+            <|im_start|>system
+            {system_prompt}<|im_end|>
+            <|im_start|>user
+            {user_input}<|im_end|>
+            <|im_start|>assistant
+        
+        优先使用 tokenizer.apply_chat_template (确保与模型训练时一致),
+        如果 tokenizer 不支持则使用手动构造的标准 ChatML 模板。
+        """
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
+        
+        # 优先使用 tokenizer 内置的 chat template
+        if hasattr(self.tokenizer, 'apply_chat_template'):
+            try:
+                return self.tokenizer.apply_chat_template(
+                    messages,
+                    add_generation_prompt=True,
+                    tokenize=False,
+                )
+            except Exception as e:
+                logger.warning(f"apply_chat_template failed, using manual template: {e}")
+        
+        # 回退: 手动构造 DeepSeek 官方 ChatML 模板
+        parts = []
+        if system_prompt:
+            parts.append(f"<|im_start|>system\n{system_prompt}<|im_end|>")
+        parts.append(f"<|im_start|>user\n{prompt}<|im_end|>")
+        parts.append("<|im_start|>assistant")
+        return "\n".join(parts) + "\n"
     
     def generate(
         self,
@@ -98,8 +131,11 @@ class DeepSeekAdapter(BaseModelAdapter):
         
         start_time = time.perf_counter()
         
-        # Format prompt if it's a chat model
-        if 'chat' in self.model_name.lower():
+        # Format prompt using official chat template
+        # 跳过已经包含 chat template 特殊标记的 prompt (避免双重包装)
+        if self._has_chat_template_tokens(prompt):
+            formatted_prompt = prompt
+        elif 'chat' in self.model_name.lower() or 'instruct' in self.model_name.lower():
             formatted_prompt = self._format_prompt(prompt)
         else:
             formatted_prompt = prompt
@@ -130,6 +166,19 @@ class DeepSeekAdapter(BaseModelAdapter):
             input_tokens=input_ids.shape[1],
             output_tokens=len(new_tokens),
         )
+    
+    def _has_chat_template_tokens(self, text: str) -> bool:
+        """检测文本是否已包含 chat template 特殊标记 (避免双重包装)"""
+        # DeepSeek/Qwen ChatML 标记
+        if '<|im_start|>' in text:
+            return True
+        # Llama 3 标记
+        if '<|begin_of_text|>' in text or '<|start_header_id|>' in text:
+            return True
+        # Llama 2 标记
+        if '[INST]' in text:
+            return True
+        return False
     
     def embed(self, text: str) -> torch.Tensor:
         """Get embeddings for text."""
@@ -210,8 +259,11 @@ class DeepSeekAdapter(BaseModelAdapter):
         
         start_time = time.perf_counter()
         
-        # Format prompt
-        if 'chat' in self.model_name.lower():
+        # Format prompt using official chat template
+        # 跳过已经包含 chat template 特殊标记的 prompt (避免双重包装)
+        if self._has_chat_template_tokens(prompt):
+            formatted_prompt = prompt
+        elif 'chat' in self.model_name.lower() or 'instruct' in self.model_name.lower():
             formatted_prompt = self._format_prompt(prompt)
         else:
             formatted_prompt = prompt

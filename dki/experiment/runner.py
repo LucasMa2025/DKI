@@ -664,9 +664,10 @@ class ExperimentRunner:
                 elif mode == 'rag':
                     self.rag_system.add_memory(session_id, mem)
             
-            # DKI mode: also write personas as user preferences so
-            # DKISystem._load_user_preferences_from_db() can find them
-            if mode == 'dki' and item.get('personas'):
+            # v5.3: 为 DKI 和 RAG 都写入偏好 (确保对比公平)
+            # DKI: _load_user_preferences_from_db() 加载
+            # RAG: _load_user_preferences() 加载 (v5.3 新增)
+            if item.get('personas'):
                 self._write_session_preferences(user_id, item['personas'])
             
             queries = self._extract_queries(item)
@@ -743,6 +744,13 @@ class ExperimentRunner:
                 
                 # 构造 DKI 注入信息
                 hybrid_info = response.metadata.get('hybrid_injection', {})
+                # v5.1: 使用 preference_alpha 而非 gating_decision.alpha
+                # gating_decision.alpha 是记忆路由 (MemoryRouter) 的 alpha,
+                # preference_alpha 是偏好注入的实际 alpha (来自配置)
+                pref_alpha = hybrid_info.get(
+                    'preference_alpha',
+                    response.gating_decision.alpha if response.gating_decision else 0.0,
+                )
                 injection_info = InjectionInfo(
                     mode='dki',
                     original_query=query,
@@ -752,7 +760,7 @@ class ExperimentRunner:
                     history_tokens=hybrid_info.get('history_tokens', 0),
                     history_messages=hybrid_info.get('history_messages', []),
                     final_input=hybrid_info.get('final_input', query),
-                    alpha=response.gating_decision.alpha,
+                    alpha=pref_alpha,
                 )
                 
                 return ExperimentResult(
@@ -763,7 +771,7 @@ class ExperimentRunner:
                     response=response.text,
                     latency_ms=response.latency_ms,
                     memories_used=[m.memory_id for m in response.memories_used],
-                    alpha=response.gating_decision.alpha,
+                    alpha=pref_alpha,
                     cache_hit=response.cache_hit,
                     injection_info=injection_info,
                 )
@@ -889,19 +897,32 @@ class ExperimentRunner:
                 'std': float(np.std(recall_scores)),
             }
         
-        # Hallucination rate (heuristic)
-        hallucination_rates = []
+        # Hallucination rate — decomposed (论文 Table 1b)
+        fabricated_rates = []
+        irrelevant_rates = []
+        total_halluc_rates = []
         for r in valid_results:
             if r.memories_used:
-                h_rate, _ = self.metrics.compute_hallucination_rate(
+                decomposed = self.metrics.compute_hallucination_decomposed(
                     response=r.response,
                     grounding_texts=r.memories_used,
+                    query=r.query,
                 )
-                hallucination_rates.append(h_rate)
-        if hallucination_rates:
+                fabricated_rates.append(decomposed['fabricated_rate'])
+                irrelevant_rates.append(decomposed['irrelevant_rate'])
+                total_halluc_rates.append(decomposed['total_rate'])
+        if total_halluc_rates:
             metrics['hallucination'] = {
-                'mean_rate': float(np.mean(hallucination_rates)),
-                'std_rate': float(np.std(hallucination_rates)),
+                'mean_rate': float(np.mean(total_halluc_rates)),
+                'std_rate': float(np.std(total_halluc_rates)),
+                'fabricated_detail': {
+                    'mean_rate': float(np.mean(fabricated_rates)),
+                    'std_rate': float(np.std(fabricated_rates)),
+                },
+                'irrelevant_offtopic': {
+                    'mean_rate': float(np.mean(irrelevant_rates)),
+                    'std_rate': float(np.std(irrelevant_rates)),
+                },
             }
         
         # Response length statistics
@@ -954,19 +975,22 @@ class ExperimentRunner:
         setup_users: bool = True,
     ) -> Dict[str, Any]:
         """
-        Run α sensitivity analysis.
+        Run α sensitivity analysis — 对齐论文 Table 4
         
         Tests DKI performance across different α values.
         
-        改进: 使用数据库中的实验用户偏好，确保偏好 K/V 注入在不同 α 下生效。
+        指标 (每个 α):
+        - BLEU-4, ROUGE-L: 文本生成质量
+        - Memory Recall: 记忆召回率
+        - Fabricated Halluc: 编造细节型幻觉率
+        - Latency: 延迟统计
         """
         self._ensure_systems()
         
-        # 设置实验用户
         if setup_users and not hasattr(self, '_experiment_user_map'):
             self.setup_experiment_users()
         
-        alpha_values = alpha_values or [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+        alpha_values = alpha_values or [0.0, 0.3, 0.4, 0.5, 0.6, 0.7, 1.0]
         
         logger.info(f"Running α sensitivity analysis with values: {alpha_values}")
         
@@ -987,13 +1011,9 @@ class ExperimentRunner:
             'results_by_alpha': {},
         }
         
-        # 使用第一个实验用户 (alpha 实验关注注入强度，用户一致即可)
         user_id = self._get_first_experiment_user_id()
-        
-        # 每个 alpha 值使用独立 session，避免历史累积
         base_ts = int(time.time())
         
-        # Test each alpha
         for alpha_idx, alpha in enumerate(alpha_values):
             alpha_results = []
             session_id = f"alpha_exp_{base_ts}_{alpha_idx}"
@@ -1008,25 +1028,98 @@ class ExperimentRunner:
                 if not query:
                     continue
                 
-                response = self.dki_system.chat(
-                    query=query,
-                    session_id=session_id,
-                    user_id=user_id,
-                    force_alpha=alpha,
-                )
-                
-                alpha_results.append({
-                    'query': query,
-                    'response': response.text,
-                    'latency_ms': response.latency_ms,
-                    'actual_alpha': response.gating_decision.alpha,
-                })
+                try:
+                    response = self.dki_system.chat(
+                        query=query,
+                        session_id=session_id,
+                        user_id=user_id,
+                        force_alpha=alpha,
+                    )
+                    
+                    response_text = response.text
+                    
+                    # Memory recall
+                    relevant = item.get('relevant_memories', item.get('personas', []))
+                    recall_score = 0.0
+                    if relevant:
+                        recall_score, _ = self.metrics.compute_memory_recall(
+                            expected_memories=relevant,
+                            response=response_text,
+                            threshold=0.3,
+                        )
+                    
+                    # Decomposed hallucination
+                    grounding = relevant if relevant else [query]
+                    if 'memory' in item:
+                        grounding = grounding + [item['memory']]
+                    halluc = self.metrics.compute_hallucination_decomposed(
+                        response=response_text,
+                        grounding_texts=grounding,
+                        query=query,
+                    )
+                    
+                    # BLEU / ROUGE
+                    reference = item.get('reference_answer', '')
+                    bleu = 0.0
+                    rouge_l = 0.0
+                    if reference:
+                        bleu = self.metrics.compute_bleu(reference, response_text)
+                        rouge_scores = self.metrics.compute_rouge(reference, response_text)
+                        rouge_l = rouge_scores.get('rougeL', 0.0)
+                    
+                    # v5.1: 从 hybrid_injection metadata 获取 preference_alpha
+                    _hi = response.metadata.get('hybrid_injection', {})
+                    _actual_alpha = _hi.get(
+                        'preference_alpha',
+                        response.gating_decision.alpha if response.gating_decision else 0.0,
+                    )
+                    alpha_results.append({
+                        'query': query,
+                        'response': response_text[:300],
+                        'latency_ms': response.latency_ms,
+                        'actual_alpha': _actual_alpha,
+                        'memory_recall': recall_score,
+                        'fabricated_halluc': halluc['fabricated_rate'],
+                        'irrelevant_halluc': halluc['irrelevant_rate'],
+                        'bleu4': bleu,
+                        'rouge_l': rouge_l,
+                    })
+                except Exception as e:
+                    logger.error(f"Alpha sensitivity query failed (α={alpha}): {e}")
             
+            # Per-alpha statistics — aligned with paper Table 4
+            import numpy as np
             latencies = [r['latency_ms'] for r in alpha_results]
+            recalls = [r['memory_recall'] for r in alpha_results]
+            fab_halluc = [r['fabricated_halluc'] for r in alpha_results]
+            bleu_scores = [r['bleu4'] for r in alpha_results]
+            rouge_scores = [r['rouge_l'] for r in alpha_results]
+            
             results['results_by_alpha'][str(alpha)] = {
                 'samples': alpha_results,
                 'latency_stats': self.metrics.compute_latency_stats(latencies),
+                'bleu4_mean': float(np.mean(bleu_scores)) if bleu_scores else 0.0,
+                'rouge_l_mean': float(np.mean(rouge_scores)) if rouge_scores else 0.0,
+                'memory_recall_mean': float(np.mean(recalls)) if recalls else 0.0,
+                'fabricated_halluc_mean': float(np.mean(fab_halluc)) if fab_halluc else 0.0,
             }
+        
+        # Summary table (aligned with paper Table 4)
+        summary_table = []
+        for alpha in alpha_values:
+            key = str(alpha)
+            if key not in results['results_by_alpha']:
+                continue
+            r = results['results_by_alpha'][key]
+            summary_table.append({
+                'alpha': alpha,
+                'bleu4': r['bleu4_mean'],
+                'rouge_l': r['rouge_l_mean'],
+                'memory_recall': r['memory_recall_mean'],
+                'fabricated_halluc': r['fabricated_halluc_mean'],
+                'latency_p50': r['latency_stats'].get('p50', 0),
+            })
+        results['summary_table'] = summary_table
         
         # Save results
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1035,6 +1128,13 @@ class ExperimentRunner:
             json.dump(results, f, ensure_ascii=False, indent=2)
         
         logger.info(f"α sensitivity results saved to {filepath}")
+        for row in summary_table:
+            logger.info(
+                f"  α={row['alpha']}: BLEU4={row['bleu4']:.3f}, "
+                f"ROUGE-L={row['rouge_l']:.3f}, "
+                f"Recall={row['memory_recall']:.3f}, "
+                f"FabHalluc={row['fabricated_halluc']:.3f}"
+            )
         return results
     
     def run_latency_comparison(
@@ -1189,9 +1289,8 @@ class ExperimentRunner:
                 # 获取该 session 对应的实验用户 ID
                 user_id = self._get_experiment_user_id(session_data)
                 
-                # 为该 session 动态写入 personas 作为偏好 (确保 DKI 偏好注入生效)
-                if mode == 'dki':
-                    self._write_session_preferences(user_id, session_data.get('personas', []))
+                # v5.3: 为 DKI 和 RAG 都写入偏好 (确保对比公平)
+                self._write_session_preferences(user_id, session_data.get('personas', []))
                 
                 # Add memories
                 for mem in session_data['personas']:
@@ -1428,9 +1527,8 @@ class ExperimentRunner:
         session_id = f"exp_{mode}_{session_type}_{session_data.get('session_id', int(time.time()))}"
         user_id = self._get_experiment_user_id(session_data)
         
-        # 为 DKI 模式写入偏好
-        if mode == 'dki':
-            self._write_session_preferences(user_id, session_data.get('personas', []))
+        # v5.3: 为 DKI 和 RAG 都写入偏好 (确保对比公平)
+        self._write_session_preferences(user_id, session_data.get('personas', []))
         
         # 添加 memories
         system = self.dki_system if mode == 'dki' else self.rag_system
@@ -1458,6 +1556,11 @@ class ExperimentRunner:
                     
                     # 构造注入信息
                     hybrid_info = response.metadata.get('hybrid_injection', {})
+                    # v5.1: 使用 preference_alpha
+                    turn_pref_alpha = hybrid_info.get(
+                        'preference_alpha',
+                        response.gating_decision.alpha if response.gating_decision else 0.0,
+                    )
                     injection_info = InjectionInfo(
                         mode='dki',
                         original_query=query,
@@ -1467,7 +1570,7 @@ class ExperimentRunner:
                         history_tokens=hybrid_info.get('history_tokens', 0),
                         history_messages=hybrid_info.get('history_messages', []),
                         final_input=hybrid_info.get('final_input', query),
-                        alpha=response.gating_decision.alpha if response.gating_decision else 0.0,
+                        alpha=turn_pref_alpha,
                     )
                 else:
                     response = self.rag_system.chat(
@@ -1531,23 +1634,25 @@ class ExperimentRunner:
         setup_users: bool = True,
     ) -> Dict[str, Any]:
         """
-        运行消融实验
+        运行消融实验 — 对齐论文 Table 3 的 7 种配置
         
         测试 DKI 各组件的独立贡献:
-        - full_dki: 完整 DKI (偏好 K/V + 历史后缀 + 门控)
-        - no_gating: 无门控 (固定 α=1.0)
-        - rag_baseline: RAG 对照
-        - no_memory: 无记忆基线
+        - full_dki:              完整 DKI (Recall v4 全部组件)
+        - wo_fact_call:          去除 Fact Call (禁用 retrieve_fact 循环)
+        - wo_multi_signal:       去除多信号召回 (仅用向量检索)
+        - wo_kv_injection:       去除 K/V 注入 (偏好放入 prompt)
+        - stable_fallback_only:  仅 Stable 策略 (偏好 K/V + 固定 N 轮窗口)
+        - rag_baseline:          RAG 对照
+        - vanilla_llm:           无记忆基线
         
-        改进: 使用数据库中的实验用户偏好。
+        指标: memory_recall, fabricated_halluc, irrelevant_halluc, latency, BLEU/ROUGE
         """
         self._ensure_systems()
         
-        # 设置实验用户
         if setup_users and not hasattr(self, '_experiment_user_map'):
             self.setup_experiment_users()
         
-        logger.info("Running ablation study")
+        logger.info("Running ablation study (7 variants aligned with paper Table 3)")
         
         # Load data
         if data_path:
@@ -1564,29 +1669,68 @@ class ExperimentRunner:
                 gen = ExperimentDataGenerator("./data")
                 data = gen.generate_ablation_data()
         
+        # 消融配置 — 对齐论文 Table 3
+        # allow_fact_call: 是否启用 retrieve_fact() 循环
+        # recall_mode: 'multi_signal' | 'vector_only' | 'stable' | None
+        # use_kv_injection: 是否使用 K/V 注入 (False → 偏好放入 prompt)
+        # system: 'dki' | 'rag' | 'baseline'
         ablation_configs = {
-            'full_dki': {'system': 'dki', 'force_alpha': None, 'use_memory': True},
-            'no_gating': {'system': 'dki', 'force_alpha': 1.0, 'use_memory': True},
-            'rag_baseline': {'system': 'rag', 'force_alpha': None, 'use_memory': True},
-            'no_memory': {'system': 'dki', 'force_alpha': None, 'use_memory': False},
+            'full_dki': {
+                'system': 'dki', 'force_alpha': 0.4, 'use_memory': True,
+                'allow_fact_call': True, 'recall_mode': 'multi_signal',
+                'use_kv_injection': True,
+            },
+            'wo_fact_call': {
+                'system': 'dki', 'force_alpha': 0.4, 'use_memory': True,
+                'allow_fact_call': False, 'recall_mode': 'multi_signal',
+                'use_kv_injection': True,
+            },
+            'wo_multi_signal': {
+                'system': 'dki', 'force_alpha': 0.4, 'use_memory': True,
+                'allow_fact_call': True, 'recall_mode': 'vector_only',
+                'use_kv_injection': True,
+            },
+            'wo_kv_injection': {
+                'system': 'dki', 'force_alpha': 0.4, 'use_memory': True,
+                'allow_fact_call': True, 'recall_mode': 'multi_signal',
+                'use_kv_injection': False,
+            },
+            'stable_fallback_only': {
+                'system': 'dki', 'force_alpha': 0.4, 'use_memory': True,
+                'allow_fact_call': False, 'recall_mode': 'stable',
+                'use_kv_injection': True,
+            },
+            'rag_baseline': {
+                'system': 'rag', 'force_alpha': None, 'use_memory': True,
+                'allow_fact_call': False, 'recall_mode': None,
+                'use_kv_injection': False,
+            },
+            'vanilla_llm': {
+                'system': 'baseline', 'force_alpha': None, 'use_memory': False,
+                'allow_fact_call': False, 'recall_mode': None,
+                'use_kv_injection': False,
+            },
         }
         
         results = {mode: {'samples': [], 'latencies': []} for mode in ablation_configs}
         
-        # 获取实验用户 ID (v3.1: 使用数据库中实际存在的用户)
         user_id = self._get_first_experiment_user_id()
         
         for ablation_mode, config in ablation_configs.items():
             logger.info(f"Running ablation: {ablation_mode}")
             
             session_id = f"ablation_{ablation_mode}_{int(time.time())}"
-            system = self.dki_system if config['system'] == 'dki' else self.rag_system
             
-            # Add memories if applicable
+            # Add memories for applicable modes
             if config['use_memory']:
-                for item in data[:30]:
-                    if 'memory' in item:
-                        system.add_memory(session_id, item['memory'])
+                if config['system'] == 'rag':
+                    for item in data[:30]:
+                        if 'memory' in item:
+                            self.rag_system.add_memory(session_id, item['memory'])
+                elif config['system'] == 'dki':
+                    for item in data[:30]:
+                        if 'memory' in item:
+                            self.dki_system.add_memory(session_id, item['memory'])
             
             for item in tqdm(data[:30], desc=f"Ablation ({ablation_mode})"):
                 query = item.get('query', '')
@@ -1594,17 +1738,34 @@ class ExperimentRunner:
                     continue
                 
                 try:
+                    response_text = ""
+                    latency = 0.0
+                    
                     if config['system'] == 'dki':
-                        response = self.dki_system.chat(
-                            query=query,
-                            session_id=session_id,
-                            user_id=user_id,
-                            force_alpha=config.get('force_alpha'),
-                            allow_injection=config['use_memory'],
-                        )
+                        # 构造 DKI 请求参数
+                        dki_kwargs = {
+                            'query': query,
+                            'session_id': session_id,
+                            'user_id': user_id,
+                            'force_alpha': config.get('force_alpha'),
+                        }
+                        # 消融控制参数
+                        if not config.get('use_kv_injection'):
+                            dki_kwargs['force_alpha'] = 0.0  # 禁用 KV 注入
+                        if not config.get('use_memory'):
+                            dki_kwargs['allow_injection'] = False
+                        if config.get('recall_mode') == 'stable':
+                            dki_kwargs['force_strategy'] = 'stable'
+                        elif config.get('recall_mode') == 'vector_only':
+                            dki_kwargs['force_strategy'] = 'vector_only'
+                        if not config.get('allow_fact_call'):
+                            dki_kwargs['disable_fact_call'] = True
+                        
+                        response = self.dki_system.chat(**dki_kwargs)
                         response_text = response.text
                         latency = response.latency_ms
-                    else:
+                        
+                    elif config['system'] == 'rag':
                         response = self.rag_system.chat(
                             query=query,
                             session_id=session_id,
@@ -1612,8 +1773,17 @@ class ExperimentRunner:
                         )
                         response_text = response.text
                         latency = response.latency_ms
+                        
+                    else:  # baseline / vanilla
+                        output = self.dki_system.model.generate(
+                            prompt=query,
+                            max_new_tokens=256,
+                            temperature=0.7,
+                        )
+                        response_text = output.text
+                        latency = output.latency_ms
                     
-                    # Check memory recall
+                    # Memory recall
                     relevant = item.get('relevant_memories', [])
                     recall_score = 0.0
                     if relevant:
@@ -1623,27 +1793,65 @@ class ExperimentRunner:
                             threshold=0.3,
                         )
                     
+                    # Decomposed hallucination
+                    grounding = item.get('relevant_memories', [])
+                    if 'memory' in item:
+                        grounding = grounding + [item['memory']]
+                    halluc = self.metrics.compute_hallucination_decomposed(
+                        response=response_text,
+                        grounding_texts=grounding if grounding else [query],
+                        query=query,
+                    )
+                    
+                    # BLEU / ROUGE (if reference available)
+                    reference = item.get('reference_answer', '')
+                    bleu = 0.0
+                    rouge_l = 0.0
+                    if reference:
+                        bleu = self.metrics.compute_bleu(reference, response_text)
+                        rouge_scores = self.metrics.compute_rouge(reference, response_text)
+                        rouge_l = rouge_scores.get('rougeL', 0.0)
+                    
                     results[ablation_mode]['samples'].append({
                         'query': query,
-                        'response': response_text,
+                        'response': response_text[:500],
                         'latency_ms': latency,
                         'memory_recall': recall_score,
+                        'fabricated_halluc': halluc['fabricated_rate'],
+                        'irrelevant_halluc': halluc['irrelevant_rate'],
+                        'total_halluc': halluc['total_rate'],
+                        'bleu4': bleu,
+                        'rouge_l': rouge_l,
                     })
                     results[ablation_mode]['latencies'].append(latency)
                     
                 except Exception as e:
                     logger.error(f"Ablation query failed ({ablation_mode}): {e}")
         
-        # Compute summaries
+        # Compute summaries — aligned with paper Table 3
         import numpy as np
         summary = {}
         for mode, mode_results in results.items():
-            recalls = [s['memory_recall'] for s in mode_results['samples']]
+            if mode == 'summary':
+                continue
+            samples = mode_results['samples']
             latencies = mode_results['latencies']
             
+            recalls = [s['memory_recall'] for s in samples]
+            fab_rates = [s['fabricated_halluc'] for s in samples]
+            irr_rates = [s['irrelevant_halluc'] for s in samples]
+            total_halluc = [s['total_halluc'] for s in samples]
+            bleu_scores = [s['bleu4'] for s in samples]
+            rouge_scores = [s['rouge_l'] for s in samples]
+            
             summary[mode] = {
-                'sample_count': len(mode_results['samples']),
-                'mean_recall': float(np.mean(recalls)) if recalls else 0.0,
+                'sample_count': len(samples),
+                'memory_recall': float(np.mean(recalls)) if recalls else 0.0,
+                'fabricated_halluc_rate': float(np.mean(fab_rates)) if fab_rates else 0.0,
+                'irrelevant_halluc_rate': float(np.mean(irr_rates)) if irr_rates else 0.0,
+                'total_halluc_rate': float(np.mean(total_halluc)) if total_halluc else 0.0,
+                'bleu4_mean': float(np.mean(bleu_scores)) if bleu_scores else 0.0,
+                'rouge_l_mean': float(np.mean(rouge_scores)) if rouge_scores else 0.0,
                 'mean_latency_ms': float(np.mean(latencies)) if latencies else 0.0,
                 'p95_latency_ms': float(np.percentile(latencies, 95)) if latencies else 0.0,
             }
@@ -1658,7 +1866,215 @@ class ExperimentRunner:
         
         logger.info(f"Ablation study results saved to {filepath}")
         for mode, s in summary.items():
-            logger.info(f"  {mode}: recall={s['mean_recall']:.3f}, latency={s['mean_latency_ms']:.1f}ms")
+            logger.info(
+                f"  {mode}: recall={s['memory_recall']:.3f}, "
+                f"fab_halluc={s['fabricated_halluc_rate']:.3f}, "
+                f"latency={s['mean_latency_ms']:.1f}ms"
+            )
+        
+        return results
+
+    def run_context_constrained(
+        self,
+        data_path: Optional[str] = None,
+        memory_lengths: Optional[List[int]] = None,
+        context_budget: int = 4096,
+        setup_users: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        运行上下文受限实验 — 对齐论文 Table 2
+        
+        固定 context window = context_budget (默认 4096),
+        变化 user memory 长度, 对比 DKI 与 RAG 的任务成功率。
+        
+        DKI 优势: K/V 注入绕过偏好记忆的 token 消耗,
+        保留更多推理预算; RAG 在长记忆下挤压推理空间。
+        
+        指标:
+        - task_success: 基于 expected_keywords 的任务成功率
+        - memory_recall: 记忆召回率
+        - fabricated_halluc / irrelevant_halluc: 幻觉分解
+        - reasoning_budget_used: 实际用于推理的 token 数估算
+        """
+        self._ensure_systems()
+        
+        if setup_users and not hasattr(self, '_experiment_user_map'):
+            self.setup_experiment_users()
+        
+        if memory_lengths is None:
+            memory_lengths = [500, 1000, 1500, 2000, 2500, 3000, 3500]
+        
+        logger.info(
+            f"Running context-constrained experiment "
+            f"(budget={context_budget}, lengths={memory_lengths})"
+        )
+        
+        # Load data
+        if data_path:
+            with open(data_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        else:
+            data_file = Path("./data/context_constrained.json")
+            if data_file.exists():
+                with open(data_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+            else:
+                logger.warning("No context-constrained data found, generating...")
+                from dki.experiment.data_generator import ExperimentDataGenerator
+                gen = ExperimentDataGenerator("./data")
+                data = gen.generate_context_constrained_data(memory_lengths=memory_lengths)
+        
+        user_id = self._get_first_experiment_user_id()
+        
+        results = {
+            'context_budget': context_budget,
+            'memory_lengths': memory_lengths,
+            'results_by_length': {},
+        }
+        
+        for mem_length in memory_lengths:
+            # Filter samples for this memory length
+            length_samples = [
+                d for d in data
+                if d.get('memory_length_tokens') == mem_length
+            ]
+            
+            if not length_samples:
+                logger.warning(f"No samples for memory_length={mem_length}, skipping")
+                continue
+            
+            length_results = {'dki': [], 'rag': []}
+            
+            for mode in ['dki', 'rag']:
+                system = self.dki_system if mode == 'dki' else self.rag_system
+                
+                for sample in tqdm(
+                    length_samples[:30],
+                    desc=f"Ctx-{mem_length} ({mode})",
+                ):
+                    session_id = f"ctx_{mode}_{mem_length}_{sample['id']}_{int(time.time())}"
+                    
+                    # Add memory fragments
+                    for frag in sample.get('memory_fragments', []):
+                        system.add_memory(session_id, frag)
+                    
+                    # v5.3: 为 DKI 和 RAG 都写入偏好 (确保对比公平)
+                    prefs = sample.get('memory_fragments', [])[:5]
+                    self._write_session_preferences(user_id, prefs)
+                    
+                    query = sample['query']
+                    expected_kw = sample.get('expected_keywords', [])
+                    
+                    try:
+                        if mode == 'dki':
+                            response = self.dki_system.chat(
+                                query=query,
+                                session_id=session_id,
+                                user_id=user_id,
+                                force_alpha=0.5,
+                                max_new_tokens=256,
+                            )
+                            response_text = response.text
+                            latency = response.latency_ms
+                        else:
+                            response = self.rag_system.chat(
+                                query=query,
+                                session_id=session_id,
+                                user_id=user_id,
+                                max_new_tokens=256,
+                            )
+                            response_text = response.text
+                            latency = response.latency_ms
+                        
+                        # Task success: check keywords
+                        resp_lower = response_text.lower()
+                        kw_hits = sum(1 for kw in expected_kw if kw.lower() in resp_lower)
+                        task_success = kw_hits / len(expected_kw) if expected_kw else 0.0
+                        
+                        # Memory recall
+                        mem_frags = sample.get('memory_fragments', [])
+                        recall, _ = self.metrics.compute_memory_recall(
+                            expected_memories=mem_frags[:5],
+                            response=response_text,
+                            threshold=0.3,
+                        )
+                        
+                        # Decomposed hallucination
+                        halluc = self.metrics.compute_hallucination_decomposed(
+                            response=response_text,
+                            grounding_texts=mem_frags,
+                            query=query,
+                        )
+                        
+                        length_results[mode].append({
+                            'sample_id': sample['id'],
+                            'query': query,
+                            'response': response_text[:300],
+                            'latency_ms': latency,
+                            'task_success': task_success,
+                            'memory_recall': recall,
+                            'fabricated_halluc': halluc['fabricated_rate'],
+                            'irrelevant_halluc': halluc['irrelevant_rate'],
+                        })
+                        
+                    except Exception as e:
+                        logger.error(f"Context-constrained query failed: {e}")
+            
+            # Per-length summary
+            import numpy as np
+            length_summary = {}
+            for mode in ['dki', 'rag']:
+                samples = length_results[mode]
+                if not samples:
+                    length_summary[mode] = {}
+                    continue
+                length_summary[mode] = {
+                    'sample_count': len(samples),
+                    'task_success': float(np.mean([s['task_success'] for s in samples])),
+                    'memory_recall': float(np.mean([s['memory_recall'] for s in samples])),
+                    'fabricated_halluc': float(np.mean([s['fabricated_halluc'] for s in samples])),
+                    'irrelevant_halluc': float(np.mean([s['irrelevant_halluc'] for s in samples])),
+                    'mean_latency_ms': float(np.mean([s['latency_ms'] for s in samples])),
+                }
+            
+            results['results_by_length'][str(mem_length)] = {
+                'samples': length_results,
+                'summary': length_summary,
+            }
+        
+        # Global summary table (aligned with paper Table 2)
+        import numpy as np
+        table_rows = []
+        for mem_length in memory_lengths:
+            key = str(mem_length)
+            if key not in results['results_by_length']:
+                continue
+            s = results['results_by_length'][key]['summary']
+            table_rows.append({
+                'memory_length': mem_length,
+                'rag_success': s.get('rag', {}).get('task_success', 0.0),
+                'dki_success': s.get('dki', {}).get('task_success', 0.0),
+                'delta': (
+                    s.get('dki', {}).get('task_success', 0.0)
+                    - s.get('rag', {}).get('task_success', 0.0)
+                ),
+            })
+        results['comparison_table'] = table_rows
+        
+        # Save
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filepath = self.output_dir / f"context_constrained_{timestamp}.json"
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(results, f, ensure_ascii=False, indent=2)
+        
+        logger.info(f"Context-constrained results saved to {filepath}")
+        for row in table_rows:
+            logger.info(
+                f"  mem={row['memory_length']}: "
+                f"RAG={row['rag_success']:.3f}, "
+                f"DKI={row['dki_success']:.3f}, "
+                f"Δ={row['delta']:+.3f}"
+            )
         
         return results
 

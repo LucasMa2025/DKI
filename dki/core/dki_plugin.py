@@ -709,6 +709,7 @@ class DKIPlugin:
                 relevant_history=relevant_history,
                 context=context,
                 force_alpha=force_alpha,
+                session_id=session_id,
             )
             
             # 从 plan 填充 metadata

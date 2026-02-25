@@ -216,6 +216,66 @@ class VLLMAdapter(BaseModelAdapter):
             raise
     
     # ================================================================
+    # Chat Template 处理
+    # ================================================================
+    
+    def _has_chat_template_tokens(self, text: str) -> bool:
+        """检测文本是否已包含 chat template 特殊标记 (避免双重包装)"""
+        # DeepSeek/Qwen ChatML 标记
+        if '<|im_start|>' in text:
+            return True
+        # Llama 3 标记
+        if '<|begin_of_text|>' in text or '<|start_header_id|>' in text:
+            return True
+        # Llama 2 标记
+        if '[INST]' in text:
+            return True
+        return False
+    
+    def _format_prompt(self, prompt: str, system_prompt: Optional[str] = None) -> str:
+        """
+        Format prompt using tokenizer's chat template.
+        
+        vLLM 的 LLM.generate() 接收 raw prompt string, 不会自动应用 chat template。
+        必须在调用前使用 tokenizer.apply_chat_template() 构造正确的 chat 格式。
+        
+        不同模型的标准格式:
+        - DeepSeek/Qwen (ChatML): <|im_start|>system/user/assistant<|im_end|>
+        - Llama 3.x: <|begin_of_text|><|start_header_id|>...<|end_header_id|>
+        - 其他模型: tokenizer 内置 chat template
+        
+        优先使用 tokenizer.apply_chat_template, 回退到 ChatML 通用格式
+        (因为 vLLM 默认模型 Qwen 使用 ChatML)。
+        """
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
+        
+        if self.tokenizer and hasattr(self.tokenizer, 'apply_chat_template'):
+            try:
+                return self.tokenizer.apply_chat_template(
+                    messages,
+                    add_generation_prompt=True,
+                    tokenize=False,
+                )
+            except Exception as e:
+                logger.warning(f"apply_chat_template failed, using ChatML fallback: {e}")
+        
+        # 回退: ChatML 格式 (Qwen/DeepSeek 通用)
+        parts = []
+        if system_prompt:
+            parts.append(f"<|im_start|>system\n{system_prompt}<|im_end|>")
+        parts.append(f"<|im_start|>user\n{prompt}<|im_end|>")
+        parts.append("<|im_start|>assistant")
+        return "\n".join(parts) + "\n"
+    
+    def _is_chat_model(self) -> bool:
+        """判断是否为 Chat/Instruct 模型"""
+        name_lower = self.model_name.lower()
+        return any(kw in name_lower for kw in ('chat', 'instruct'))
+    
+    # ================================================================
     # 核心推理接口
     # ================================================================
     
@@ -230,6 +290,7 @@ class VLLMAdapter(BaseModelAdapter):
         """
         Generate text using vLLM.
         
+        使用 tokenizer.apply_chat_template 构造符合模型官方标准的 chat 格式。
         vLLM 的 prefix_caching 会自动检测 prompt 前缀并复用 KV Cache,
         因此偏好文本作为前缀时, 首次请求 prefill 计算 KV, 后续请求直接复用。
         """
@@ -240,13 +301,22 @@ class VLLMAdapter(BaseModelAdapter):
         
         start_time = time.perf_counter()
         
+        # Format prompt using official chat template
+        # 跳过已经包含 chat template 特殊标记的 prompt (避免双重包装)
+        if self._has_chat_template_tokens(prompt):
+            formatted_prompt = prompt
+        elif self._is_chat_model():
+            formatted_prompt = self._format_prompt(prompt)
+        else:
+            formatted_prompt = prompt
+        
         sampling_params = SamplingParams(
             temperature=temperature,
             top_p=top_p,
             max_tokens=max_new_tokens,
         )
         
-        outputs = self.llm.generate([prompt], sampling_params)
+        outputs = self.llm.generate([formatted_prompt], sampling_params)
         output = outputs[0]
         
         end_time = time.perf_counter()
@@ -280,6 +350,11 @@ class VLLMAdapter(BaseModelAdapter):
         - 相同偏好 → 相同前缀 → KV Cache 自动复用
         - alpha 控制由 Executor 在构造前缀时实现 (前缀长度 + 强度标记)
         
+        Chat Template 处理:
+        - prompt 可能已由 Executor 使用 apply_chat_template 格式化
+        - _has_chat_template_tokens 检测已格式化的 prompt 并跳过二次包装
+        - 未格式化的 prompt 由 _format_prompt 包装为 chat template 格式
+        
         Args:
             prompt: 用户输入 (已包含偏好前缀, 由 Executor 组装)
             injected_kv: 保留签名兼容, 内部不使用
@@ -293,6 +368,15 @@ class VLLMAdapter(BaseModelAdapter):
         
         start_time = time.perf_counter()
         
+        # Format prompt using official chat template
+        # 注意: prompt 可能已包含偏好前缀, 检测是否需要包装 chat template
+        if self._has_chat_template_tokens(prompt):
+            formatted_prompt = prompt
+        elif self._is_chat_model():
+            formatted_prompt = self._format_prompt(prompt)
+        else:
+            formatted_prompt = prompt
+        
         sampling_params = SamplingParams(
             temperature=kwargs.get('temperature', 0.7),
             top_p=kwargs.get('top_p', 0.9),
@@ -301,7 +385,7 @@ class VLLMAdapter(BaseModelAdapter):
         
         # prompt 已包含偏好前缀, 直接调用 vLLM generate
         # vLLM prefix_caching 会自动检测并复用相同前缀的 KV Cache
-        outputs = self.llm.generate([prompt], sampling_params)
+        outputs = self.llm.generate([formatted_prompt], sampling_params)
         output = outputs[0]
         
         end_time = time.perf_counter()

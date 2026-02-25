@@ -821,12 +821,28 @@ class DKISystem:
                 if not self.get_user_preference(user_id):
                     self._load_user_preferences_from_db(user_id)
             
-            # Step 0.5: History preparation (Recall v4 or Hybrid)
+            # Step 0.5: History + Preference preparation
             hybrid_result = None
             recall_v4_suffix = None
             recall_v4_trace_ids = []
             
             _recall_v4_failed = False
+            
+            # ============ v5.2: 统一偏好加载 (先于历史准备) ============
+            # 偏好在 vLLM v5.0 中通过 prompt (system message) 注入, 不依赖 compute_kv。
+            # 必须在所有路径中确保偏好进入 prompt, 即使没有历史消息。
+            preference = None
+            if use_hybrid_mode and allow_injection and user_id:
+                preference = self.get_user_preference(user_id)
+                if preference:
+                    logger.debug(
+                        f"Preference loaded for user {user_id}: "
+                        f"{len(preference.content)} chars"
+                    )
+            
+            # v5.5: 跟踪 hybrid fallback 路径中实际注入的历史 token 数
+            _hybrid_fallback_hist_tokens = 0
+            _hybrid_fallback_hist_messages = []
             
             if self._use_recall_v4 and use_hybrid_mode and allow_injection:
                 # ============ Recall v4: 多信号召回 + 后缀组装 ============
@@ -834,16 +850,33 @@ class DKISystem:
                     timer.start_stage("recall_v4")
                     self._init_recall_v4_components()
                     
-                    # Get user preference (for K/V injection, 不变)
-                    preference = None
-                    if user_id:
-                        preference = self.get_user_preference(user_id)
+                    # v5.3: 调试日志 — 确认 recall 前数据库中的消息数
+                    try:
+                        _dbg_msgs = self._multi_signal_recall._conversation_repo.get_by_session(
+                            session_id=session_id,
+                        )
+                        logger.info(
+                            f"[Recall v4 pre-check] session_id={session_id}, "
+                            f"user_id={user_id}, "
+                            f"messages_in_db={len(_dbg_msgs)}, "
+                            f"roles={[getattr(m, 'role', '?') for m in _dbg_msgs[-6:]] if _dbg_msgs else []}"
+                        )
+                    except Exception as _dbg_err:
+                        logger.warning(f"[Recall v4 pre-check] failed: {_dbg_err}")
                     
                     # 多信号召回
                     recall_result = self._multi_signal_recall.recall(
                         query=query,
                         session_id=session_id,
                         user_id=user_id,
+                    )
+                    
+                    logger.debug(
+                        f"Recall v4 result: {len(recall_result.messages)} messages, "
+                        f"keyword={recall_result.keyword_hits}, "
+                        f"bm25={recall_result.bm25_hits}, "
+                        f"vector={recall_result.vector_hits}, "
+                        f"recent={recall_result.recent_turns_added}"
                     )
                     
                     # 后缀组装
@@ -869,14 +902,39 @@ class DKISystem:
                         preference_tokens=pref_tokens,
                     )
                     
-                    recall_v4_suffix = assembled.text
+                    # v5.5: 仅当实际有历史消息时才设置 recall_v4_suffix
+                    # SuffixBuilder.build() 在 recalled_messages 为空时返回 text=query, total_tokens=0
+                    # 此时 recall_v4_suffix 不应被设置 (它不包含历史)
+                    if assembled.total_tokens > 0 and assembled.items:
+                        recall_v4_suffix = assembled.text
+                    else:
+                        recall_v4_suffix = None  # 无历史, 不设置
                     recall_v4_trace_ids = assembled.trace_ids
                     
-                    # 使用组装好的后缀替代 query
-                    if assembled.total_tokens > 0:
-                        query = assembled.text
+                    # ============ v5.2: 始终通过 chat template 构造 prompt ============
+                    # 修复: 即使 assembled.total_tokens == 0 (无历史), 
+                    # 只要有偏好, 也应通过 chat template 将偏好注入 system message。
+                    # 在 vLLM v5.0 中, 偏好通过 prompt 前缀注入 (不依赖 compute_kv)。
+                    has_history = assembled.total_tokens > 0 and assembled.items
+                    has_preference = preference is not None and preference.content
                     
-                    # 仍然准备 hybrid_result 用于偏好 K/V 注入 (history 已由 recall_v4 处理)
+                    if has_history or has_preference:
+                        query = self._build_recall_v4_chat_prompt(
+                            items=assembled.items if has_history else [],
+                            original_query=original_query,
+                            preference=preference,
+                            trace_ids=assembled.trace_ids if has_history else [],
+                            has_fact_call_instruction=assembled.has_fact_call_instruction if has_history else False,
+                        )
+                        logger.debug(
+                            f"Chat prompt built: history_items={len(assembled.items) if has_history else 0}, "
+                            f"preference={'yes' if has_preference else 'no'}, "
+                            f"history_tokens={assembled.total_tokens}"
+                        )
+                    
+                    # 准备 hybrid_result 用于元数据显示 (偏好文本、token 统计等)
+                    # 注意: 在 vLLM v5.0 中, preference_kv 为空列表 (不需要)
+                    # 偏好已通过 chat template system message 注入 prompt
                     if preference:
                         hybrid_result = self.hybrid_injector.prepare_input(
                             user_query=original_query,
@@ -884,11 +942,22 @@ class DKISystem:
                             history=None,
                         )
                     
+                    # v5.5: 关键日志 — 确认 recall_v4 成功完成
+                    logger.info(
+                        f"[Recall v4 SUCCESS] "
+                        f"recalled={len(recall_result.messages)}, "
+                        f"assembled_tokens={assembled.total_tokens}, "
+                        f"items={len(assembled.items)}, "
+                        f"suffix_len={len(recall_v4_suffix) if recall_v4_suffix else 0}, "
+                        f"has_history={has_history}, has_preference={has_preference}"
+                    )
+                    
                     timer.end_stage()
                 
                 except Exception as recall_error:
                     logger.error(
-                        f"Recall v4 failed, falling back to stable (hybrid): {recall_error}"
+                        f"Recall v4 failed, falling back to stable (hybrid): {recall_error}",
+                        exc_info=True,
                     )
                     _recall_v4_failed = True
                     # 重置 query 到原始输入
@@ -902,29 +971,78 @@ class DKISystem:
             
             if (_recall_v4_failed and use_hybrid_mode and allow_injection) or \
                (not self._use_recall_v4 and use_hybrid_mode and allow_injection):
-                # ============ 原有 Hybrid 注入 (flat_history) ============
+                # ============ Hybrid 注入 (回退路径或非 recall_v4 模式) ============
                 timer.start_stage("hybrid_prep")
                 
-                # Get user preference (if user_id provided)
-                preference = None
-                if user_id:
-                    preference = self.get_user_preference(user_id)
+                # 偏好已在上方统一加载 (preference 变量)
                 
-                # Get session history
+                # Get session history (无论 history.enabled 配置, 仍尝试获取历史)
+                # 修复: 之前 history.enabled=false 导致 HybridDKIInjector 跳过历史
+                # 但这里应直接获取历史, 通过 chat template 注入
                 history = self.get_session_history(session_id)
                 
-                # Prepare hybrid input
+                # Prepare hybrid input (用于元数据: 偏好文本、token 统计)
+                # 注意: hybrid_result.history_tokens 可能为 0 (因 config.history_enabled=false)
+                # 但我们仍然通过 chat template 注入历史, 所以需要单独跟踪实际注入的历史 token 数
                 hybrid_result = self.hybrid_injector.prepare_input(
                     user_query=query,
                     preference=preference,
                     history=history if history.messages else None,
                 )
                 
-                # Use modified query with history suffix
-                if hybrid_result.history_tokens > 0:
-                    query = hybrid_result.input_text
+                # v5.2: 始终通过 chat template 构造 prompt
+                # 条件: 有历史消息 或 有偏好 → 都需要 chat template 格式化
+                has_history = history and history.messages and len(history.messages) > 0
+                has_preference = preference is not None and preference.content
+                
+                if has_history or has_preference:
+                    query = self._build_hybrid_chat_prompt(
+                        history=history if has_history else None,
+                        original_query=query,
+                        preference=preference,
+                    )
+                
+                # v5.5: 跟踪 hybrid fallback 实际注入的历史 token 数
+                # (hybrid_result.history_tokens 可能因 config.history_enabled=false 而为 0)
+                if has_history:
+                    _hist_text = ""
+                    for msg in history.messages:
+                        _hist_text += getattr(msg, 'content', '') + " "
+                    tokenizer = getattr(self.model, 'tokenizer', None) if self._model_adapter else None
+                    if tokenizer:
+                        try:
+                            _hybrid_fallback_hist_tokens = len(tokenizer.encode(_hist_text))
+                        except Exception:
+                            _hybrid_fallback_hist_tokens = len(_hist_text) // 2
+                    else:
+                        _hybrid_fallback_hist_tokens = len(_hist_text) // 2
+                    
+                    _hybrid_fallback_hist_messages = [
+                        {"role": getattr(m, 'role', 'user'), "content": getattr(m, 'content', '')[:500]}
+                        for m in history.messages
+                    ]
+                    
+                    logger.info(
+                        f"[Hybrid fallback] history_msgs={len(history.messages)}, "
+                        f"history_tokens={_hybrid_fallback_hist_tokens}, "
+                        f"preference={'yes' if has_preference else 'no'}"
+                    )
                 
                 timer.end_stage()
+            
+            # ============ v5.2: 最后防线 — 纯偏好注入 (无历史, 非 hybrid 模式) ============
+            # 如果以上路径都未走 (例如 allow_injection=True 但 use_hybrid=False),
+            # 但有偏好, 仍应通过 chat template 注入偏好
+            if preference and preference.content and query == original_query:
+                # query 未被任何路径改写, 说明偏好还没注入
+                query = self._build_recall_v4_chat_prompt(
+                    items=[],
+                    original_query=original_query,
+                    preference=preference,
+                    trace_ids=[],
+                    has_fact_call_instruction=False,
+                )
+                logger.debug("Fallback: preference injected via chat template (no history path)")
             
             # Step 1: Gating decision
             timer.start_stage("gating")
@@ -1027,39 +1145,157 @@ class DKISystem:
         # Record latency for analysis
         self._budget_analyzer.record_latency(timer.breakdown)
         
-        # Add hybrid injection metadata with display info
-        if hybrid_result:
-            metadata = {
-                'model': self.model.model_name,
-                'session_cache_stats': session_cache.get_stats(),
-                'task_type': task_type,
-                'hybrid_injection': {
-                    'enabled': True,
-                    'preference_tokens': hybrid_result.preference_tokens,
-                    'history_tokens': hybrid_result.history_tokens,
-                    'preference_alpha': hybrid_result.preference_alpha,
-                    # 用于显示的明文信息
-                    'preference_text': hybrid_result.preference_text,
-                    'history_suffix_text': hybrid_result.history_suffix_text,
-                    'history_messages': hybrid_result.history_messages,
-                    'final_input': hybrid_result.input_text,
-                },
-            }
-        else:
-            metadata = {
-                'model': self.model.model_name,
-                'session_cache_stats': session_cache.get_stats(),
-                'task_type': task_type,
-                'hybrid_injection': {'enabled': False},
-            }
+        # ============ v5.2: 构建元数据 (修正 alpha/历史 token 来源) ============
+        # 偏好 alpha 来自配置 (hybrid_injection.preference.alpha), 不来自门控决策
+        # 历史 tokens 来自 recall_v4 assembled 或 hybrid 历史
+        _pref_alpha_config = 0.0
+        _pref_tokens_display = 0
+        _hist_tokens_display = 0
+        _pref_text_display = ""
+        _hist_suffix_display = ""
+        _hist_messages_display = []
+        _final_input_display = query
         
-        # Recall v4 metadata
-        if self._use_recall_v4 and recall_v4_suffix:
+        if preference and preference.content:
+            _pref_alpha_config = getattr(
+                getattr(getattr(self.config.dki, 'hybrid_injection', None), 'preference', None),
+                'alpha', 0.4
+            )
+            _pref_text_display = preference.content
+            # 精确计算偏好 token 数
+            tokenizer = getattr(self.model, 'tokenizer', None) if self._model_adapter else None
+            if tokenizer:
+                try:
+                    _pref_tokens_display = len(tokenizer.encode(preference.content))
+                except Exception:
+                    _pref_tokens_display = len(preference.content)
+            else:
+                import re as _re_est
+                _cn = len(_re_est.findall(r'[\u4e00-\u9fff]', preference.content))
+                _en = len(_re_est.findall(r'[a-zA-Z]+', preference.content))
+                _pref_tokens_display = int(_cn * 1.5 + _en * 1.3) or len(preference.content)
+        
+        if hybrid_result:
+            _hist_tokens_display = hybrid_result.history_tokens
+            _hist_suffix_display = hybrid_result.history_suffix_text
+            _hist_messages_display = hybrid_result.history_messages
+            _final_input_display = hybrid_result.input_text
+        
+        # recall_v4 历史 tokens 覆盖 hybrid 的 (recall_v4 更准确)
+        # v5.5: 同时提取 recall_v4 的历史消息用于可视化显示
+        _recall_v4_signal_stats = {}
+        if recall_v4_suffix and self._use_recall_v4:
+            # recall_v4 成功: 使用 assembled 的 token 数
+            # 注意: 仅当 assembled.total_tokens > 0 时才算真正有历史
+            # (当 recalled_messages 为空时, assembled.text = query, total_tokens = 0)
+            if 'assembled' in locals() and hasattr(assembled, 'total_tokens') and assembled.total_tokens > 0:
+                _hist_tokens_display = assembled.total_tokens
+                _hist_suffix_display = recall_v4_suffix
+                logger.debug(f"Recall v4 history tokens (from assembled): {_hist_tokens_display}")
+            else:
+                # assembled.total_tokens == 0 意味着没有召回到历史消息
+                # recall_v4_suffix 只是 query 文本, 不应计为历史 tokens
+                logger.debug(
+                    f"Recall v4 suffix exists but assembled.total_tokens=0 "
+                    f"(no history recalled, suffix is just query)"
+                )
+        
+        # v5.5: 从 recall_v4 assembled items 填充 _hist_messages_display
+        if self._use_recall_v4 and recall_v4_suffix and not _hist_messages_display:
+            try:
+                if 'assembled' in locals() and hasattr(assembled, 'items') and assembled.items:
+                    for item in assembled.items:
+                        _hist_messages_display.append({
+                            'role': item.role or 'user',
+                            'content': item.content[:500] if item.content else '',
+                            'type': item.type,
+                            'trace_id': item.trace_id,
+                            'confidence': item.confidence,
+                        })
+                    logger.debug(
+                        f"Recall v4 history messages for viz: {len(_hist_messages_display)} items"
+                    )
+            except Exception as e:
+                logger.debug(f"Failed to extract recall_v4 history items for viz: {e}")
+        
+        # v5.5: Hybrid fallback 历史 tokens 补充
+        # 当 recall_v4 失败 (recall_v4_suffix=None) 但 hybrid fallback 注入了历史时,
+        # hybrid_result.history_tokens 可能为 0 (因 config.history_enabled=false),
+        # 但实际上 _build_hybrid_chat_prompt 已经将历史注入了 prompt。
+        # 使用 _hybrid_fallback_hist_tokens 来修正。
+        if _hist_tokens_display == 0 and _hybrid_fallback_hist_tokens > 0:
+            _hist_tokens_display = _hybrid_fallback_hist_tokens
+            _hist_messages_display = _hybrid_fallback_hist_messages
+            logger.debug(
+                f"Hybrid fallback history tokens applied: {_hybrid_fallback_hist_tokens}, "
+                f"messages: {len(_hybrid_fallback_hist_messages)}"
+            )
+        
+        # v5.4: 提取 recall_v4 多信号统计 (用于可视化)
+        if self._use_recall_v4 and 'recall_result' in locals():
+            try:
+                _recall_v4_signal_stats = {
+                    'keyword_hits': getattr(recall_result, 'keyword_hits', 0),
+                    'bm25_hits': getattr(recall_result, 'bm25_hits', 0),
+                    'vector_hits': getattr(recall_result, 'vector_hits', 0),
+                    'recent_turns_added': getattr(recall_result, 'recent_turns_added', 0),
+                    'reference_scope': getattr(recall_result, 'reference_scope', None),
+                    'total_recalled': len(getattr(recall_result, 'messages', [])),
+                }
+            except Exception:
+                pass
+        
+        # v5.5: _final_input_display 始终使用最终的 query
+        # (query 已被 _build_recall_v4_chat_prompt 或 _build_hybrid_chat_prompt 改写)
+        if query != original_query:
+            _final_input_display = query  # query 已包含完整 chat template 格式
+        
+        # v5.4: 从 assembled 获取 summary/message count
+        _summary_count = 0
+        _message_count = 0
+        if self._use_recall_v4 and 'assembled' in locals() and hasattr(assembled, 'summary_count'):
+            _summary_count = assembled.summary_count
+            _message_count = assembled.message_count
+        
+        # v5.5: 关键日志 — 元数据摘要
+        logger.info(
+            f"[DKI metadata] "
+            f"pref_tokens={_pref_tokens_display}, "
+            f"hist_tokens={_hist_tokens_display}, "
+            f"pref_alpha={_pref_alpha_config}, "
+            f"hist_messages={len(_hist_messages_display)}, "
+            f"recall_v4_suffix={'yes' if recall_v4_suffix else 'no'}, "
+            f"hybrid_fallback_hist={_hybrid_fallback_hist_tokens}, "
+            f"query_modified={'yes' if query != original_query else 'no'}"
+        )
+        
+        metadata = {
+            'model': self.model.model_name,
+            'session_cache_stats': session_cache.get_stats(),
+            'task_type': task_type,
+            'hybrid_injection': {
+                'enabled': bool(preference) or _hist_tokens_display > 0,
+                'preference_tokens': _pref_tokens_display,
+                'history_tokens': _hist_tokens_display,
+                'preference_alpha': _pref_alpha_config,
+                # 用于显示的明文信息
+                'preference_text': _pref_text_display,
+                'history_suffix_text': _hist_suffix_display,
+                'history_messages': _hist_messages_display,
+                'final_input': _final_input_display,
+            },
+        }
+        
+        # Recall v4 metadata (v5.4: 包含完整信号统计)
+        if self._use_recall_v4:
             metadata['recall_v4'] = {
-                'enabled': True,
+                'enabled': bool(recall_v4_suffix) or self._use_recall_v4,
                 'strategy': self._recall_config.strategy if self._recall_config else '',
                 'trace_ids': recall_v4_trace_ids,
                 'fact_rounds_used': fact_rounds_used,
+                'summary_count': _summary_count,
+                'message_count': _message_count,
+                **_recall_v4_signal_stats,
             }
         
         # Log to database (使用原始用户输入，避免历史后缀递归嵌套)
@@ -1085,6 +1321,215 @@ class DKISystem:
             latency_breakdown=timer.breakdown,
             metadata=metadata,
         )
+    
+    def _build_recall_v4_chat_prompt(
+        self,
+        items: list,
+        original_query: str,
+        preference: Optional[Any] = None,
+        trace_ids: Optional[list] = None,
+        has_fact_call_instruction: bool = False,
+    ) -> str:
+        """
+        v5.1: 使用 chat template 构造正确的多轮对话格式
+        
+        修复角色混乱问题:
+        之前的做法是将 recall_v4 后缀 (包含多轮历史) 扁平化为一个纯文本字符串,
+        然后作为单一 user message 传给 apply_chat_template。这导致历史中的
+        Assistant/User 角色标记变成纯文本, 模型无法区分历史角色和当前查询。
+        
+        新做法:
+        1. 将偏好信息作为 system message
+        2. 将 recall_v4 历史 items 按原始角色还原为独立的 user/assistant messages
+        3. 将当前查询作为最后一个 user message
+        4. 通过 tokenizer.apply_chat_template 生成正确的多轮 prompt
+        
+        这样模型能正确识别每轮对话的角色, 避免把助手的历史回复当成用户消息。
+        
+        Args:
+            items: List[HistoryItem] - recall_v4 召回的历史条目
+            original_query: 原始用户查询 (不含后缀)
+            preference: 用户偏好 (用于 system message)
+            trace_ids: 召回的 trace_id 列表 (用于 fact call 指令)
+            has_fact_call_instruction: 是否需要 fact call 指令
+            
+        Returns:
+            格式化后的完整 prompt (已含 chat template 特殊标记)
+        """
+        tokenizer = None
+        if self._model_adapter and hasattr(self._model_adapter, 'tokenizer'):
+            tokenizer = self._model_adapter.tokenizer
+        elif hasattr(self, 'model') and hasattr(self.model, 'tokenizer'):
+            tokenizer = self.model.tokenizer
+        
+        # ============ 1. System message: 偏好 + 召回元数据 ============
+        system_parts = []
+        if preference and preference.content:
+            system_parts.append(f"用户偏好:\n{preference.content}")
+        
+        # 如果有 fact call 指令, 加入 system message
+        if has_fact_call_instruction and trace_ids:
+            if self._recall_formatter:
+                constraint = self._recall_formatter.format_constraint_instruction(trace_ids)
+                system_parts.append(constraint)
+        
+        system_content = "\n\n".join(system_parts) if system_parts else ""
+        
+        # ============ 2. 历史 messages: 按原始角色还原 ============
+        history_messages = []
+        for item in items:
+            role = getattr(item, 'role', None) or 'user'
+            content = getattr(item, 'content', str(item))
+            item_type = getattr(item, 'type', 'message')
+            
+            # summary 类型: 标注为摘要, 保留 trace_id 信息
+            if item_type == 'summary':
+                trace_id = getattr(item, 'trace_id', '')
+                if trace_id:
+                    content = f"[摘要 trace_id={trace_id}] {content}"
+            
+            # 确保 role 是 chat template 支持的标准角色
+            if role not in ('user', 'assistant', 'system'):
+                role = 'user'
+            
+            history_messages.append({"role": role, "content": content})
+        
+        # ============ 3. 构造 messages 列表 ============
+        messages = []
+        if system_content:
+            messages.append({"role": "system", "content": system_content})
+        
+        # 添加历史消息 (保留原始角色)
+        for msg in history_messages:
+            messages.append(msg)
+        
+        # 添加当前用户查询 (始终是最后一个 user message)
+        messages.append({"role": "user", "content": original_query})
+        
+        # ============ 4. 使用 apply_chat_template 格式化 ============
+        if tokenizer and hasattr(tokenizer, 'apply_chat_template'):
+            try:
+                formatted = tokenizer.apply_chat_template(
+                    messages,
+                    add_generation_prompt=True,
+                    tokenize=False,
+                )
+                logger.debug(
+                    f"Recall v4 chat prompt built: "
+                    f"{len(messages)} messages, "
+                    f"{len(history_messages)} history items, "
+                    f"system={'yes' if system_content else 'no'}"
+                )
+                return formatted
+            except Exception as e:
+                logger.warning(f"apply_chat_template failed in recall_v4: {e}")
+        
+        # ============ 回退: ChatML 格式 (DeepSeek/Qwen 通用) ============
+        parts = []
+        if system_content:
+            parts.append(f"<|im_start|>system\n{system_content}<|im_end|>")
+        
+        for msg in history_messages:
+            role = msg['role']
+            parts.append(f"<|im_start|>{role}\n{msg['content']}<|im_end|>")
+        
+        parts.append(f"<|im_start|>user\n{original_query}<|im_end|>")
+        parts.append("<|im_start|>assistant")
+        
+        formatted = "\n".join(parts) + "\n"
+        logger.debug(f"Recall v4 chat prompt built (ChatML fallback): {len(messages)} messages")
+        return formatted
+    
+    def _build_hybrid_chat_prompt(
+        self,
+        history,
+        original_query: str,
+        preference=None,
+    ) -> str:
+        """
+        v5.1: Hybrid 模式下使用 chat template 构造正确的多轮对话格式
+        
+        与 _build_recall_v4_chat_prompt 类似, 但接收的是 SessionHistory 对象
+        而非 HistoryItem 列表。
+        
+        Args:
+            history: SessionHistory 对象, 包含 .messages 列表
+            original_query: 原始用户查询
+            preference: 用户偏好对象
+            
+        Returns:
+            格式化后的完整 prompt
+        """
+        tokenizer = None
+        if self._model_adapter and hasattr(self._model_adapter, 'tokenizer'):
+            tokenizer = self._model_adapter.tokenizer
+        elif hasattr(self, 'model') and hasattr(self.model, 'tokenizer'):
+            tokenizer = self.model.tokenizer
+        
+        # ============ 1. System message ============
+        system_content = ""
+        if preference:
+            pref_content = getattr(preference, 'content', str(preference))
+            if pref_content:
+                system_content = f"用户偏好:\n{pref_content}"
+        
+        # ============ 2. 历史消息还原为独立 messages ============
+        history_messages = []
+        if history and hasattr(history, 'messages'):
+            for msg in history.messages:
+                if isinstance(msg, dict):
+                    role = msg.get('role', 'user')
+                    content = msg.get('content', '')
+                else:
+                    role = getattr(msg, 'role', 'user')
+                    content = getattr(msg, 'content', str(msg))
+                
+                if role not in ('user', 'assistant', 'system'):
+                    role = 'user'
+                if content:
+                    history_messages.append({"role": role, "content": content})
+        
+        # ============ 3. 构造 messages 列表 ============
+        messages = []
+        if system_content:
+            messages.append({"role": "system", "content": system_content})
+        
+        for msg in history_messages:
+            messages.append(msg)
+        
+        messages.append({"role": "user", "content": original_query})
+        
+        # ============ 4. apply_chat_template ============
+        if tokenizer and hasattr(tokenizer, 'apply_chat_template'):
+            try:
+                formatted = tokenizer.apply_chat_template(
+                    messages,
+                    add_generation_prompt=True,
+                    tokenize=False,
+                )
+                logger.debug(
+                    f"Hybrid chat prompt built: "
+                    f"{len(messages)} messages, "
+                    f"{len(history_messages)} history items"
+                )
+                return formatted
+            except Exception as e:
+                logger.warning(f"apply_chat_template failed in hybrid: {e}")
+        
+        # ============ 回退: ChatML ============
+        parts = []
+        if system_content:
+            parts.append(f"<|im_start|>system\n{system_content}<|im_end|>")
+        
+        for msg in history_messages:
+            parts.append(f"<|im_start|>{msg['role']}\n{msg['content']}<|im_end|>")
+        
+        parts.append(f"<|im_start|>user\n{original_query}<|im_end|>")
+        parts.append("<|im_start|>assistant")
+        
+        formatted = "\n".join(parts) + "\n"
+        logger.debug(f"Hybrid chat prompt built (ChatML fallback): {len(messages)} messages")
+        return formatted
     
     def _generate_with_injection(
         self,
@@ -1626,42 +2071,83 @@ class DKISystem:
 # Recall v4 辅助类
 # ============================================================
 
+class _DetachedMessage:
+    """
+    脱管消息的纯 Python 副本 (解决 SQLAlchemy DetachedInstanceError)
+    
+    SQLAlchemy ORM 对象在 session.close() 后变为 detached 状态,
+    访问其属性会失败。此类在 session 活跃时提取所有需要的属性,
+    创建独立于 session 的纯 Python 对象。
+    """
+    __slots__ = ('id', 'message_id', 'session_id', 'role', 'content',
+                 'created_at', 'injection_mode', 'injection_alpha',
+                 'memory_ids', 'latency_ms')
+    
+    def __init__(self, orm_obj):
+        self.id = getattr(orm_obj, 'id', None)
+        self.message_id = getattr(orm_obj, 'id', None)  # 兼容 recall 组件
+        self.session_id = getattr(orm_obj, 'session_id', None)
+        self.role = getattr(orm_obj, 'role', 'user')
+        self.content = getattr(orm_obj, 'content', '')
+        self.created_at = getattr(orm_obj, 'created_at', None)
+        self.injection_mode = getattr(orm_obj, 'injection_mode', None)
+        self.injection_alpha = getattr(orm_obj, 'injection_alpha', None)
+        self.memory_ids = getattr(orm_obj, 'memory_ids', None)
+        self.latency_ms = getattr(orm_obj, 'latency_ms', None)
+
+
 class _ConversationRepoWrapper:
     """
-    ConversationRepository 的简单包装器
+    ConversationRepository 的安全包装器
     
     为 recall 组件提供统一接口, 自动管理数据库 session。
+    
+    关键修复 (v5.1):
+    返回 _DetachedMessage 纯 Python 副本, 而非 SQLAlchemy ORM 对象。
+    ORM 对象在 session_scope 退出后会变为 detached 状态,
+    导致后续属性访问静默失败 (role/content 返回 None),
+    这是 DKI 模式历史消息注入为 0 的根因。
     """
     
     def __init__(self, db_manager: DatabaseManager):
         self._db_manager = db_manager
+    
+    @staticmethod
+    def _to_detached(orm_objects: List[Any]) -> List[_DetachedMessage]:
+        """将 ORM 对象列表转换为脱管安全的纯 Python 副本"""
+        return [_DetachedMessage(obj) for obj in orm_objects]
     
     def get_by_session(
         self,
         session_id: str,
         db_session: Optional[Any] = None,
         **kwargs,
-    ) -> List[Any]:
-        """获取会话的所有消息"""
+    ) -> List[_DetachedMessage]:
+        """获取会话的所有消息 (返回脱管安全副本)"""
         with self._db_manager.session_scope() as db:
             repo = ConversationRepository(db)
-            return repo.get_by_session(session_id)
+            orm_results = repo.get_by_session(session_id)
+            # 在 session 活跃时提取属性, 避免 DetachedInstanceError
+            return self._to_detached(orm_results)
     
     def get_recent(
         self,
         session_id: str,
         limit: int = 10,
         **kwargs,
-    ) -> List[Any]:
-        """获取最近的消息"""
+    ) -> List[_DetachedMessage]:
+        """获取最近的消息 (返回脱管安全副本)"""
         with self._db_manager.session_scope() as db:
             repo = ConversationRepository(db)
-            return repo.get_recent(session_id, limit=limit)
+            orm_results = repo.get_recent(session_id, limit=limit)
+            return self._to_detached(orm_results)
     
-    def get_by_id(self, message_id: str) -> Optional[Any]:
-        """根据 ID 获取消息"""
+    def get_by_id(self, message_id: str) -> Optional[_DetachedMessage]:
+        """根据 ID 获取消息 (返回脱管安全副本)"""
         with self._db_manager.session_scope() as db:
             repo = ConversationRepository(db)
             if hasattr(repo, 'get_by_id'):
-                return repo.get_by_id(message_id)
+                result = repo.get_by_id(message_id)
+                if result:
+                    return _DetachedMessage(result)
         return None

@@ -1,6 +1,11 @@
 """
 LLaMA Model Adapter for DKI System
 HuggingFace Transformers-based adapter for LLaMA models
+
+Chat Template 支持:
+- LLaMA 3 / 3.1 / 3.2 Instruct: 使用 <|begin_of_text|> + <|start_header_id|> 官方模板
+- LLaMA 2 Chat: 使用 [INST] / [/INST] 官方模板  
+- 优先使用 tokenizer.apply_chat_template 以确保与模型训练一致
 """
 
 import time
@@ -16,7 +21,11 @@ class LlamaAdapter(BaseModelAdapter):
     """
     LLaMA model adapter using HuggingFace Transformers.
     
-    Supports LLaMA 2, LLaMA 3, and compatible models.
+    Supports LLaMA 2 Chat, LLaMA 3/3.1/3.2 Instruct, and compatible models.
+    
+    Chat template 遵循 Meta 官方标准:
+    - Llama 3.x: <|begin_of_text|><|start_header_id|>system<|end_header_id|>...
+    - Llama 2:   [INST] <<SYS>>...<</SYS>> {prompt} [/INST]
     """
     
     def __init__(
@@ -91,6 +100,89 @@ class LlamaAdapter(BaseModelAdapter):
             logger.error(f"Failed to load LLaMA model: {e}")
             raise
     
+    def _is_chat_model(self) -> bool:
+        """判断是否为 Chat/Instruct 模型"""
+        name_lower = self.model_name.lower()
+        return any(kw in name_lower for kw in ('chat', 'instruct'))
+    
+    def _is_llama3(self) -> bool:
+        """判断是否为 Llama 3.x 系列"""
+        name_lower = self.model_name.lower()
+        return any(kw in name_lower for kw in ('llama-3', 'llama3', 'meta-llama/meta-llama-3'))
+    
+    def _format_prompt(self, prompt: str, system_prompt: Optional[str] = None) -> str:
+        """
+        Format prompt using official LLaMA chat template.
+        
+        Llama 3.x Instruct 官方模板 (Meta 标准):
+            <|begin_of_text|><|start_header_id|>system<|end_header_id|>
+            {system_prompt}
+            <|start_header_id|>user<|end_header_id|>
+            {user_input}
+            <|start_header_id|>assistant<|end_header_id|>
+        
+        Llama 2 Chat 官方模板:
+            [INST] <<SYS>>
+            {system_prompt}
+            <</SYS>>
+            {user_input} [/INST]
+        
+        优先使用 tokenizer.apply_chat_template (确保与模型训练时一致)。
+        """
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
+        
+        # 优先使用 tokenizer 内置的 chat template
+        if hasattr(self.tokenizer, 'apply_chat_template'):
+            try:
+                return self.tokenizer.apply_chat_template(
+                    messages,
+                    add_generation_prompt=True,
+                    tokenize=False,
+                )
+            except Exception as e:
+                logger.warning(f"apply_chat_template failed, using manual template: {e}")
+        
+        # 回退: 根据模型版本手动构造官方模板
+        if self._is_llama3():
+            # Llama 3.x 官方模板
+            parts = ["<|begin_of_text|>"]
+            if system_prompt:
+                parts.append(
+                    f"<|start_header_id|>system<|end_header_id|>\n{system_prompt}"
+                )
+            parts.append(
+                f"<|start_header_id|>user<|end_header_id|>\n{prompt}"
+            )
+            parts.append(
+                "<|start_header_id|>assistant<|end_header_id|>\n"
+            )
+            return "\n".join(parts) if system_prompt else "".join(parts)
+        else:
+            # Llama 2 Chat 官方模板
+            if system_prompt:
+                return (
+                    f"[INST] <<SYS>>\n{system_prompt}\n<</SYS>>\n\n"
+                    f"{prompt} [/INST]"
+                )
+            else:
+                return f"[INST] {prompt} [/INST]"
+    
+    def _has_chat_template_tokens(self, text: str) -> bool:
+        """检测文本是否已包含 chat template 特殊标记 (避免双重包装)"""
+        # Llama 3 标记
+        if '<|begin_of_text|>' in text or '<|start_header_id|>' in text:
+            return True
+        # Llama 2 标记
+        if '[INST]' in text:
+            return True
+        # DeepSeek/Qwen ChatML 标记
+        if '<|im_start|>' in text:
+            return True
+        return False
+    
     def generate(
         self,
         prompt: str,
@@ -105,7 +197,16 @@ class LlamaAdapter(BaseModelAdapter):
         
         start_time = time.perf_counter()
         
-        inputs = self.tokenize(prompt)
+        # Format prompt using official chat template for chat/instruct models
+        # 跳过已经包含 chat template 特殊标记的 prompt (避免双重包装)
+        if self._has_chat_template_tokens(prompt):
+            formatted_prompt = prompt
+        elif self._is_chat_model():
+            formatted_prompt = self._format_prompt(prompt)
+        else:
+            formatted_prompt = prompt
+        
+        inputs = self.tokenize(formatted_prompt)
         input_ids = inputs['input_ids']
         
         with torch.no_grad():
@@ -212,7 +313,16 @@ class LlamaAdapter(BaseModelAdapter):
         
         start_time = time.perf_counter()
         
-        inputs = self.tokenize(prompt)
+        # Format prompt using official chat template for chat/instruct models
+        # 跳过已经包含 chat template 特殊标记的 prompt (避免双重包装)
+        if self._has_chat_template_tokens(prompt):
+            formatted_prompt = prompt
+        elif self._is_chat_model():
+            formatted_prompt = self._format_prompt(prompt)
+        else:
+            formatted_prompt = prompt
+        
+        inputs = self.tokenize(formatted_prompt)
         input_ids = inputs['input_ids']
         attention_mask = inputs['attention_mask']
         

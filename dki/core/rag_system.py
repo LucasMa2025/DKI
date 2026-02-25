@@ -15,7 +15,8 @@ from dki.models.factory import ModelFactory
 from dki.models.base import BaseModelAdapter, ModelOutput
 from dki.database.connection import DatabaseManager
 from dki.database.repository import (
-    SessionRepository, MemoryRepository, ConversationRepository, AuditLogRepository
+    SessionRepository, MemoryRepository, ConversationRepository, AuditLogRepository,
+    UserPreferenceRepository,
 )
 from dki.config.config_loader import ConfigLoader
 
@@ -247,6 +248,14 @@ class RAGSystem:
         """
         Build prompt with retrieved memories and conversation history.
         
+        使用 tokenizer.apply_chat_template 构造符合各模型官方标准的 chat 格式:
+        - DeepSeek/Qwen: <|im_start|>system/user/assistant<|im_end|>
+        - Llama 3.x:     <|begin_of_text|><|start_header_id|>...<|end_header_id|>
+        - GLM:           GLM 原生 chat template
+        - 其他模型:      tokenizer 内置的 chat template
+        
+        如果 tokenizer 不支持 apply_chat_template, 则回退到通用格式。
+        
         Includes automatic truncation to prevent exceeding model context length.
         
         Args:
@@ -269,83 +278,99 @@ class RAGSystem:
             history_messages=history or [],
         )
         
-        # === 1. 构建必须保留的部分 (system prompt + query + footer) ===
-        fixed_parts = []
-        if system_prompt:
-            fixed_parts.append(f"System: {system_prompt}\n")
-        fixed_parts.append(f"User: {query}")
-        fixed_parts.append("\nAssistant:")
-        fixed_text = "\n".join(fixed_parts)
-        fixed_tokens = self._estimate_tokens(fixed_text)
-        
-        remaining_tokens = max_prompt_tokens - fixed_tokens
-        
-        # === 2. 构建 retrieved context (优先保留) ===
+        # === 1. 构建 retrieved context (作为 system prompt 的一部分) ===
         context_parts = []
         context_text = ""
-        if memories and remaining_tokens > 50:
-            context_header = "Relevant information:\n"
-            context_tokens = self._estimate_tokens(context_header)
-            
+        if memories:
             for i, mem in enumerate(memories, 1):
                 line = f"[{i}] {mem.content}"
-                line_tokens = self._estimate_tokens(line)
-                if context_tokens + line_tokens > remaining_tokens * 0.5:
-                    # 最多使用剩余空间的 50% 给 context
-                    break
                 context_parts.append(line)
-                context_tokens += line_tokens
-            
-            if context_parts:
-                context_text = context_header + "\n".join(context_parts) + "\n"
-                remaining_tokens -= self._estimate_tokens(context_text)
+            context_text = "\n".join(context_parts)
         
-        prompt_info.retrieved_context = "\n".join(context_parts)
+        prompt_info.retrieved_context = context_text
+        
+        # === 2. 构建 system prompt (含检索到的上下文) ===
+        full_system_prompt = ""
+        if system_prompt and context_text:
+            full_system_prompt = (
+                f"{system_prompt}\n\n"
+                f"Relevant information:\n{context_text}"
+            )
+        elif system_prompt:
+            full_system_prompt = system_prompt
+        elif context_text:
+            full_system_prompt = f"Relevant information:\n{context_text}"
         
         # === 3. 构建 conversation history (截断最旧的) ===
         history_parts = []
-        history_text = ""
-        if history and remaining_tokens > 50:
-            history_header = "Previous conversation:\n"
-            header_tokens = self._estimate_tokens(history_header)
+        selected_history_msgs = []
+        if history:
+            # 粗估可用 token 预算
+            system_tokens = self._estimate_tokens(full_system_prompt) if full_system_prompt else 0
+            query_tokens = self._estimate_tokens(query)
+            remaining_tokens = max_prompt_tokens - system_tokens - query_tokens - 100
             
             # 从最新开始，保留尽可能多的历史
-            selected_history = []
-            used_tokens = header_tokens
-            
+            used_tokens = 0
             for msg in reversed(history):
-                role = "User" if msg["role"] == "user" else "Assistant"
-                line = f"{role}: {msg['content']}"
-                line_tokens = self._estimate_tokens(line)
-                if used_tokens + line_tokens > remaining_tokens:
+                msg_tokens = self._estimate_tokens(msg['content'])
+                if used_tokens + msg_tokens > remaining_tokens:
                     break
-                selected_history.insert(0, line)
-                used_tokens += line_tokens
+                selected_history_msgs.insert(0, msg)
+                used_tokens += msg_tokens
             
-            if selected_history:
-                history_parts = selected_history
-                history_text = history_header + "\n".join(selected_history) + "\n"
+            if selected_history_msgs:
+                for msg in selected_history_msgs:
+                    role = "User" if msg["role"] == "user" else "Assistant"
+                    history_parts.append(f"{role}: {msg['content']}")
             
-            if len(selected_history) < len(history):
+            if len(selected_history_msgs) < len(history):
                 logger.info(
-                    f"RAG prompt truncated: kept {len(selected_history)}/{len(history)} "
+                    f"RAG prompt truncated: kept {len(selected_history_msgs)}/{len(history)} "
                     f"history messages to fit model context ({max_context} tokens)"
                 )
         
         prompt_info.history_text = "\n".join(history_parts)
         
-        # === 4. 组装最终 prompt ===
-        parts = []
-        if system_prompt:
-            parts.append(f"System: {system_prompt}\n")
-        if context_text:
-            parts.append(context_text)
-        if history_text:
-            parts.append(history_text)
-        parts.append(f"User: {query}")
-        parts.append("\nAssistant:")
+        # === 4. 构造标准 messages 列表, 使用 apply_chat_template ===
+        messages = []
+        if full_system_prompt:
+            messages.append({"role": "system", "content": full_system_prompt})
         
-        final_prompt = "\n".join(parts)
+        # 添加历史对话
+        for msg in selected_history_msgs:
+            messages.append({"role": msg["role"], "content": msg["content"]})
+        
+        # 添加当前查询
+        messages.append({"role": "user", "content": query})
+        
+        # 尝试使用 tokenizer.apply_chat_template (适配所有模型)
+        tokenizer = getattr(self.model, 'tokenizer', None)
+        use_chat_template = False
+        
+        if tokenizer and hasattr(tokenizer, 'apply_chat_template'):
+            try:
+                final_prompt = tokenizer.apply_chat_template(
+                    messages,
+                    add_generation_prompt=True,
+                    tokenize=False,
+                )
+                use_chat_template = True
+            except Exception as e:
+                logger.warning(f"apply_chat_template failed, using fallback format: {e}")
+        
+        if not use_chat_template:
+            # 回退: 通用格式 (不依赖特殊 token)
+            parts = []
+            if full_system_prompt:
+                parts.append(f"System: {full_system_prompt}\n")
+            for msg in selected_history_msgs:
+                role = "User" if msg["role"] == "user" else "Assistant"
+                parts.append(f"{role}: {msg['content']}")
+            parts.append(f"User: {query}")
+            parts.append("\nAssistant:")
+            final_prompt = "\n".join(parts)
+        
         prompt_info.final_prompt = final_prompt
         
         # 最终安全检查
@@ -387,6 +412,46 @@ class RAGSystem:
                 for msg in messages
             ]
     
+    def _load_user_preferences(self, user_id: str) -> Optional[str]:
+        """
+        从数据库加载用户偏好文本 (v5.3: 为 RAG 增加偏好注入, 确保对比公平)
+        
+        Args:
+            user_id: 用户标识
+            
+        Returns:
+            偏好文本 (多条偏好合并), 无偏好时返回 None
+        """
+        if not user_id:
+            return None
+        
+        try:
+            with self.db_manager.session_scope() as db:
+                pref_repo = UserPreferenceRepository(db)
+                preferences = pref_repo.get_by_user(user_id, active_only=True)
+                
+                if not preferences:
+                    return None
+                
+                # 按优先级合并偏好文本
+                pref_texts = []
+                for p in preferences:
+                    text = getattr(p, 'preference_text', '') or ''
+                    if text.strip():
+                        pref_texts.append(text.strip())
+                
+                if pref_texts:
+                    combined = "\n".join(pref_texts)
+                    logger.debug(
+                        f"RAG loaded {len(pref_texts)} preferences for user {user_id}: "
+                        f"{len(combined)} chars"
+                    )
+                    return combined
+        except Exception as e:
+            logger.warning(f"RAG failed to load preferences for user {user_id}: {e}")
+        
+        return None
+    
     def chat(
         self,
         query: str,
@@ -403,10 +468,13 @@ class RAGSystem:
         """
         Generate response using RAG with conversation history.
         
+        v5.3: 增加偏好注入支持, 确保 DKI vs RAG 对比公平。
+        RAG 通过 system prompt 注入用户偏好 (与 DKI 类似)。
+        
         Args:
             query: User query
             session_id: Session identifier
-            user_id: User identifier (optional)
+            user_id: User identifier (optional, used for preference loading)
             top_k: Number of memories to retrieve
             system_prompt: Optional system prompt
             max_new_tokens: Maximum tokens to generate
@@ -418,6 +486,19 @@ class RAGSystem:
             RAGResponse with generated text and metadata
         """
         start_time = time.perf_counter()
+        
+        # v5.3: 加载用户偏好 (与 DKI 公平对比)
+        preference_text = self._load_user_preferences(user_id)
+        
+        # 构造 system prompt: 用户偏好 + 自定义 system prompt
+        effective_system_prompt = system_prompt or ""
+        if preference_text:
+            pref_section = f"用户偏好:\n{preference_text}"
+            if effective_system_prompt:
+                effective_system_prompt = f"{pref_section}\n\n{effective_system_prompt}"
+            else:
+                effective_system_prompt = pref_section
+            logger.debug(f"RAG injected preference into system prompt: {len(preference_text)} chars")
         
         # Retrieve relevant memories
         top_k = top_k or self.config.rag.top_k
@@ -434,7 +515,11 @@ class RAGSystem:
                 history = None
         
         # Build prompt with history (now returns tuple)
-        prompt, prompt_info = self._build_prompt(query, memories, system_prompt, history)
+        prompt, prompt_info = self._build_prompt(
+            query, memories,
+            effective_system_prompt if effective_system_prompt else None,
+            history,
+        )
         
         # Generate response
         output = self.model.generate(
@@ -494,6 +579,9 @@ class RAGSystem:
                 'prompt_length': len(prompt),
                 'model': self.model.model_name,
                 'history_turns': len(history) if history else 0,
+                # v5.3: 偏好注入信息 (与 DKI 对比公平)
+                'preference_injected': bool(preference_text),
+                'preference_text': preference_text or "",
             },
             prompt_info=prompt_info,
         )

@@ -667,8 +667,8 @@ class ExperimentDataGenerator:
     
     def generate_long_session_persona_chat(
         self,
-        n_sessions: int = 20,
-        n_turns_per_session: int = 15,
+        n_sessions: int = 40,
+        n_turns_per_session: int = 20,
         min_turn_length: int = 512,
         max_turn_length: int = 2048,
     ) -> List[Dict[str, Any]]:
@@ -903,6 +903,17 @@ class ExperimentDataGenerator:
             },
         ]
         
+        # v5.3: 扩展 turn 模板 — 当 n_turns_per_session 超过模板数量时,
+        # 基于模板内容生成追问 / 深入探讨 / 回忆测试 的 follow-up turns
+        follow_up_templates = [
+            "请你回忆一下我之前提到的{topic}，能否进一步展开讨论？我记得我们讨论过{detail}，但我想了解更多细节。",
+            "结合我的个人情况（{context}），你觉得在{topic}方面我应该注意什么？请给出具体的建议。",
+            "我想确认一下你是否还记得我的偏好：{pref}。在这个基础上，我们继续讨论{topic}的问题。",
+            "上次我们讨论{topic}时你提到了一些很好的观点。现在我想从另一个角度来看这个问题——{angle}。你怎么看？",
+            "请帮我对比一下我们之前讨论的{topic1}和{topic2}，结合我的实际需求（{need}），分析各自的优缺点。",
+            "我正在整理我们之前讨论的内容，关于{topic}这个部分，能否帮我补充一些我们之前遗漏的关键点？特别是考虑到{context}。",
+        ]
+        
         data = []
         
         for session_idx in range(n_sessions):
@@ -910,7 +921,10 @@ class ExperimentDataGenerator:
             session_id = f"long_session_{session_idx:04d}"
             
             turns = []
-            for turn_idx, turn_data in enumerate(scenario["turns"][:n_turns_per_session]):
+            base_turns = scenario["turns"]
+            
+            for turn_idx in range(min(n_turns_per_session, len(base_turns))):
+                turn_data = base_turns[turn_idx]
                 turns.append({
                     'turn_id': turn_idx,
                     'query': turn_data["query"],
@@ -921,6 +935,47 @@ class ExperimentDataGenerator:
                         if any(kw.lower() in p.lower() for kw in turn_data["expected_keywords"])
                     ],
                 })
+            
+            # v5.3: 动态生成额外 turns (当需要更多轮次时)
+            if n_turns_per_session > len(base_turns):
+                persona_snippets = [p[:60] for p in scenario["personas"]]
+                prev_keywords = [t["expected_keywords"] for t in base_turns]
+                
+                for extra_idx in range(len(base_turns), n_turns_per_session):
+                    # 从之前的 turn 中选择话题进行追问/回忆测试
+                    ref_turn = base_turns[extra_idx % len(base_turns)]
+                    template = follow_up_templates[extra_idx % len(follow_up_templates)]
+                    
+                    kws = ref_turn["expected_keywords"]
+                    topic = kws[0] if kws else "之前的话题"
+                    detail = kws[1] if len(kws) > 1 else "一些具体内容"
+                    pref = random.choice(persona_snippets)
+                    context = random.choice(persona_snippets)
+                    
+                    query = template.format(
+                        topic=topic,
+                        detail=detail,
+                        context=context,
+                        pref=pref,
+                        angle="实用性和可行性",
+                        topic1=topic,
+                        topic2=random.choice(
+                            [k[0] for k in prev_keywords if k[0] != topic]
+                        ) if len(prev_keywords) > 1 else "其他方面",
+                        need=context,
+                    )
+                    
+                    turns.append({
+                        'turn_id': extra_idx,
+                        'query': query,
+                        'expected_keywords': kws,
+                        'tests_memory': True,  # 标记为记忆测试 turn
+                        'expected_length_range': [512, 2048],
+                        'relevant_memories': [
+                            p for p in scenario["personas"]
+                            if any(kw.lower() in p.lower() for kw in kws)
+                        ],
+                    })
             
             data.append({
                 'session_id': session_id,
@@ -947,6 +1002,142 @@ class ExperimentDataGenerator:
         logger.info(f"Generated {len(data)} long-session PersonaChat sessions to {output_path}")
         return data
 
+    def generate_context_constrained_data(
+        self,
+        memory_lengths: Optional[List[int]] = None,
+        n_samples_per_length: int = 30,
+    ) -> List[Dict[str, Any]]:
+        """
+        生成上下文受限实验数据 (论文 Table 2)
+        
+        模拟不同 user memory 长度下的性能对比:
+        - 固定 context window = 4096
+        - 变化 memory_length ∈ [500, 1000, 1500, 2000, 2500, 3000, 3500]
+        - 每个长度生成 n_samples_per_length 条样本
+        
+        数据结构:
+        - memory_text: 用户记忆文本 (拼接到指定 token 数)
+        - query: 需要结合记忆回答的查询
+        - expected_keywords: 期望在回答中出现的关键词
+        - memory_length_tokens: 目标记忆长度 (token 估算)
+        - context_budget: 上下文预算 (4096)
+        """
+        if memory_lengths is None:
+            memory_lengths = [500, 1000, 1500, 2000, 2500, 3000, 3500]
+        
+        # 记忆片段池 — 每条约 50-100 tokens
+        memory_fragments_cn = [
+            "用户是素食主义者，已坚持素食超过10年。对所有肉类和海鲜过敏。",
+            "用户住在北京海淀区中关村附近，常在五道口和学院路一带活动。",
+            "用户是中国农业大学的营养学研究员，主要研究植物性蛋白质。",
+            "用户每周末去昌平有机农场采购新鲜蔬果，偏好本地时令蔬菜。",
+            "用户正在撰写一本关于中国传统素食文化的专著。",
+            "用户对坚果不过敏，但对贝类严重过敏，曾因误食虾仁住院。",
+            "用户喜欢古典音乐，尤其是贝多芬和莫扎特的交响曲。",
+            "用户养了一只名叫小白的金毛犬，每天早晚各遛一次。",
+            "用户是一名数据科学家，精通Python、PyTorch和TensorFlow。",
+            "用户在一家AI创业公司担任技术负责人，团队使用8卡A100集群。",
+            "用户喜欢阅读科幻小说，特别是刘慈欣的《三体》系列。",
+            "用户住在上海浦东新区，每天通勤约50分钟。",
+            "用户正在学习弹吉他，已经学了三个月的古典吉他。",
+            "用户对辣椒过敏，完全不能吃辣的食物。",
+            "用户周末经常去徒步，最近在计划攀登泰山。",
+            "用户有一个5岁的孩子，对食品安全非常关注。",
+            "用户喜欢喝咖啡，偏好手冲和浓缩，不喜欢速溶咖啡。",
+            "用户是一名摄影爱好者，专攻人文纪实和街头摄影。",
+            "用户正在准备一个关于LLM推理优化的技术分享。",
+            "用户每天晚上10点前入睡，早上6点起床做瑜伽。",
+            "上个月用户去了成都旅游，参观了杜甫草堂和武侯祠。",
+            "用户的预算比较紧张，每月餐饮预算不超过3000元。",
+            "用户最近在研究肠道菌群与植物性饮食的关系。",
+            "用户下周计划去杭州出差，需要安排住宿和餐饮。",
+            "用户喜欢运动，每周跑步三次，每次5公里左右。",
+            "用户的母亲有高血压和糖尿病，需要低盐低糖饮食。",
+            "用户曾在2023年获得全国素食烹饪大赛的银奖。",
+            "用户的研究团队最近发表了一篇关于植物蛋白消化率的论文。",
+            "用户习惯使用公共交通出行，偶尔骑共享单车。",
+            "用户喜欢在网上购买有机食品，常用的平台是京东和本来生活。",
+        ]
+        
+        # 查询模板
+        query_templates = [
+            {
+                "query": "根据我的饮食偏好和过敏情况，推荐我今天的午餐。",
+                "expected_keywords": ["素食", "过敏"],
+            },
+            {
+                "query": "考虑到我的生活习惯和兴趣，推荐一个适合我的周末活动。",
+                "expected_keywords": ["周末", "活动"],
+            },
+            {
+                "query": "基于我之前提到的工作和研究方向，推荐几篇值得阅读的论文。",
+                "expected_keywords": ["研究", "论文"],
+            },
+            {
+                "query": "结合我的饮食限制和预算，帮我制定这周的采购清单。",
+                "expected_keywords": ["素食", "采购"],
+            },
+            {
+                "query": "根据我的个人情况，帮我安排下周的出差行程。",
+                "expected_keywords": ["出差", "安排"],
+            },
+        ]
+        
+        data = []
+        
+        for mem_length in memory_lengths:
+            for sample_idx in range(n_samples_per_length):
+                # 拼接记忆到目标长度 (粗估: 1 中文字 ≈ 1.5 token)
+                target_chars = int(mem_length / 1.5)
+                memory_text = ""
+                used_fragments = []
+                
+                shuffled = memory_fragments_cn.copy()
+                random.shuffle(shuffled)
+                
+                for frag in shuffled:
+                    if len(memory_text) >= target_chars:
+                        break
+                    memory_text += frag + "\n"
+                    used_fragments.append(frag)
+                
+                # 不够长则重复填充
+                while len(memory_text) < target_chars:
+                    frag = random.choice(memory_fragments_cn)
+                    detail = f"补充信息（{random.randint(1, 100)}）：{frag}"
+                    memory_text += detail + "\n"
+                    used_fragments.append(detail)
+                
+                # 选择查询
+                qt = random.choice(query_templates)
+                
+                data.append({
+                    "id": f"ctx_{mem_length}_{sample_idx}",
+                    "memory_length_tokens": mem_length,
+                    "context_budget": 4096,
+                    "memory_text": memory_text.strip(),
+                    "memory_fragments": used_fragments,
+                    "query": qt["query"],
+                    "expected_keywords": qt["expected_keywords"],
+                    "experiment_user": random.choice([
+                        "exp_user_vegetarian",
+                        "exp_user_tech",
+                        "exp_user_outdoor",
+                        "exp_user_music",
+                    ]),
+                })
+        
+        # Save
+        filepath = self.output_dir / "context_constrained.json"
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        
+        logger.info(
+            f"Generated {len(data)} context-constrained samples "
+            f"({len(memory_lengths)} memory lengths × {n_samples_per_length} samples)"
+        )
+        return data
+
     def generate_all(
         self,
         persona_sessions: int = 100,
@@ -969,6 +1160,7 @@ class ExperimentDataGenerator:
         if include_advanced:
             result['multi_turn_coherence'] = self.generate_multi_turn_coherence()
             result['ablation'] = self.generate_ablation_data()
+            result['context_constrained'] = self.generate_context_constrained_data()
         
         if include_long_sessions:
             result['long_session_persona_chat'] = self.generate_long_session_persona_chat()

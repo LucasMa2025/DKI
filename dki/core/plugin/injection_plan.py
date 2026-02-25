@@ -253,6 +253,11 @@ class InjectionPlan:
     fact_rounds_used: int = 0             # 实际使用的 fact call 轮次 (Planner 侧)
     session_id: str = ""                  # 会话 ID (用于 fact retriever)
     
+    # ============ Recall v4 结构化历史 (v5.1 修复角色混乱) ============
+    # 保留原始的 HistoryItem 列表, 用于 Executor 构造正确的多轮 chat template
+    # 避免将所有历史扁平化为单一 user message 导致角色混乱
+    history_items: List[Any] = field(default_factory=list)  # List[HistoryItem]
+    
     # ============ Planner-only Fact Blocks (v3.3) ============
     # Planner 在构建计划时预解析的事实块
     # Executor 不再有 Fact Call 循环，所有事实在 Planner 侧解析完毕
