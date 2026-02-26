@@ -39,6 +39,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 from loguru import logger
 
+from dki.core.text_utils import strip_think_content, estimate_tokens_fast
+
 from dki.models.base import BaseModelAdapter, ModelOutput, KVCacheEntry, PackedKV
 from dki.core.plugin.injection_plan import (
     InjectionPlan,
@@ -513,10 +515,83 @@ class InjectionExecutor:
             except Exception as e:
                 logger.warning(f"apply_chat_template failed in Executor: {e}")
         
-        # 回退: 直接拼接 (adapter 层会检测并包装)
+        # 回退: ChatML 格式 (半角标记, 标签闭合, Qwen/DeepSeek 通用)
+        parts = []
         if system_content:
-            return system_content + "\n\n" + user_content
-        return user_content
+            parts.append(f"<|im_start|>system\n{system_content}<|im_end|>")
+        parts.append(f"<|im_start|>user\n{user_content}<|im_end|>")
+        parts.append("<|im_start|>assistant")
+        return "\n".join(parts) + "\n"
+    
+    def _estimate_prompt_tokens(self, text: str) -> int:
+        """
+        v5.7: 使用快速估算 (不依赖 tokenizer, 略微高估)
+        """
+        return estimate_tokens_fast(text, overestimate_factor=1.15)
+    
+    def _trim_history_messages(
+        self,
+        history_messages: list,
+        system_content: str,
+        original_query: str,
+        max_new_tokens: int = 512,
+    ) -> list:
+        """
+        v5.7: 重新设计的历史消息修剪
+        
+        核心原则: 用户当前输入 (original_query) 永远不被截断,
+        只从最旧的历史消息开始移除。
+        
+        预算: 上下文窗口 - 生成预留(30%) - 标记开销(120) - 固定开销(偏好+当前输入)
+        """
+        if not history_messages:
+            return history_messages
+        
+        # 获取 max_model_len
+        max_model_len = getattr(self.model, 'max_model_len', 4096)
+        if not max_model_len or max_model_len <= 0:
+            max_model_len = 4096
+        
+        # v5.7: 生成预留 = 30% 上下文
+        generation_reserve = int(max_model_len * 0.30)
+        tag_overhead = 120  # chat template 标记开销
+        
+        max_prompt_tokens = max_model_len - generation_reserve - tag_overhead
+        
+        # 计算固定开销 (直接估算, 不预留)
+        fixed_tokens = 0
+        if system_content:
+            fixed_tokens += self._estimate_prompt_tokens(system_content) + 10
+        fixed_tokens += self._estimate_prompt_tokens(original_query) + 10
+        fixed_tokens += 20  # generation prompt + misc tags
+        
+        history_budget = max_prompt_tokens - fixed_tokens
+        if history_budget <= 0:
+            logger.warning(
+                f"Executor: no budget for history: max_prompt={max_prompt_tokens}, "
+                f"fixed={fixed_tokens}"
+            )
+            return []
+        
+        # 从最新消息开始保留
+        kept = []
+        used = 0
+        for msg in reversed(history_messages):
+            msg_tokens = self._estimate_prompt_tokens(msg['content']) + 8
+            if used + msg_tokens > history_budget:
+                break
+            kept.insert(0, msg)
+            used += msg_tokens
+        
+        trimmed = len(history_messages) - len(kept)
+        if trimmed > 0:
+            logger.info(
+                f"Executor: history trimmed: "
+                f"kept {len(kept)}/{len(history_messages)}, "
+                f"budget={history_budget}, used={used}"
+            )
+        
+        return kept
     
     def _build_multiturn_chat_prompt(
         self,
@@ -526,6 +601,8 @@ class InjectionExecutor:
         """
         v5.1: 使用 chat template 构造正确的多轮对话格式 (修复角色混乱)
         
+        v5.6: 增加 token 预算控制, 确保用户当前输入永远不被截断
+        
         之前的做法是将所有历史扁平化为单一 user message, 导致模型无法区分
         历史中的 User/Assistant 角色。
         
@@ -534,6 +611,7 @@ class InjectionExecutor:
         2. plan.history_items (AdapterChatMessage) → 独立的 user/assistant messages
         3. 当前查询 → 最后一个 user message
         4. 通过 tokenizer.apply_chat_template 生成正确的多轮 prompt
+        5. **token 预算检查**: 如果总长度超过预算, 从最旧历史开始修剪
         
         回退策略: 如果没有 tokenizer 或 apply_chat_template 失败,
         使用 ChatML 格式 (兼容 DeepSeek/Qwen)。
@@ -558,12 +636,7 @@ class InjectionExecutor:
                 strength = "轻微参考以下用户偏好（可酌情忽略）"
             system_content = f"请{strength}:\n{plan.preference_text}"
         
-        # ============ 2. 构造 messages 列表 ============
-        messages = []
-        if system_content:
-            messages.append({"role": "system", "content": system_content})
-        
-        # 添加历史消息 (保留原始角色)
+        # ============ 2. 收集历史消息 ============
         # 注入标记列表 (assistant 消息中包含这些标记时应过滤)
         _injection_markers = [
             "[会话历史参考]", "[Session History Reference]",
@@ -573,6 +646,7 @@ class InjectionExecutor:
             "[DMI Memory Context]", "[DMI Memory Context End]",
         ]
         
+        history_messages = []
         for item in plan.history_items:
             role = getattr(item, 'role', 'user') or 'user'
             content = getattr(item, 'content', str(item))
@@ -585,15 +659,34 @@ class InjectionExecutor:
             if role == 'assistant' and any(m in content for m in _injection_markers):
                 continue
             
+            # v5.7: 移除历史消息中的 <think> 推理内容 (防御性)
+            if role == 'assistant' and content:
+                content, _ = strip_think_content(content)
+            
             if content and content.strip():
-                messages.append({"role": role, "content": content})
+                history_messages.append({"role": role, "content": content})
+        
+        # ============ 2.5 Token 预算修剪 (v5.6) ============
+        history_messages = self._trim_history_messages(
+            history_messages=history_messages,
+            system_content=system_content,
+            original_query=plan.original_query,
+        )
+        
+        # ============ 3. 构造 messages 列表 ============
+        messages = []
+        if system_content:
+            messages.append({"role": "system", "content": system_content})
+        
+        for msg in history_messages:
+            messages.append(msg)
         
         # 添加当前用户查询 (始终是最后一个 user message)
         messages.append({"role": "user", "content": plan.original_query})
         
-        history_count = len(plan.history_items)
+        history_count = len(history_messages)
         
-        # ============ 3. 使用 apply_chat_template 格式化 ============
+        # ============ 4. 使用 apply_chat_template 格式化 ============
         if tokenizer and hasattr(tokenizer, 'apply_chat_template'):
             try:
                 formatted = tokenizer.apply_chat_template(

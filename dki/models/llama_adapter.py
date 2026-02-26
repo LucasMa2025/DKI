@@ -145,21 +145,21 @@ class LlamaAdapter(BaseModelAdapter):
             except Exception as e:
                 logger.warning(f"apply_chat_template failed, using manual template: {e}")
         
-        # 回退: 根据模型版本手动构造官方模板
+        # 回退: 根据模型版本手动构造官方模板 (标签闭合)
         if self._is_llama3():
-            # Llama 3.x 官方模板
+            # Llama 3.x 官方模板 (每个消息以 <|eot_id|> 闭合)
             parts = ["<|begin_of_text|>"]
             if system_prompt:
                 parts.append(
-                    f"<|start_header_id|>system<|end_header_id|>\n{system_prompt}"
+                    f"<|start_header_id|>system<|end_header_id|>\n\n{system_prompt}<|eot_id|>"
                 )
             parts.append(
-                f"<|start_header_id|>user<|end_header_id|>\n{prompt}"
+                f"<|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|>"
             )
             parts.append(
-                "<|start_header_id|>assistant<|end_header_id|>\n"
+                "<|start_header_id|>assistant<|end_header_id|>\n\n"
             )
-            return "\n".join(parts) if system_prompt else "".join(parts)
+            return "".join(parts)
         else:
             # Llama 2 Chat 官方模板
             if system_prompt:
@@ -178,8 +178,11 @@ class LlamaAdapter(BaseModelAdapter):
         # Llama 2 标记
         if '[INST]' in text:
             return True
-        # DeepSeek/Qwen ChatML 标记
+        # DeepSeek/Qwen ChatML 标记 (半角)
         if '<|im_start|>' in text:
+            return True
+        # DeepSeek V2/V3 原生标记 (全角 ｜, tokenizer 自带格式)
+        if '<\uff5c' in text and '\uff5c>' in text:
             return True
         return False
     

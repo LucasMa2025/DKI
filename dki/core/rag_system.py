@@ -1,6 +1,13 @@
 """
 RAG System for DKI
 Retrieval-Augmented Generation implementation as baseline
+
+v5.7 更新:
+- 从提示词构造中移除 <think> 推理内容
+- 使用新的 token 预算分配 (30% 生成预留)
+- 历史轮次从外置配置读取 (与 DKI 一致)
+- 使用快速 token 估算 (estimate_tokens_fast)
+- 存储响应前移除 think 内容
 """
 
 import time
@@ -9,6 +16,7 @@ from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
+from dki.core.text_utils import strip_think_content, estimate_tokens_fast
 from dki.core.memory_router import MemoryRouter, MemorySearchResult
 from dki.core.embedding_service import EmbeddingService
 from dki.models.factory import ModelFactory
@@ -217,14 +225,11 @@ class RAGSystem:
         return count
     
     def _estimate_tokens(self, text: str) -> int:
-        """估算 token 数 (使用 tokenizer 或字符数近似)"""
-        if self.model and hasattr(self.model, 'tokenizer') and self.model.tokenizer:
-            try:
-                return len(self.model.tokenizer.encode(text))
-            except Exception:
-                pass
-        # 粗略估算: 中文约 1.5 字/token, 英文约 4 字符/token, 取平均 2.5
-        return max(1, len(text) // 2)
+        """
+        v5.7: 使用快速估算 (不依赖 tokenizer, 略微高估 15%)
+        与 DKI 系统使用相同的估算方法, 确保对比公平
+        """
+        return estimate_tokens_fast(text, overestimate_factor=1.15)
     
     def _get_max_context_length(self) -> int:
         """获取模型最大上下文长度"""
@@ -267,9 +272,11 @@ class RAGSystem:
         Returns:
             Tuple of (formatted_prompt, RAGPromptInfo)
         """
-        # 获取模型最大上下文长度, 预留 generation 空间
+        # v5.7: 获取模型最大上下文长度, 生成预留 = 30% 上下文
         max_context = self._get_max_context_length()
-        max_prompt_tokens = max_context - 512  # 预留 512 tokens 给生成
+        generation_reserve = int(max_context * 0.30)
+        tag_overhead = 120  # chat template 标记开销
+        max_prompt_tokens = max_context - generation_reserve - tag_overhead
         
         # 用于记录的信息
         prompt_info = RAGPromptInfo(
@@ -305,15 +312,27 @@ class RAGSystem:
         history_parts = []
         selected_history_msgs = []
         if history:
-            # 粗估可用 token 预算
+            # v5.7: 移除历史消息中的 <think> 推理内容
+            cleaned_history = []
+            for msg in history:
+                cleaned_msg = dict(msg)  # 浅拷贝
+                if cleaned_msg.get('role') == 'assistant' and cleaned_msg.get('content'):
+                    cleaned_content, _ = strip_think_content(cleaned_msg['content'])
+                    if cleaned_content and cleaned_content.strip():
+                        cleaned_msg['content'] = cleaned_content
+                    else:
+                        continue  # 清理后为空, 跳过
+                cleaned_history.append(cleaned_msg)
+            
+            # 粗估可用 token 预算 (直接估算, 不预留)
             system_tokens = self._estimate_tokens(full_system_prompt) if full_system_prompt else 0
             query_tokens = self._estimate_tokens(query)
-            remaining_tokens = max_prompt_tokens - system_tokens - query_tokens - 100
+            remaining_tokens = max_prompt_tokens - system_tokens - query_tokens - 40
             
             # 从最新开始，保留尽可能多的历史
             used_tokens = 0
-            for msg in reversed(history):
-                msg_tokens = self._estimate_tokens(msg['content'])
+            for msg in reversed(cleaned_history):
+                msg_tokens = self._estimate_tokens(msg['content']) + 8  # +8 for role tags
                 if used_tokens + msg_tokens > remaining_tokens:
                     break
                 selected_history_msgs.insert(0, msg)
@@ -324,9 +343,9 @@ class RAGSystem:
                     role = "User" if msg["role"] == "user" else "Assistant"
                     history_parts.append(f"{role}: {msg['content']}")
             
-            if len(selected_history_msgs) < len(history):
+            if len(selected_history_msgs) < len(cleaned_history):
                 logger.info(
-                    f"RAG prompt truncated: kept {len(selected_history_msgs)}/{len(history)} "
+                    f"RAG prompt truncated: kept {len(selected_history_msgs)}/{len(cleaned_history)} "
                     f"history messages to fit model context ({max_context} tokens)"
                 )
         
@@ -360,16 +379,16 @@ class RAGSystem:
                 logger.warning(f"apply_chat_template failed, using fallback format: {e}")
         
         if not use_chat_template:
-            # 回退: 通用格式 (不依赖特殊 token)
+            # 回退: ChatML 格式 (半角标记, 标签闭合, Qwen/DeepSeek/通用)
+            # 确保所有 <|im_start|> 都有对应的 <|im_end|> 闭合
             parts = []
             if full_system_prompt:
-                parts.append(f"System: {full_system_prompt}\n")
+                parts.append(f"<|im_start|>system\n{full_system_prompt}<|im_end|>")
             for msg in selected_history_msgs:
-                role = "User" if msg["role"] == "user" else "Assistant"
-                parts.append(f"{role}: {msg['content']}")
-            parts.append(f"User: {query}")
-            parts.append("\nAssistant:")
-            final_prompt = "\n".join(parts)
+                parts.append(f"<|im_start|>{msg['role']}\n{msg['content']}<|im_end|>")
+            parts.append(f"<|im_start|>user\n{query}<|im_end|>")
+            parts.append("<|im_start|>assistant")
+            final_prompt = "\n".join(parts) + "\n"
         
         prompt_info.final_prompt = final_prompt
         
@@ -380,8 +399,8 @@ class RAGSystem:
                 f"RAG prompt still too long ({final_tokens} > {max_prompt_tokens}), "
                 f"forcefully truncating"
             )
-            # 强制截断: 只保留 query
-            final_prompt = f"User: {query}\nAssistant:"
+            # 强制截断: 只保留 query (ChatML 格式, 半角标记, 标签闭合)
+            final_prompt = f"<|im_start|>user\n{query}<|im_end|>\n<|im_start|>assistant\n"
             prompt_info.final_prompt = final_prompt
             prompt_info.history_text = ""
             prompt_info.retrieved_context = ""
@@ -452,6 +471,23 @@ class RAGSystem:
         
         return None
     
+    def _get_max_history_turns(self) -> int:
+        """
+        v5.7: 从外置配置读取最大历史轮次 (与 DKI 一致)
+        
+        配置路径: dki.recall.budget.max_recent_turns (默认 5)
+        """
+        try:
+            recall_obj = getattr(self.config.dki, 'recall', None)
+            if recall_obj:
+                budget_obj = getattr(recall_obj, 'budget', None) if hasattr(recall_obj, 'budget') else (recall_obj.get('budget') if isinstance(recall_obj, dict) else None)
+                if budget_obj:
+                    val = getattr(budget_obj, 'max_recent_turns', 5) if hasattr(budget_obj, 'max_recent_turns') else (budget_obj.get('max_recent_turns', 5) if isinstance(budget_obj, dict) else 5)
+                    return val
+        except Exception:
+            pass
+        return 5
+    
     def chat(
         self,
         query: str,
@@ -462,14 +498,17 @@ class RAGSystem:
         max_new_tokens: int = 512,
         temperature: float = 0.7,
         include_history: bool = True,
-        max_history_turns: int = 5,
+        max_history_turns: Optional[int] = None,
         **kwargs
     ) -> RAGResponse:
         """
         Generate response using RAG with conversation history.
         
-        v5.3: 增加偏好注入支持, 确保 DKI vs RAG 对比公平。
-        RAG 通过 system prompt 注入用户偏好 (与 DKI 类似)。
+        v5.7: 增强偏好注入和历史轮次配置
+        - 偏好通过 system prompt 注入 (与 DKI 一致)
+        - 历史轮次从外置配置读取 (dki.recall.budget.max_recent_turns)
+        - 移除 <think> 推理内容 (存储和召回时双重过滤)
+        - 使用 30% 上下文生成预留 (与 DKI 一致)
         
         Args:
             query: User query
@@ -480,12 +519,16 @@ class RAGSystem:
             max_new_tokens: Maximum tokens to generate
             temperature: Sampling temperature
             include_history: Whether to include conversation history
-            max_history_turns: Maximum history turns to include
+            max_history_turns: Maximum history turns (None = 从配置读取)
             
         Returns:
             RAGResponse with generated text and metadata
         """
         start_time = time.perf_counter()
+        
+        # v5.7: 历史轮次从外置配置读取 (与 DKI 一致)
+        if max_history_turns is None:
+            max_history_turns = self._get_max_history_turns()
         
         # v5.3: 加载用户偏好 (与 DKI 公平对比)
         preference_text = self._load_user_preferences(user_id)
@@ -532,6 +575,14 @@ class RAGSystem:
         end_time = time.perf_counter()
         total_latency = (end_time - start_time) * 1000
         
+        # v5.7: 存储前移除 <think> 推理内容
+        clean_response, think_stripped = strip_think_content(output.text)
+        if think_stripped:
+            logger.debug(
+                f"RAG: Think content stripped before DB storage: "
+                f"{len(output.text)} -> {len(clean_response)} chars"
+            )
+        
         # Log to database
         try:
             with self.db_manager.session_scope() as db:
@@ -549,11 +600,11 @@ class RAGSystem:
                     content=query,
                 )
                 
-                # Store assistant response
+                # Store assistant response (存储清理后的内容)
                 conv_repo.create(
                     session_id=session_id,
                     role='assistant',
-                    content=output.text,
+                    content=clean_response,
                     injection_mode='rag',
                     memory_ids=[m.memory_id for m in memories],
                     latency_ms=total_latency,
@@ -570,7 +621,7 @@ class RAGSystem:
             logger.error(f"Failed to log conversation: {e}")
         
         return RAGResponse(
-            text=output.text,
+            text=clean_response,  # v5.7: 返回清理后的响应 (无 think 内容)
             memories_used=memories,
             latency_ms=total_latency,
             input_tokens=output.input_tokens,
@@ -582,6 +633,8 @@ class RAGSystem:
                 # v5.3: 偏好注入信息 (与 DKI 对比公平)
                 'preference_injected': bool(preference_text),
                 'preference_text': preference_text or "",
+                # v5.7: think 内容过滤信息
+                'think_content_stripped': think_stripped,
             },
             prompt_info=prompt_info,
         )

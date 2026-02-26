@@ -37,19 +37,36 @@ class RecallSignalsConfig:
 
 @dataclass
 class RecallBudgetConfig:
-    """动态 History 预算配置"""
-    generation_reserve: int = 512
-    instruction_reserve: int = 150
-    min_recent_turns: int = 2
-    max_recent_turns: int = 5
+    """
+    v5.7: 重新设计的 Token 预算配置
+    
+    预算分配策略:
+    - generation_ratio: 生成预留比例 (默认 30% 上下文)
+    - instruction_reserve: 标记开销 (chat template 标记, 默认 120)
+    - preference_max_tokens: 偏好最大 tokens (100-200)
+    - 当前输入: 直接估算 (不预留)
+    - 剩余 → 历史消息
+    """
+    generation_reserve: int = 512       # fallback: 固定生成预留
+    instruction_reserve: int = 120      # 标记开销 (chat template)
+    preference_max_tokens: int = 200    # 偏好最大 token 数
+    min_recent_turns: int = 2           # 至少补充的近期完整轮次
+    max_recent_turns: int = 5           # 最多补充的近期完整轮次 (外置配置)
+    generation_ratio: float = 0.30      # v5.7: 生成预留比例 (30% 上下文)
 
 
 @dataclass
 class RecallSummaryConfig:
-    """逐消息 Summary 配置"""
-    per_message_threshold: int = 200
-    max_tokens_per_summary: int = 150
-    strategy: str = "extractive"  # extractive | llm
+    """
+    v5.7: 历史消息压缩策略
+    
+    逐消息阈值判断:
+    - < per_message_threshold → 保留全文
+    - >= per_message_threshold → summary + trace_id
+    """
+    per_message_threshold: int = 300    # v5.7: 调整为 300 tokens (可外置配置)
+    max_tokens_per_summary: int = 150   # 每条 summary 最大 tokens
+    strategy: str = "extractive"        # extractive | llm
 
 
 @dataclass
@@ -166,7 +183,13 @@ class RecallConfig:
             return cls()
         
         signals = RecallSignalsConfig(**d.get("signals", {})) if "signals" in d else RecallSignalsConfig()
-        budget = RecallBudgetConfig(**d.get("budget", {})) if "budget" in d else RecallBudgetConfig()
+        
+        # v5.7: RecallBudgetConfig 新增字段, 需要过滤未知字段
+        budget_dict = d.get("budget", {})
+        budget_fields = {f.name for f in RecallBudgetConfig.__dataclass_fields__.values()}
+        budget_filtered = {k: v for k, v in budget_dict.items() if k in budget_fields} if budget_dict else {}
+        budget = RecallBudgetConfig(**budget_filtered) if budget_filtered else RecallBudgetConfig()
+        
         summary = RecallSummaryConfig(**d.get("summary", {})) if "summary" in d else RecallSummaryConfig()
         fact_call = RecallFactCallConfig(**d.get("fact_call", {})) if "fact_call" in d else RecallFactCallConfig()
         

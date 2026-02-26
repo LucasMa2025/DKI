@@ -36,6 +36,8 @@ from datetime import datetime
 
 from loguru import logger
 
+from dki.core.text_utils import strip_think_content
+
 from dki.adapters.base import (
     IUserDataAdapter,
     UserPreference as AdapterUserPreference,
@@ -759,8 +761,11 @@ class DKIPlugin:
                 final_input=plan.final_input,
             )
             
+            # v5.7: 移除 <think> 推理内容
+            clean_text, _ = strip_think_content(result.text)
+            
             return DKIPluginResponse(
-                text=result.text,
+                text=clean_text,
                 input_tokens=result.input_tokens,
                 output_tokens=result.output_tokens,
                 metadata=metadata,
@@ -809,9 +814,12 @@ class DKIPlugin:
                     **kwargs,
                 )
                 
+                # v5.7: 移除 <think> 推理内容
+                clean_text, _ = strip_think_content(result.text)
+                
                 metadata.latency_ms = (time.time() - start_time) * 1000
                 return DKIPluginResponse(
-                    text=result.text,
+                    text=clean_text,
                     input_tokens=result.input_tokens,
                     output_tokens=result.output_tokens,
                     metadata=metadata,
@@ -828,9 +836,12 @@ class DKIPlugin:
                     temperature=temperature,
                     **kwargs,
                 )
+                # v5.7: 移除 <think> 推理内容
+                clean_text, _ = strip_think_content(output.text)
+                
                 metadata.injection_strategy = "none_fallback"
                 return DKIPluginResponse(
-                    text=output.text,
+                    text=clean_text,
                     input_tokens=output.input_tokens,
                     output_tokens=output.output_tokens,
                     metadata=metadata,

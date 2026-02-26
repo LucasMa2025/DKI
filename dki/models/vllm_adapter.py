@@ -221,8 +221,11 @@ class VLLMAdapter(BaseModelAdapter):
     
     def _has_chat_template_tokens(self, text: str) -> bool:
         """检测文本是否已包含 chat template 特殊标记 (避免双重包装)"""
-        # DeepSeek/Qwen ChatML 标记
+        # DeepSeek/Qwen ChatML 标记 (半角)
         if '<|im_start|>' in text:
+            return True
+        # DeepSeek V2/V3 原生标记 (全角 ｜ + 下划线 ▁, 这是 tokenizer 自带格式)
+        if '<\uff5c' in text and '\uff5c>' in text:
             return True
         # Llama 3 标记
         if '<|begin_of_text|>' in text or '<|start_header_id|>' in text:

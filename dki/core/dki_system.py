@@ -53,6 +53,7 @@ This makes DKI a "plug-and-play" solution for any decoder-only LLM.
 ============================================================================
 """
 
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union
@@ -60,6 +61,7 @@ from typing import Any, Dict, List, Optional, Union
 import torch
 from loguru import logger
 
+from dki.core.text_utils import strip_think_content, estimate_tokens_fast
 from dki.core.memory_router import MemoryRouter, MemorySearchResult
 from dki.core.embedding_service import EmbeddingService
 from dki.core.components.memory_influence_scaling import MemoryInfluenceScaling
@@ -879,13 +881,8 @@ class DKISystem:
                         f"recent={recall_result.recent_turns_added}"
                     )
                     
-                    # 后缀组装
-                    context_window = 4096
-                    if hasattr(self.config.model, 'engines'):
-                        engine_cfg = self.config.model.engines.get(
-                            self.config.model.default_engine, {}
-                        )
-                        context_window = getattr(engine_cfg, 'max_model_len', 4096) if hasattr(engine_cfg, 'max_model_len') else 4096
+                    # 后缀组装 (使用动态上下文窗口)
+                    context_window = self._get_context_window()
                     
                     pref_tokens = 0
                     if preference:
@@ -1298,7 +1295,17 @@ class DKISystem:
                 **_recall_v4_signal_stats,
             }
         
+        # v5.7: 移除 <think> 推理内容 (用于返回和存储)
+        clean_response_text, think_stripped = strip_think_content(output.text)
+        if think_stripped:
+            logger.debug(
+                f"DKI: Think content stripped: "
+                f"{len(output.text)} -> {len(clean_response_text)} chars"
+            )
+            metadata['think_content_stripped'] = True
+        
         # Log to database (使用原始用户输入，避免历史后缀递归嵌套)
+        # _log_conversation 内部也会执行 strip_think_content
         self._log_conversation(
             session_id=session_id,
             query=original_query,
@@ -1309,7 +1316,7 @@ class DKISystem:
         )
         
         return DKIResponse(
-            text=output.text,
+            text=clean_response_text,  # v5.7: 返回清理后的响应 (无 think 内容)
             memories_used=memories_used,
             gating_decision=gating_decision,
             latency_ms=timer.breakdown.total_ms,
@@ -1322,6 +1329,145 @@ class DKISystem:
             metadata=metadata,
         )
     
+    def _estimate_prompt_tokens(self, text: str) -> int:
+        """
+        估算文本的 token 数量 (v5.7: 使用快速估算, 略微高估)
+        
+        不依赖 tokenizer, 使用 estimate_tokens_fast:
+        - 中文字符: ~1.5 token/字 × 1.15 (高估 15%)
+        - 英文单词: ~1.3 token/word × 1.15
+        - 其他字符: ~0.5 token/char
+        """
+        return estimate_tokens_fast(text, overestimate_factor=1.15)
+    
+    def _get_context_window(self) -> int:
+        """获取模型上下文窗口大小"""
+        context_window = 4096
+        if hasattr(self.config.model, 'engines'):
+            engine_cfg = self.config.model.engines.get(
+                self.config.model.default_engine, {}
+            )
+            context_window = getattr(engine_cfg, 'max_model_len', 4096) if hasattr(engine_cfg, 'max_model_len') else 4096
+        return context_window
+    
+    def _get_max_prompt_tokens(self, max_new_tokens: int = 512) -> int:
+        """
+        v5.7: 重新设计的 token 预算分配
+        
+        核心变更:
+        - 生成预留 = 30% 上下文 (而非固定 512)
+        - 偏好: 100-200 tokens (由配置控制)
+        - 标记开销: 100-150 tokens (chat template 标记)
+        - 当前输入: 直接估算 (不预留, 以估算值为准)
+        - 剩余: 历史消息
+        
+        预算 = 上下文窗口 - 生成预留(30%) - 标记开销
+        """
+        context_window = self._get_context_window()
+        
+        # v5.7: 生成预留 = 30% 上下文
+        generation_reserve = int(context_window * 0.30)
+        
+        # 标记开销 (chat template 标记, 特殊 token 等)
+        tag_overhead = self._get_tag_overhead()
+        
+        return context_window - generation_reserve - tag_overhead
+    
+    def _get_tag_overhead(self) -> int:
+        """获取 chat template 标记开销 (可配置, 默认 120)"""
+        # 从 recall.budget.instruction_reserve 读取, 默认 120
+        try:
+            recall_obj = getattr(self.config.dki, 'recall', None)
+            if recall_obj:
+                budget_obj = getattr(recall_obj, 'budget', None) if hasattr(recall_obj, 'budget') else (recall_obj.get('budget') if isinstance(recall_obj, dict) else None)
+                if budget_obj:
+                    return getattr(budget_obj, 'instruction_reserve', 120) if hasattr(budget_obj, 'instruction_reserve') else (budget_obj.get('instruction_reserve', 120) if isinstance(budget_obj, dict) else 120)
+        except Exception:
+            pass
+        return 120
+    
+    def _trim_history_to_budget(
+        self,
+        history_messages: list,
+        system_content: str,
+        original_query: str,
+        max_prompt_tokens: int,
+    ) -> list:
+        """
+        v5.7: 重新设计的历史消息修剪
+        
+        核心原则: 用户当前输入 (original_query) 和偏好 (system_content) 
+        **永远不会被截断**, 只从最旧的历史消息开始移除。
+        
+        预算分配 (以 4096 为例):
+        ┌──────────────────────────────────────────────────┐
+        │ max_model_len = 4096                             │
+        ├──────────────────────────────────────────────────┤
+        │ 生成预留 (30%)                   = 1228          │
+        │ 标记开销 (tag_overhead)          = 120           │
+        │ ─────────────────────────────────────────────    │
+        │ 可用于 prompt 的总预算            = 2748         │
+        │                                                  │
+        │ 固定开销 (不可压缩, 直接估算):                     │
+        │   偏好 (system)                  ≈ 100-200       │
+        │   当前用户输入                    ≈ 按实际估算     │
+        │ ─────────────────────────────────────────────    │
+        │ 剩余 → 历史消息预算                               │
+        └──────────────────────────────────────────────────┘
+        
+        Args:
+            history_messages: 历史消息列表 [{"role": ..., "content": ...}]
+            system_content: system message 内容
+            original_query: 用户当前输入 (不可截断)
+            max_prompt_tokens: prompt 最大 token 数
+            
+        Returns:
+            修剪后的历史消息列表 (从最旧的开始移除)
+        """
+        if not history_messages:
+            return history_messages
+        
+        # 计算固定开销 (不可压缩部分, 直接估算)
+        fixed_tokens = 0
+        if system_content:
+            fixed_tokens += self._estimate_prompt_tokens(system_content) + 10  # +10 for role tags
+        # 当前输入: 直接估算 (不需要预留, 以估算值为准, 已含高估)
+        fixed_tokens += self._estimate_prompt_tokens(original_query) + 10  # +10 for role tags
+        fixed_tokens += 20  # generation prompt + misc tags
+        
+        # 历史消息可用预算
+        history_budget = max_prompt_tokens - fixed_tokens
+        
+        if history_budget <= 0:
+            logger.warning(
+                f"No budget for history: max_prompt={max_prompt_tokens}, "
+                f"fixed={fixed_tokens} (system+query+tags)"
+            )
+            return []
+        
+        # 从最新消息开始保留 (最旧的先丢弃)
+        # 使用反向遍历: 最新的消息优先保留
+        kept_messages = []
+        used_tokens = 0
+        
+        for msg in reversed(history_messages):
+            msg_tokens = self._estimate_prompt_tokens(msg['content']) + 8  # +8 for role tags per message
+            if used_tokens + msg_tokens > history_budget:
+                break
+            kept_messages.insert(0, msg)
+            used_tokens += msg_tokens
+        
+        trimmed_count = len(history_messages) - len(kept_messages)
+        if trimmed_count > 0:
+            logger.info(
+                f"History trimmed to fit context: "
+                f"kept {len(kept_messages)}/{len(history_messages)} messages, "
+                f"history_budget={history_budget}, used={used_tokens}, "
+                f"fixed_overhead={fixed_tokens} (system+query)"
+            )
+        
+        return kept_messages
+    
     def _build_recall_v4_chat_prompt(
         self,
         items: list,
@@ -1333,6 +1479,8 @@ class DKISystem:
         """
         v5.1: 使用 chat template 构造正确的多轮对话格式
         
+        v5.6: 增加 token 预算控制, 确保用户当前输入永远不被截断
+        
         修复角色混乱问题:
         之前的做法是将 recall_v4 后缀 (包含多轮历史) 扁平化为一个纯文本字符串,
         然后作为单一 user message 传给 apply_chat_template。这导致历史中的
@@ -1343,6 +1491,7 @@ class DKISystem:
         2. 将 recall_v4 历史 items 按原始角色还原为独立的 user/assistant messages
         3. 将当前查询作为最后一个 user message
         4. 通过 tokenizer.apply_chat_template 生成正确的多轮 prompt
+        5. **token 预算检查**: 如果总长度超过预算, 从最旧历史开始修剪
         
         这样模型能正确识别每轮对话的角色, 避免把助手的历史回复当成用户消息。
         
@@ -1382,6 +1531,11 @@ class DKISystem:
             content = getattr(item, 'content', str(item))
             item_type = getattr(item, 'type', 'message')
             
+            # v5.7: 移除历史消息中的 <think> 推理内容 (防御性)
+            # 数据库存储时已清理, 但旧数据或外部数据可能仍含 think 内容
+            if role == 'assistant' and content:
+                content, _ = strip_think_content(content)
+            
             # summary 类型: 标注为摘要, 保留 trace_id 信息
             if item_type == 'summary':
                 trace_id = getattr(item, 'trace_id', '')
@@ -1392,7 +1546,21 @@ class DKISystem:
             if role not in ('user', 'assistant', 'system'):
                 role = 'user'
             
+            # 跳过清理后为空的消息
+            if not content or not content.strip():
+                continue
+            
             history_messages.append({"role": role, "content": content})
+        
+        # ============ 2.5 Token 预算修剪 (v5.6) ============
+        # 确保用户当前输入永远不被截断, 必要时从最旧历史开始修剪
+        max_prompt_tokens = self._get_max_prompt_tokens()
+        history_messages = self._trim_history_to_budget(
+            history_messages=history_messages,
+            system_content=system_content,
+            original_query=original_query,
+            max_prompt_tokens=max_prompt_tokens,
+        )
         
         # ============ 3. 构造 messages 列表 ============
         messages = []
@@ -1449,6 +1617,8 @@ class DKISystem:
         """
         v5.1: Hybrid 模式下使用 chat template 构造正确的多轮对话格式
         
+        v5.6: 增加 token 预算控制, 确保用户当前输入永远不被截断
+        
         与 _build_recall_v4_chat_prompt 类似, 但接收的是 SessionHistory 对象
         而非 HistoryItem 列表。
         
@@ -1486,8 +1656,23 @@ class DKISystem:
                 
                 if role not in ('user', 'assistant', 'system'):
                     role = 'user'
-                if content:
+                
+                # v5.7: 移除历史消息中的 <think> 推理内容 (防御性)
+                if role == 'assistant' and content:
+                    content, _ = strip_think_content(content)
+                
+                if content and content.strip():
                     history_messages.append({"role": role, "content": content})
+        
+        # ============ 2.5 Token 预算修剪 (v5.6) ============
+        # 确保用户当前输入永远不被截断, 必要时从最旧历史开始修剪
+        max_prompt_tokens = self._get_max_prompt_tokens()
+        history_messages = self._trim_history_to_budget(
+            history_messages=history_messages,
+            system_content=system_content,
+            original_query=original_query,
+            max_prompt_tokens=max_prompt_tokens,
+        )
         
         # ============ 3. 构造 messages 列表 ============
         messages = []
@@ -1912,6 +2097,14 @@ class DKISystem:
         user_id: Optional[str] = None,
     ) -> None:
         """Log conversation to database."""
+        # v5.7: 存储前移除 <think> 推理内容 (节省历史 token 预算)
+        clean_response, think_stripped = strip_think_content(response)
+        if think_stripped:
+            logger.debug(
+                f"Think content stripped before DB storage: "
+                f"{len(response)} -> {len(clean_response)} chars"
+            )
+        
         with self.db_manager.session_scope() as db:
             # Ensure session exists before inserting conversation
             session_repo = SessionRepository(db)
@@ -1927,11 +2120,11 @@ class DKISystem:
                 content=query,
             )
             
-            # Assistant response
+            # Assistant response (存储清理后的内容)
             conv_repo.create(
                 session_id=session_id,
                 role='assistant',
-                content=response,
+                content=clean_response,
                 injection_mode='dki' if gating_decision.should_inject else 'none',
                 injection_alpha=gating_decision.alpha,
                 memory_ids=[m.memory_id for m in gating_decision.memories],

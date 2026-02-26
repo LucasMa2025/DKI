@@ -21,6 +21,7 @@ from typing import Any, Callable, List, Optional
 
 from loguru import logger
 
+from dki.core.text_utils import strip_think_content, estimate_tokens_fast
 from dki.core.recall.recall_config import (
     RecallConfig,
     HistoryItem,
@@ -84,6 +85,13 @@ class SuffixBuilder:
         """
         组装后缀
         
+        v5.7: 重新设计 token 预算分配
+        - 生成预留 = 30% 上下文窗口
+        - 标记开销 = instruction_reserve (默认 120)
+        - 偏好 = 直接估算 (100-200 tokens)
+        - 当前输入 = 直接估算 (不预留, 高估 15%)
+        - 剩余 → 历史消息
+        
         Args:
             query: 用户查询
             recalled_messages: 召回的消息列表
@@ -96,15 +104,22 @@ class SuffixBuilder:
             result.text = query
             return result
 
-        # ============ 计算可用预算 ============
+        # ============ v5.7: 重新计算可用预算 ============
         budget_cfg = self.config.budget
         query_tokens = self._count_tokens(query)
+        
+        # v5.7: 生成预留 = 30% 上下文窗口 (不使用固定值)
+        generation_reserve = int(context_window * 0.30)
+        
+        # 标记开销 (chat template 特殊标记)
+        tag_overhead = budget_cfg.instruction_reserve  # 默认 120-150
+        
         context_budget = (
             context_window
-            - preference_tokens
-            - query_tokens
-            - budget_cfg.generation_reserve
-            - budget_cfg.instruction_reserve
+            - generation_reserve
+            - tag_overhead
+            - preference_tokens     # 偏好 (100-200 tokens)
+            - query_tokens           # 当前输入 (直接估算)
         )
 
         if context_budget <= 0:
@@ -154,8 +169,14 @@ class SuffixBuilder:
         """
         逐消息阈值判断
         
-        超阈值 → summary + trace_id
-        阈值内 → 保留原文
+        v5.7: 增加 <think> 内容过滤
+        - 先移除 assistant 消息中的 <think> 推理内容
+        - 然后按阈值判断: 超阈值 → summary + trace_id, 阈值内 → 保留原文
+        
+        阈值说明:
+        - per_message_threshold: 单条消息的 token 阈值 (外置配置, 默认 300)
+        - 如果历史消息长度 < 阈值, 保留全文
+        - 如果历史消息长度 >= 阈值, 生成 summary + trace_id
         
         Returns:
             (items, used_tokens)
@@ -172,6 +193,14 @@ class SuffixBuilder:
                 or getattr(msg, "message_id", None)
                 or str(id(msg))
             )
+
+            # v5.7: 移除 assistant 消息中的 <think> 推理内容
+            if role == 'assistant' and content:
+                content, think_stripped = strip_think_content(content)
+                if think_stripped:
+                    logger.debug(f"Think content stripped from history msg {msg_id}")
+                if not content or not content.strip():
+                    continue  # 清理后为空, 跳过
 
             msg_tokens = self._count_tokens(content)
 

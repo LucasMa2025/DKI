@@ -89,6 +89,8 @@ from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
+from dki.core.text_utils import strip_think_content
+
 # DKI 核心组件 (不依赖 ModelAdapter)
 from dki.database.connection import DatabaseManager
 from dki.database.repository import (
@@ -496,30 +498,54 @@ class DKIService:
         return self._format_chatml(messages)
     
     def _format_chatml(self, messages: List[Dict[str, str]]) -> str:
-        """ChatML 格式"""
+        """
+        ChatML 格式 (Qwen/DeepSeek 通用)
+        
+        标准格式 (半角符号, 标签闭合):
+            <|im_start|>system
+            {system_content}<|im_end|>
+            <|im_start|>user
+            {user_content}<|im_end|>
+            <|im_start|>assistant
+        """
         parts = []
         for msg in messages:
             parts.append(f"<|im_start|>{msg['role']}\n{msg['content']}<|im_end|>")
-        parts.append("<|im_start|>assistant\n")
-        return "\n".join(parts)
+        parts.append("<|im_start|>assistant")
+        return "\n".join(parts) + "\n"
     
     def _format_deepseek(self, messages: List[Dict[str, str]]) -> str:
-        """DeepSeek 格式"""
-        parts = ["<｜begin▁of▁sentence｜>"]
-        for msg in messages:
-            role = msg["role"]
-            content = msg["content"]
-            if role == "system":
-                parts.append(content)
-            elif role == "user":
-                parts.append(f"<｜User｜>{content}")
-            elif role == "assistant":
-                parts.append(f"<｜Assistant｜>{content}<｜end▁of▁sentence｜>")
-        parts.append("<｜Assistant｜>")
-        return "".join(parts)
+        """
+        DeepSeek 格式 (ChatML 兼容)
+        
+        DeepSeek V2/V3 tokenizer 在 apply_chat_template 中使用全角 ｜ 和 ▁,
+        但手动回退时统一使用 ChatML 半角格式, 因为:
+        1. DeepSeek 官方支持 ChatML 格式
+        2. 半角标记更通用且不依赖特殊 Unicode 字符
+        3. 确保标签闭合一致性
+        
+        标准格式 (半角符号, 标签闭合):
+            <|im_start|>system
+            {system_content}<|im_end|>
+            <|im_start|>user
+            {user_content}<|im_end|>
+            <|im_start|>assistant
+        """
+        # DeepSeek 兼容 ChatML, 统一使用半角标准格式
+        return self._format_chatml(messages)
     
     def _format_llama3(self, messages: List[Dict[str, str]]) -> str:
-        """Llama 3 格式"""
+        """
+        Llama 3 格式
+        
+        标准格式 (半角符号, 标签闭合):
+            <|begin_of_text|>
+            <|start_header_id|>system<|end_header_id|>
+            {system_content}<|eot_id|>
+            <|start_header_id|>user<|end_header_id|>
+            {user_content}<|eot_id|>
+            <|start_header_id|>assistant<|end_header_id|>
+        """
         parts = ["<|begin_of_text|>"]
         for msg in messages:
             parts.append(
