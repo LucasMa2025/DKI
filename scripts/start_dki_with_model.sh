@@ -32,7 +32,7 @@ case $MODEL in
         ;;
     *)
         echo "Unknown model: $MODEL"
-        echo "Available: deepseek_7b, qianwen_14b, llama_8b"
+        echo "Available: deepseek_14b, qianwen_14b, llama_8b"
         exit 1
         ;;
 esac
