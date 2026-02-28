@@ -374,15 +374,11 @@ class InjectionExecutor:
             
             if has_injectable_content:
                 # K/V 注入推理 (recall_v4 和 stable 共用)
-                # v3.3: 不再有 Fact Call 循环, Planner 已将事实内联到 plan.final_input
+                # v6.0: 不再有 Planner-only Fact 补齐.
+                # SuffixBuilder 已做全局预算分配, 最大化保留原文.
                 result = await self._execute_with_kv_injection(
                     plan, max_new_tokens, temperature, **kwargs
                 )
-                
-                # 填充 Planner 侧事实解析信息到结果
-                result.fact_blocks_resolved = len(plan.fact_blocks)
-                result.fact_tokens_total = plan.fact_tokens
-                result.fact_strategy = plan.fact_strategy
                 
                 if plan.strategy == "recall_v4":
                     self._stats["recall_v4_executions"] += 1

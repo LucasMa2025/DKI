@@ -411,25 +411,54 @@ class RAGSystem:
         self,
         session_id: str,
         max_turns: int = 5,
+        user_id: Optional[str] = None,
     ) -> List[Dict[str, str]]:
         """
-        Get conversation history for a session.
+        Get conversation history for a session, with cross-session support.
+        
+        v6.1: 支持跨会话记忆
+        - 首先获取该用户其他会话的历史消息 (跨会话记忆)
+        - 然后获取当前会话的历史消息
+        - 跨会话消息在前, 当前会话消息在后
         
         Args:
             session_id: Session identifier
             max_turns: Maximum number of conversation turns to retrieve
+            user_id: User identifier (optional, for cross-session retrieval)
             
         Returns:
             List of conversation messages
         """
+        result = []
+        
         with self.db_manager.session_scope() as db:
             conv_repo = ConversationRepository(db)
-            messages = conv_repo.get_recent(session_id, n_turns=max_turns)
             
-            return [
-                {"role": msg.role, "content": msg.content}
-                for msg in messages
-            ]
+            # v6.1: 跨会话历史 (放在当前会话之前)
+            if user_id:
+                try:
+                    cross_session_limit = max_turns  # 跨会话消息量 = 当前会话消息量
+                    cross_msgs = conv_repo.get_recent_by_user_cross_session(
+                        user_id=user_id,
+                        current_session_id=session_id,
+                        limit=cross_session_limit * 2,  # 每轮 user+assistant
+                    )
+                    for msg in cross_msgs:
+                        result.append({"role": msg.role, "content": msg.content})
+                    if cross_msgs:
+                        logger.info(
+                            f"RAG cross-session: added {len(cross_msgs)} messages "
+                            f"from previous sessions for user {user_id}"
+                        )
+                except Exception as e:
+                    logger.warning(f"RAG cross-session retrieval failed (non-critical): {e}")
+            
+            # 当前会话历史
+            messages = conv_repo.get_recent(session_id, n_turns=max_turns)
+            for msg in messages:
+                result.append({"role": msg.role, "content": msg.content})
+        
+        return result
     
     def _load_user_preferences(self, user_id: str) -> Optional[str]:
         """
@@ -551,8 +580,8 @@ class RAGSystem:
         history = None
         if include_history:
             try:
-                history = self._get_conversation_history(session_id, max_turns=max_history_turns)
-                logger.debug(f"Retrieved {len(history)} history messages for session {session_id}")
+                history = self._get_conversation_history(session_id, max_turns=max_history_turns, user_id=user_id)
+                logger.debug(f"Retrieved {len(history)} history messages for session {session_id} (user={user_id})")
             except Exception as e:
                 logger.warning(f"Failed to get conversation history: {e}")
                 history = None

@@ -301,6 +301,71 @@ class ConversationRepository(BaseRepository):
     def get_by_id(self, message_id: str) -> Optional[Conversation]:
         """Get a conversation entry by ID."""
         return self.db.query(Conversation).filter(Conversation.id == message_id).first()
+    
+    def get_by_user_cross_session(
+        self,
+        user_id: str,
+        current_session_id: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Conversation]:
+        """
+        Get conversation history across ALL sessions for a given user.
+        
+        Joins Conversation -> Session to find all sessions owned by user_id,
+        then returns conversations from those sessions (excluding current session
+        if specified, to avoid duplication with get_by_session).
+        
+        Args:
+            user_id: User identifier
+            current_session_id: Current session ID to exclude (optional)
+            limit: Maximum number of messages to return
+            
+        Returns:
+            List of conversations from other sessions, ordered by creation time (newest first)
+        """
+        query = (
+            self.db.query(Conversation)
+            .join(Session, Conversation.session_id == Session.id)
+            .filter(Session.user_id == user_id)
+            .filter(Session.is_active == True)
+        )
+        
+        if current_session_id:
+            query = query.filter(Conversation.session_id != current_session_id)
+        
+        return (
+            query
+            .order_by(desc(Conversation.created_at))
+            .limit(limit)
+            .all()
+        )
+    
+    def get_recent_by_user_cross_session(
+        self,
+        user_id: str,
+        current_session_id: Optional[str] = None,
+        limit: int = 20,
+    ) -> List[Conversation]:
+        """
+        Get recent conversations from previous sessions for cross-session memory.
+        
+        Returns messages in chronological order (oldest to newest).
+        
+        Args:
+            user_id: User identifier
+            current_session_id: Current session ID to exclude
+            limit: Maximum number of messages to return
+            
+        Returns:
+            List of conversations from previous sessions, chronological order
+        """
+        conversations = self.get_by_user_cross_session(
+            user_id=user_id,
+            current_session_id=current_session_id,
+            limit=limit,
+        )
+        # Reverse to chronological order (oldest first)
+        return list(reversed(conversations))
 
 
 class ExperimentRepository(BaseRepository):

@@ -53,6 +53,7 @@ class RecallBudgetConfig:
     min_recent_turns: int = 2           # 至少补充的近期完整轮次
     max_recent_turns: int = 5           # 最多补充的近期完整轮次 (外置配置)
     generation_ratio: float = 0.30      # v5.7: 生成预留比例 (30% 上下文)
+    cross_session_limit: int = 10       # v6.1: 跨会话最大召回消息数
 
 
 @dataclass

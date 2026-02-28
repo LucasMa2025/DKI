@@ -7,9 +7,13 @@ DKI Injection Planner - 注入计划生成器
 - 策略选择
 - Alpha 计算 (分层)
 - 数据格式化 (偏好文本 + 历史后缀)
-- Planner-only Fact Resolution (v3.3): 事实预解析, 消除 Executor 循环推理
 - 安全验证 (SafetyEnvelope)
 - 最终输入构造
+
+v6.0 改动:
+- 移除 Planner-only Fact Resolution (v3.3 的一次性全量补齐)
+- SuffixBuilder 已改为两阶段全局预算分配, Planner 不再需要补齐
+- 保留 fact_call 回调机制 (模型真正需要时才触发, 由 Executor 处理)
 
 输入: query, preferences, history, config
 输出: InjectionPlan
@@ -18,10 +22,9 @@ DKI Injection Planner - 注入计划生成器
 - Planner 不持有模型引用
 - Planner 不执行推理
 - Planner 的输出可以被序列化、缓存、重放
-- Executor 只做一次 O(1) forward pass (v3.3)
 
 Author: AGI Demo Project
-Version: 3.3.0
+Version: 6.0.0
 """
 
 import math
@@ -48,7 +51,6 @@ from dki.core.plugin.injection_plan import (
     AlphaProfile,
     SafetyEnvelope,
     QueryContext,
-    FactBlock,
 )
 
 # Recall v4 组件 (可选, 通过配置启用)
@@ -185,7 +187,8 @@ class InjectionPlanner:
         self._multi_signal_recall = multi_signal_recall
         self._suffix_builder = suffix_builder
         
-        # Planner-only Fact Resolution (v3.3)
+        # v6.0: fact_retriever / prompt_formatter 保留引用但不再在 Planner 中使用
+        # (由 Executor 的 fact_call 回调按需使用)
         self._fact_retriever = fact_retriever
         self._prompt_formatter = prompt_formatter
         
@@ -196,7 +199,6 @@ class InjectionPlanner:
             "memory_trigger_count": 0,
             "reference_resolved_count": 0,
             "recall_v4_plans": 0,
-            "fact_blocks_resolved": 0,
         }
     
     # ================================================================
@@ -323,7 +325,7 @@ class InjectionPlanner:
         
         # ============ Step 2: 历史召回 ============
         if strategy == "recall_v4" and self._multi_signal_recall and self._suffix_builder:
-            # ============ Recall v4: 多信号召回 + 后缀组装 ============
+            # ============ Recall v4 完整路径: 多信号召回 + 后缀组装 ============
             plan = self._build_recall_v4_plan(
                 plan=plan,
                 query=query,
@@ -341,29 +343,31 @@ class InjectionPlanner:
                     plan.history_suffix = self._format_history_suffix(relevant_history)
                     plan.relevant_history_count = len(relevant_history)
                     plan.history_tokens = self._estimate_tokens(plan.history_suffix)
-                    # v5.1: 填充结构化历史消息, 用于 Executor 构造多轮 chat template
                     plan.history_items = relevant_history
-        elif strategy == "stable" or not (self._multi_signal_recall and self._suffix_builder):
-            # ============ Stable 策略: 平铺历史后缀 ============
+        elif strategy == "recall_v4" and self._suffix_builder and relevant_history:
+            # ============ v6.2: Suffix-only 路径 (Plugin 外部召回 + SuffixBuilder 压缩) ============
+            # DKI Plugin 已通过 adapter 完成召回, 只需 SuffixBuilder 做 token 预算分配和压缩
+            plan = self._build_suffix_only_plan(
+                plan=plan,
+                query=query,
+                relevant_history=relevant_history,
+                context_window=context_window,
+            )
+        elif strategy == "stable" or not self._suffix_builder:
+            # ============ Stable 策略: 平铺历史后缀 (无压缩) ============
             plan.strategy = "stable"
             if relevant_history:
                 plan.history_suffix = self._format_history_suffix(relevant_history)
                 plan.relevant_history_count = len(relevant_history)
                 plan.history_tokens = self._estimate_tokens(plan.history_suffix)
                 plan.recall_strategy = "flat_history"
-                # v5.1: 填充结构化历史消息, 用于 Executor 构造多轮 chat template
                 plan.history_items = relevant_history
         
-        # ============ Step 2.5: Planner-only Fact Resolution (v3.3) ============
-        # 如果 recall_v4 产生了 summary 条目 (has_fact_call_instruction),
-        # Planner 主动检索事实并内联到计划中, 消除 Executor 循环推理
-        if (plan.strategy == "recall_v4"
-                and plan.has_fact_call_instruction
-                and self._fact_retriever
-                and self._prompt_formatter
-                and self._recall_config
-                and self._recall_config.fact_call.enabled):
-            plan = self._resolve_facts_in_planner(plan, session_id)
+        # ============ Step 2.5: (v6.0 已移除 Planner-only Fact Resolution) ============
+        # v3.3 的一次性全量补齐已移除 — SuffixBuilder 全局预算分配
+        # 已最大化保留原文, 只有真正放不下的才压缩为 summary + trace_id.
+        # 如果模型在推理时确实需要某个 trace_id 的原文,
+        # 将通过 Executor 的 fact_call 回调机制按需获取.
         
         # ============ Step 3: Alpha 计算 (分层, P0-4 + P1-2) ============
         plan.alpha_profile = self._compute_alpha_profile(
@@ -388,10 +392,8 @@ class InjectionPlanner:
         # ============ Step 5: 构造最终输入 ============
         if plan.assembled_suffix:
             # Recall v4: 已在 _build_recall_v4_plan 中组装好的后缀
+            # v6.0: 不再追加 Planner 补齐的事实块 (已移除)
             plan.final_input = plan.assembled_suffix
-            # 如果有 Planner 解析的事实块, 追加到 final_input
-            if plan.fact_blocks:
-                plan.final_input = self._append_fact_blocks_to_input(plan)
         elif plan.history_suffix:
             # Fallback: 历史后缀 + 查询
             plan.final_input = plan.history_suffix + "\n\n" + query
@@ -510,6 +512,73 @@ class InjectionPlanner:
             logger.error(f"Recall v4 failed, falling back to flat_history: {e}")
             # 回退到平铺方式
             plan.recall_strategy = "flat_history_fallback"
+        
+        return plan
+    
+    # ================================================================
+    # v6.2: Suffix-only 计划构建 (Plugin 外部召回)
+    # ================================================================
+    
+    def _build_suffix_only_plan(
+        self,
+        plan: InjectionPlan,
+        query: str,
+        relevant_history: List[AdapterChatMessage],
+        context_window: int,
+    ) -> InjectionPlan:
+        """
+        v6.2: 仅使用 SuffixBuilder 的计划构建
+        
+        适用于 DKI Plugin 路径: adapter 已完成召回, 只需 SuffixBuilder
+        进行 token 预算分配和 summary 压缩。
+        
+        与 _build_recall_v4_plan 的区别:
+        - 不调用 MultiSignalRecall (因为 adapter 已经完成了召回)
+        - 直接将 relevant_history 传给 SuffixBuilder
+        """
+        try:
+            plan.relevant_history_count = len(relevant_history)
+            plan.recall_strategy = "suffix_only"
+            
+            assembled = self._suffix_builder.build(
+                query=query,
+                recalled_messages=relevant_history,
+                context_window=context_window,
+                preference_tokens=plan.preference_tokens,
+            )
+            
+            plan.assembled_suffix = assembled.text
+            plan.history_suffix = assembled.text
+            plan.history_tokens = assembled.total_tokens
+            plan.summary_count = assembled.summary_count
+            plan.message_count = assembled.message_count
+            plan.trace_ids = assembled.trace_ids
+            plan.has_fact_call_instruction = assembled.has_fact_call_instruction
+            
+            # v5.1: 填充结构化历史条目
+            if hasattr(assembled, 'items') and assembled.items:
+                plan.history_items = assembled.items
+            else:
+                plan.history_items = relevant_history
+            
+            self._stats["recall_v4_plans"] += 1
+            
+            logger.debug(
+                f"Suffix-only plan: {plan.message_count} msgs + "
+                f"{plan.summary_count} summaries, "
+                f"context_window={context_window}, "
+                f"history_tokens={plan.history_tokens}"
+            )
+            
+        except Exception as e:
+            logger.error(f"Suffix-only plan failed, falling back to flat_history: {e}")
+            # 回退到平铺方式
+            plan.strategy = "stable"
+            plan.recall_strategy = "flat_history_fallback"
+            plan.history_suffix = self._format_history_suffix(relevant_history)
+            plan.relevant_history_count = len(relevant_history)
+            plan.history_tokens = self._estimate_tokens(plan.history_suffix)
+            plan.history_items = relevant_history
         
         return plan
     
@@ -656,13 +725,6 @@ class InjectionPlanner:
             if epistemic_mode:
                 lines.append(f"认知态: {epistemic_mode}")
             
-            # 事实解析
-            if plan.fact_blocks:
-                lines.append(
-                    f"事实补充: {len(plan.fact_blocks)} 段 "
-                    f"({plan.fact_tokens} tokens)"
-                )
-            
             lines.append("[DMI 记忆状态结束]")
         else:
             lines = ["[DMI Memory Context]"]
@@ -685,12 +747,6 @@ class InjectionPlanner:
             
             if epistemic_mode:
                 lines.append(f"Mode: {epistemic_mode}")
-            
-            if plan.fact_blocks:
-                lines.append(
-                    f"Facts: {len(plan.fact_blocks)} segments "
-                    f"({plan.fact_tokens} tokens)"
-                )
             
             lines.append("[DMI Memory Context End]")
         
@@ -743,168 +799,6 @@ class InjectionPlanner:
             return ""
         
         return prefix + "\n".join(lines) + suffix
-    
-    # ================================================================
-    # Planner-only Fact Resolution (v3.3)
-    # ================================================================
-    
-    def _resolve_facts_in_planner(
-        self,
-        plan: InjectionPlan,
-        session_id: str,
-    ) -> InjectionPlan:
-        """
-        Planner 侧事实预解析 (v3.3)
-        
-        核心改动: Fact Call 从 Executor 循环推理 → Planner 预解析
-        
-        流程:
-        1. 从 SuffixBuilder 产生的 trace_ids 中识别需要检索的事实
-        2. 对每个 trace_id 调用 FactRetriever.retrieve() 获取原始消息
-        3. 使用 PromptFormatter.format_fact_segment() 格式化事实
-        4. 将事实块存入 plan.fact_blocks
-        5. 后续在 _append_fact_blocks_to_input() 中内联到 final_input
-        
-        优势:
-        - Executor 只做一次 O(1) forward pass
-        - 推理延迟可预测 (无循环)
-        - GPU 成本恒定
-        
-        Args:
-            plan: 当前注入计划
-            session_id: 会话 ID
-            
-        Returns:
-            更新后的 InjectionPlan (含 fact_blocks)
-        """
-        if not self._fact_retriever or not self._prompt_formatter:
-            return plan
-        
-        max_fact_tokens = self._recall_config.fact_call.max_fact_tokens
-        total_fact_tokens = 0
-        fact_blocks = []
-        
-        # 遍历所有 trace_ids, 检索事实
-        for trace_id in plan.trace_ids:
-            if total_fact_tokens >= max_fact_tokens:
-                logger.info(
-                    f"Fact token budget exhausted: {total_fact_tokens} >= {max_fact_tokens}"
-                )
-                plan.fact_strategy = "budget_exceeded"
-                break
-            
-            try:
-                fact_response = self._fact_retriever.retrieve(
-                    trace_id=trace_id,
-                    session_id=session_id,
-                    offset=0,
-                    limit=self._recall_config.fact_call.batch_size,
-                )
-                
-                if not fact_response.messages:
-                    logger.debug(f"No facts found for trace_id={trace_id}")
-                    continue
-                
-                # 格式化事实段落
-                fact_text = self._prompt_formatter.format_fact_segment(fact_response)
-                fact_tokens = self._estimate_tokens(fact_text)
-                
-                # 检查 token 预算
-                if total_fact_tokens + fact_tokens > max_fact_tokens:
-                    logger.info(
-                        f"Fact token budget would be exceeded: "
-                        f"{total_fact_tokens} + {fact_tokens} > {max_fact_tokens}, "
-                        f"skipping trace_id={trace_id}"
-                    )
-                    plan.fact_strategy = "budget_exceeded"
-                    break
-                
-                fact_blocks.append(FactBlock(
-                    trace_id=trace_id,
-                    fact_text=fact_text,
-                    fact_tokens=fact_tokens,
-                    source="retriever",
-                ))
-                total_fact_tokens += fact_tokens
-                
-                logger.debug(
-                    f"Fact resolved for trace_id={trace_id}: "
-                    f"{fact_tokens} tokens"
-                )
-                
-            except Exception as e:
-                logger.warning(f"Fact retrieval failed for trace_id={trace_id}: {e}")
-                continue
-        
-        plan.fact_blocks = fact_blocks
-        plan.fact_tokens = total_fact_tokens
-        plan.fact_rounds_used = len(fact_blocks)
-        
-        if plan.fact_strategy == "budget_exceeded":
-            # 保持 budget_exceeded (即使 0 个 block 也保留, 说明预算不足)
-            pass
-        elif fact_blocks:
-            plan.fact_strategy = "planner_resolved"
-        else:
-            plan.fact_strategy = "none"
-        
-        # 更新总 token 计数
-        plan.total_tokens += total_fact_tokens
-        
-        self._stats["fact_blocks_resolved"] += len(fact_blocks)
-        
-        logger.info(
-            f"Planner fact resolution: {len(fact_blocks)} blocks, "
-            f"{total_fact_tokens} tokens, strategy={plan.fact_strategy}"
-        )
-        
-        return plan
-    
-    def _append_fact_blocks_to_input(self, plan: InjectionPlan) -> str:
-        """
-        将 Planner 解析的事实块追加到 final_input
-        
-        格式:
-        [原始 assembled_suffix]
-        
-        [补充事实]
-        [FACT_SEGMENT ...]
-        ...
-        [/补充事实]
-        
-        [不需要再次请求事实的指令]
-        """
-        parts = [plan.assembled_suffix]
-        
-        # 事实块
-        if self.language == "cn":
-            parts.append("\n[补充事实 - 以下为原始记录，内容可信]")
-        else:
-            parts.append("\n[Supplementary Facts - Original records below, trustworthy]")
-        
-        for block in plan.fact_blocks:
-            parts.append(block.fact_text)
-        
-        if self.language == "cn":
-            parts.append("[/补充事实]")
-        else:
-            parts.append("[/Supplementary Facts]")
-        
-        # 添加 "不需要再次请求事实" 的指令
-        if self.language == "cn":
-            parts.append(
-                "\n【重要】以上补充事实已包含所需的原始记录。"
-                "请直接基于这些事实回答用户问题，"
-                "不需要再调用 retrieve_fact，不需要请求更多事实。"
-            )
-        else:
-            parts.append(
-                "\n[IMPORTANT] The supplementary facts above contain the required original records. "
-                "Please answer the user's question based on these facts directly. "
-                "Do NOT call retrieve_fact again. Do NOT request more facts."
-            )
-        
-        return "\n\n".join(parts)
     
     def _compute_alpha_profile(
         self,
@@ -990,10 +884,16 @@ class InjectionPlanner:
         )
     
     def _estimate_tokens(self, text: str) -> int:
-        """估算 token 数量 (粗略: 1.3 tokens per word)"""
+        """
+        估算 token 数量
+        
+        v6.2: 使用 estimate_tokens_fast, 正确处理中文
+        中文约 1.5 token/字, 英文约 1.3 token/word
+        """
         if not text:
             return 0
-        return int(len(text.split()) * 1.3)
+        from dki.core.text_utils import estimate_tokens_fast
+        return estimate_tokens_fast(text, overestimate_factor=1.15)
     
     # ================================================================
     # 策略管理

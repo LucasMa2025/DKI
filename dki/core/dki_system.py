@@ -732,9 +732,19 @@ class DKISystem:
         except Exception as e:
             logger.warning(f"Failed to load preferences from DB for user {user_id}: {e}")
     
-    def get_session_history(self, session_id: str, max_messages: int = 10) -> SessionHistory:
+    def get_session_history(
+        self,
+        session_id: str,
+        max_messages: int = 10,
+        user_id: Optional[str] = None,
+    ) -> SessionHistory:
         """
-        Get session history for hybrid injection.
+        Get session history for hybrid injection, with cross-session support.
+        
+        v6.1: 支持跨会话记忆
+        - 首先获取当前会话的历史消息
+        - 如果提供了 user_id, 还会补充该用户其他会话的历史消息
+        - 跨会话消息放在当前会话消息之前 (按时间顺序)
         
         History is:
         - Longer (can be 100-500 tokens)
@@ -744,6 +754,7 @@ class DKISystem:
         Args:
             session_id: Session identifier
             max_messages: Maximum messages to retrieve
+            user_id: User identifier (optional, for cross-session retrieval)
             
         Returns:
             SessionHistory object
@@ -752,6 +763,31 @@ class DKISystem:
         
         with self.db_manager.session_scope() as db:
             conv_repo = ConversationRepository(db)
+            
+            # v6.1: 先添加跨会话历史 (旧的先加, 时间顺序排列)
+            if user_id:
+                try:
+                    cross_session_limit = max_messages // 2  # 跨会话消息占一半配额
+                    cross_msgs = conv_repo.get_recent_by_user_cross_session(
+                        user_id=user_id,
+                        current_session_id=session_id,
+                        limit=cross_session_limit,
+                    )
+                    for msg in cross_msgs:
+                        history.add_message(
+                            role=msg.role,
+                            content=msg.content,
+                            timestamp=msg.created_at.timestamp() if msg.created_at else None,
+                        )
+                    if cross_msgs:
+                        logger.info(
+                            f"Cross-session history: added {len(cross_msgs)} messages "
+                            f"from previous sessions for user {user_id}"
+                        )
+                except Exception as e:
+                    logger.warning(f"Cross-session history retrieval failed (non-critical): {e}")
+            
+            # 当前会话的历史消息
             messages = conv_repo.get_recent(session_id, limit=max_messages)
             
             for msg in messages:
@@ -976,7 +1012,7 @@ class DKISystem:
                 # Get session history (无论 history.enabled 配置, 仍尝试获取历史)
                 # 修复: 之前 history.enabled=false 导致 HybridDKIInjector 跳过历史
                 # 但这里应直接获取历史, 通过 chat template 注入
-                history = self.get_session_history(session_id)
+                history = self.get_session_history(session_id, user_id=user_id)
                 
                 # Prepare hybrid input (用于元数据: 偏好文本、token 统计)
                 # 注意: hybrid_result.history_tokens 可能为 0 (因 config.history_enabled=false)
@@ -2344,3 +2380,33 @@ class _ConversationRepoWrapper:
                 if result:
                     return _DetachedMessage(result)
         return None
+    
+    def get_cross_session_history(
+        self,
+        user_id: str,
+        current_session_id: Optional[str] = None,
+        limit: int = 20,
+        **kwargs,
+    ) -> List[_DetachedMessage]:
+        """
+        获取用户跨会话的历史消息 (返回脱管安全副本)
+        
+        通过 Session.user_id 关联, 检索该用户所有历史会话的消息,
+        排除当前会话 (当前会话消息由 get_by_session 获取)。
+        
+        Args:
+            user_id: 用户 ID
+            current_session_id: 当前会话 ID (排除, 避免重复)
+            limit: 最大消息数
+            
+        Returns:
+            其他会话的历史消息 (时间顺序, 旧到新)
+        """
+        with self._db_manager.session_scope() as db:
+            repo = ConversationRepository(db)
+            orm_results = repo.get_recent_by_user_cross_session(
+                user_id=user_id,
+                current_session_id=current_session_id,
+                limit=limit,
+            )
+            return self._to_detached(orm_results)

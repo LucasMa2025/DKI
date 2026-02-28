@@ -13,13 +13,16 @@ DKI Injection Plan - 注入计划数据结构
 核心数据结构:
 - AlphaProfile: 分层 alpha 控制 (偏好/历史/安全上限)
 - SafetyEnvelope: 策略安全边界
-- FactBlock: Planner 侧预解析的事实块
 - InjectionPlan: 决策层输出
 - ExecutionResult: 执行层输出
 - QueryContext: 查询分析上下文
 
+Note (v6.0): FactBlock 已移除 — Planner 不再做一次性全量事实补齐.
+SuffixBuilder 已改为两阶段全局预算分配, 最大化保留原文.
+模型推理期如需补充事实, 通过 Executor fact_call 回调按需获取.
+
 Author: AGI Demo Project
-Version: 3.3.0
+Version: 6.0.0
 """
 
 from dataclasses import dataclass, field
@@ -150,32 +153,6 @@ class QueryContext:
 
 
 # ============================================================
-# FactBlock - Planner 侧预解析的事实块
-# ============================================================
-
-@dataclass
-class FactBlock:
-    """
-    Planner 侧预解析的事实块
-    
-    Planner 在构建计划时，对 summary 条目中标记了 facts_missing 的项，
-    主动调用 FactRetriever 检索原始事实，并将结果内联到此数据结构中。
-    
-    这样 Executor 只需做一次 O(1) forward pass，不再有循环推理。
-    
-    字段:
-    - trace_id: 事实溯源 ID (对应 summary 的 trace_id)
-    - fact_text: 格式化后的事实文本 (由 PromptFormatter.format_fact_segment 生成)
-    - fact_tokens: 事实文本的 token 数 (粗估)
-    - source: 事实来源 ("retriever" | "inline")
-    """
-    trace_id: str = ""
-    fact_text: str = ""
-    fact_tokens: int = 0
-    source: str = "retriever"
-
-
-# ============================================================
 # InjectionPlan - 注入计划 (核心中间产物)
 # ============================================================
 
@@ -258,13 +235,6 @@ class InjectionPlan:
     # 避免将所有历史扁平化为单一 user message 导致角色混乱
     history_items: List[Any] = field(default_factory=list)  # List[HistoryItem]
     
-    # ============ Planner-only Fact Blocks (v3.3) ============
-    # Planner 在构建计划时预解析的事实块
-    # Executor 不再有 Fact Call 循环，所有事实在 Planner 侧解析完毕
-    fact_blocks: List[FactBlock] = field(default_factory=list)
-    fact_tokens: int = 0                  # 所有事实块的总 token 数
-    fact_strategy: str = "none"           # none | planner_resolved | budget_exceeded
-    
     # ============ P0-1: 记忆元数据 ============
     memory_metadata: str = ""             # 记忆元数据提示块文本
     
@@ -297,10 +267,6 @@ class InjectionPlan:
             "has_fact_call_instruction": self.has_fact_call_instruction,
             "fact_rounds_used": self.fact_rounds_used,
             "trace_ids_count": len(self.trace_ids),
-            # Planner-only Fact Blocks (v3.3)
-            "fact_blocks_count": len(self.fact_blocks),
-            "fact_tokens": self.fact_tokens,
-            "fact_strategy": self.fact_strategy,
             # P0-1: Memory Metadata
             "memory_metadata": bool(self.memory_metadata),
         }
@@ -333,12 +299,6 @@ class ExecutionResult:
     # 降级
     fallback_used: bool = False
     error_message: Optional[str] = None
-    
-    # Fact resolution (Planner-only, v3.3)
-    # These are copied from the plan for observability
-    fact_blocks_resolved: int = 0
-    fact_tokens_total: int = 0
-    fact_strategy: str = "none"
     
     # KV 监控指标 (P1-4)
     kv_bytes_cpu: int = 0                  # CPU 上的 KV 缓存字节数

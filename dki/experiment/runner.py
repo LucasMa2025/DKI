@@ -1874,6 +1874,407 @@ class ExperimentRunner:
         
         return results
 
+    def run_longmemeval(
+        self,
+        modes: Optional[List[str]] = None,
+        longmemeval_modes: Optional[List[str]] = None,
+        max_samples: int = 50,
+        max_new_tokens: int = 256,
+        force_alpha: float = 0.4,
+        setup_users: bool = True,
+        auto_generate: bool = True,
+        longmemeval_source: str = "../longmem/longmemeval_s_cleaned.json",
+    ) -> Dict[str, Any]:
+        """
+        运行 LongMemEval 基准测试 — 长期记忆能力评估
+        
+        LongMemEval (ICLR 2025) 测试五种长期记忆能力:
+        - Information Extraction (单会话用户/助手信息提取)
+        - Multi-Session Reasoning (跨会话推理)
+        - Knowledge Updates (知识更新)
+        - Temporal Reasoning (时间推理)
+        - Preference Recall (偏好推断)
+        
+        测试流程:
+        1. 加载 LongMemEval 数据 (已转换为 DKI 格式)
+        2. 对每个样本: 先播放历史对话 (写入 DB), 再发送评估问题
+        3. 比较模型回答与标准答案 (关键词匹配 + ROUGE)
+        4. 对比 DKI vs RAG vs Baseline
+        
+        关键设计:
+        - 历史对话通过 chat() 真实写入 DB, 确保 recall 系统可召回
+        - 仅最后一个 turn (is_eval_query=True) 用于评估
+        - expected_response 字段用于模拟助手历史回复
+        
+        Args:
+            modes: 系统模式 ["dki", "rag", "baseline"]
+            longmemeval_modes: LongMemEval 数据模式 ["multi_turn", "needle"]
+            max_samples: 每种模式最大样本数
+            max_new_tokens: 最大生成 token 数
+            force_alpha: DKI 强制 alpha 值
+            setup_users: 是否设置实验用户
+            auto_generate: 数据不存在时是否自动生成
+            longmemeval_source: LongMemEval 源数据路径
+        """
+        self._ensure_systems()
+        
+        if setup_users:
+            # 添加 LongMemEval 专用实验用户
+            longmem_users = self._get_default_experiment_users() + [{
+                "username": "exp_user_longmem",
+                "display_name": "LongMemEval Test User",
+                "preferences": [
+                    {"text": "I am a user participating in long-term memory evaluation", "type": "general", "priority": 5},
+                ],
+            }]
+            self.setup_experiment_users(longmem_users)
+        
+        if modes is None:
+            modes = ["dki", "rag", "baseline"]
+        if longmemeval_modes is None:
+            longmemeval_modes = ["multi_turn", "needle"]
+        
+        logger.info(
+            f"Running LongMemEval benchmark: modes={modes}, "
+            f"longmem_modes={longmemeval_modes}, max_samples={max_samples}"
+        )
+        
+        results = {
+            'benchmark': 'longmemeval',
+            'started_at': datetime.now().isoformat(),
+            'config': {
+                'modes': modes,
+                'longmemeval_modes': longmemeval_modes,
+                'max_samples': max_samples,
+                'max_new_tokens': max_new_tokens,
+                'force_alpha': force_alpha,
+            },
+            'results_by_dataset': {},
+            'summary': {},
+        }
+        
+        for lm_mode in longmemeval_modes:
+            dataset_name = f"longmemeval_{lm_mode}"
+            data_file = Path(f"./data/{dataset_name}.json")
+            
+            # 自动生成数据 (如果不存在)
+            if not data_file.exists() and auto_generate:
+                logger.info(f"Data file {data_file} not found, generating...")
+                from dki.experiment.data_generator import ExperimentDataGenerator
+                gen = ExperimentDataGenerator("./data")
+                gen.generate_longmemeval(
+                    source_path=longmemeval_source,
+                    mode=lm_mode,
+                    output_name=dataset_name,
+                )
+            
+            if not data_file.exists():
+                logger.error(f"Data file {data_file} not found, skipping {lm_mode}")
+                continue
+            
+            with open(data_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            logger.info(f"Loaded {len(data)} items for LongMemEval-{lm_mode}")
+            
+            # 采样
+            samples = data[:max_samples]
+            
+            dataset_results = {}
+            
+            for mode in modes:
+                logger.info(f"  Running {mode} on {dataset_name} ({len(samples)} samples)")
+                mode_results = self._run_longmemeval_mode(
+                    mode=mode,
+                    samples=samples,
+                    max_new_tokens=max_new_tokens,
+                    force_alpha=force_alpha,
+                )
+                dataset_results[mode] = mode_results
+            
+            results['results_by_dataset'][dataset_name] = dataset_results
+        
+        # 汇总
+        results['summary'] = self._summarize_longmemeval(results['results_by_dataset'])
+        results['completed_at'] = datetime.now().isoformat()
+        
+        # 保存
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filepath = self.output_dir / f"longmemeval_{timestamp}.json"
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(results, f, ensure_ascii=False, indent=2)
+        
+        logger.info(f"LongMemEval results saved to {filepath}")
+        self._print_longmemeval_summary(results['summary'])
+        
+        return results
+    
+    def _run_longmemeval_mode(
+        self,
+        mode: str,
+        samples: List[Dict[str, Any]],
+        max_new_tokens: int = 256,
+        force_alpha: float = 0.4,
+    ) -> Dict[str, Any]:
+        """
+        运行 LongMemEval 单模式评估。
+        
+        关键流程:
+        1. 对每个样本创建独立 session
+        2. 将非 eval turns 的 query+expected_response 写入 DB 作为历史
+        3. 发送 eval query, 获取模型回答
+        4. 与 expected_answer 比较
+        """
+        eval_results = []
+        base_ts = int(time.time())
+        
+        for idx, item in enumerate(tqdm(samples, desc=f"LongMemEval ({mode})")):
+            session_id = f"longmem_{mode}_{base_ts}_{idx}"
+            user_id = self._get_experiment_user_id(item)
+            
+            # 写入偏好
+            personas = item.get('personas', [])
+            if personas:
+                self._write_session_preferences(user_id, personas)
+            
+            # 添加 personas 作为 memories
+            system = self.dki_system if mode == 'dki' else self.rag_system
+            if mode != 'baseline':
+                for mem in personas:
+                    system.add_memory(session_id, mem)
+            
+            turns = item.get('turns', [])
+            eval_turn = None
+            history_turns = []
+            
+            for t in turns:
+                if t.get('is_eval_query'):
+                    eval_turn = t
+                else:
+                    history_turns.append(t)
+            
+            if not eval_turn:
+                logger.warning(f"Sample {idx} has no eval query, skipping")
+                continue
+            
+            # 播放历史: 将历史对话写入 DB (模拟真实多轮对话)
+            history_injected = 0
+            for h_turn in history_turns:
+                query = h_turn.get('query', '')
+                expected_resp = h_turn.get('expected_response', '')
+                if not query:
+                    continue
+                
+                try:
+                    if mode == 'dki':
+                        # 真实调用 chat() 让 DKI 系统记录对话
+                        resp = self.dki_system.chat(
+                            query=query,
+                            session_id=session_id,
+                            user_id=user_id,
+                            max_new_tokens=32,  # 最小生成, 仅为建立历史
+                            temperature=0.1,
+                            force_alpha=force_alpha,
+                        )
+                        history_injected += 1
+                    elif mode == 'rag':
+                        resp = self.rag_system.chat(
+                            query=query,
+                            session_id=session_id,
+                            user_id=user_id,
+                            max_new_tokens=32,
+                            temperature=0.1,
+                        )
+                        history_injected += 1
+                    # baseline: 不播放历史
+                except Exception as e:
+                    logger.debug(f"History turn failed (expected in some cases): {e}")
+            
+            # 发送评估问题
+            eval_query = eval_turn['query']
+            expected_answer = eval_turn.get('expected_answer', '')
+            expected_keywords = eval_turn.get('expected_keywords', [])
+            
+            try:
+                start_time = time.time()
+                
+                if mode == 'dki':
+                    response = self.dki_system.chat(
+                        query=eval_query,
+                        session_id=session_id,
+                        user_id=user_id,
+                        max_new_tokens=max_new_tokens,
+                        temperature=0.7,
+                        force_alpha=force_alpha,
+                    )
+                    response_text = response.text
+                    latency = response.latency_ms
+                    
+                    hybrid_info = response.metadata.get('hybrid_injection', {})
+                    pref_alpha = hybrid_info.get(
+                        'preference_alpha',
+                        response.gating_decision.alpha if response.gating_decision else 0.0,
+                    )
+                    
+                elif mode == 'rag':
+                    response = self.rag_system.chat(
+                        query=eval_query,
+                        session_id=session_id,
+                        user_id=user_id,
+                        max_new_tokens=max_new_tokens,
+                        temperature=0.7,
+                    )
+                    response_text = response.text
+                    latency = response.latency_ms
+                    pref_alpha = 0.0
+                    
+                else:  # baseline
+                    output = self.dki_system.model.generate(
+                        prompt=eval_query,
+                        max_new_tokens=max_new_tokens,
+                        temperature=0.7,
+                    )
+                    response_text = output.text
+                    latency = output.latency_ms
+                    pref_alpha = 0.0
+                
+                # 评估: 关键词命中率
+                resp_lower = response_text.lower()
+                kw_hits = sum(1 for kw in expected_keywords if kw.lower() in resp_lower)
+                keyword_recall = kw_hits / len(expected_keywords) if expected_keywords else 0.0
+                
+                # 评估: 答案包含率 (expected_answer 的关键词是否出现在回答中)
+                answer_match = 0.0
+                if expected_answer:
+                    answer_words = re.findall(r'\b\w+\b', expected_answer.lower())
+                    answer_words = [w for w in answer_words if len(w) > 2]
+                    if answer_words:
+                        hits = sum(1 for w in answer_words if w in resp_lower)
+                        answer_match = hits / len(answer_words)
+                
+                # 评估: ROUGE-L (如果有参考答案)
+                rouge_l = 0.0
+                if expected_answer:
+                    try:
+                        rouge_scores = self.metrics.compute_rouge(expected_answer, response_text)
+                        rouge_l = rouge_scores.get('rougeL', 0.0)
+                    except Exception:
+                        pass
+                
+                eval_results.append({
+                    'sample_idx': idx,
+                    'session_id': item.get('session_id', ''),
+                    'question_type': item.get('metadata', {}).get('question_type', ''),
+                    'question_id': item.get('metadata', {}).get('question_id', ''),
+                    'eval_query': eval_query,
+                    'expected_answer': expected_answer,
+                    'response': response_text[:500],
+                    'latency_ms': latency,
+                    'keyword_recall': keyword_recall,
+                    'answer_match': answer_match,
+                    'rouge_l': rouge_l,
+                    'alpha': pref_alpha,
+                    'history_turns_played': history_injected,
+                    'total_turns': len(turns),
+                })
+                
+            except Exception as e:
+                logger.error(f"LongMemEval eval query failed: {e}")
+                eval_results.append({
+                    'sample_idx': idx,
+                    'session_id': item.get('session_id', ''),
+                    'question_type': item.get('metadata', {}).get('question_type', ''),
+                    'eval_query': eval_query,
+                    'expected_answer': expected_answer,
+                    'response': f"ERROR: {e}",
+                    'latency_ms': 0,
+                    'keyword_recall': 0.0,
+                    'answer_match': 0.0,
+                    'rouge_l': 0.0,
+                    'alpha': 0.0,
+                    'history_turns_played': history_injected,
+                    'total_turns': len(turns),
+                })
+        
+        # 汇总指标
+        import numpy as np
+        valid = [r for r in eval_results if not r['response'].startswith('ERROR:')]
+        
+        metrics = {
+            'total_samples': len(eval_results),
+            'valid_samples': len(valid),
+            'error_count': len(eval_results) - len(valid),
+        }
+        
+        if valid:
+            metrics.update({
+                'keyword_recall_mean': float(np.mean([r['keyword_recall'] for r in valid])),
+                'answer_match_mean': float(np.mean([r['answer_match'] for r in valid])),
+                'rouge_l_mean': float(np.mean([r['rouge_l'] for r in valid])),
+                'latency_mean_ms': float(np.mean([r['latency_ms'] for r in valid])),
+                'latency_p50_ms': float(np.median([r['latency_ms'] for r in valid])),
+                'latency_p95_ms': float(np.percentile([r['latency_ms'] for r in valid], 95)),
+                'avg_history_turns': float(np.mean([r['history_turns_played'] for r in valid])),
+            })
+            
+            # 按 question_type 分组
+            by_type = {}
+            for r in valid:
+                qt = r.get('question_type', 'unknown')
+                if qt not in by_type:
+                    by_type[qt] = []
+                by_type[qt].append(r)
+            
+            metrics['by_question_type'] = {}
+            for qt, items in by_type.items():
+                metrics['by_question_type'][qt] = {
+                    'count': len(items),
+                    'keyword_recall': float(np.mean([r['keyword_recall'] for r in items])),
+                    'answer_match': float(np.mean([r['answer_match'] for r in items])),
+                    'rouge_l': float(np.mean([r['rouge_l'] for r in items])),
+                }
+        
+        return {
+            'mode': mode if mode != 'baseline' else 'baseline',
+            'samples': eval_results,
+            'metrics': metrics,
+        }
+    
+    def _summarize_longmemeval(
+        self,
+        results_by_dataset: Dict[str, Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """汇总 LongMemEval 所有数据集和模式的结果。"""
+        summary = {}
+        
+        for dataset_name, mode_results in results_by_dataset.items():
+            summary[dataset_name] = {}
+            for mode, result in mode_results.items():
+                m = result.get('metrics', {})
+                summary[dataset_name][mode] = {
+                    'keyword_recall': m.get('keyword_recall_mean', 0.0),
+                    'answer_match': m.get('answer_match_mean', 0.0),
+                    'rouge_l': m.get('rouge_l_mean', 0.0),
+                    'latency_p50': m.get('latency_p50_ms', 0.0),
+                    'valid_samples': m.get('valid_samples', 0),
+                }
+        
+        return summary
+    
+    def _print_longmemeval_summary(self, summary: Dict[str, Any]):
+        """打印 LongMemEval 汇总结果。"""
+        for dataset_name, modes in summary.items():
+            logger.info(f"\n=== {dataset_name} ===")
+            for mode, metrics in modes.items():
+                logger.info(
+                    f"  {mode:>10s}: "
+                    f"kw_recall={metrics['keyword_recall']:.3f}, "
+                    f"ans_match={metrics['answer_match']:.3f}, "
+                    f"rouge_l={metrics['rouge_l']:.3f}, "
+                    f"latency_p50={metrics['latency_p50']:.0f}ms, "
+                    f"n={metrics['valid_samples']}"
+                )
+
     def run_context_constrained(
         self,
         data_path: Optional[str] = None,

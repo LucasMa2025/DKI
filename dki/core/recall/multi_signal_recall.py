@@ -401,6 +401,32 @@ class MultiSignalRecall:
                 seen_ids.add(msg_id)
                 final_messages.append(msg)
 
+        # ============ 12. 跨会话历史召回 (Cross-Session Memory) ============
+        cross_session_count = 0
+        if user_id and self._conversation_repo and hasattr(self._conversation_repo, 'get_cross_session_history'):
+            try:
+                cross_session_limit = self.config.budget.cross_session_limit if hasattr(self.config.budget, 'cross_session_limit') else 10
+                cross_session_msgs = self._conversation_repo.get_cross_session_history(
+                    user_id=user_id,
+                    current_session_id=session_id,
+                    limit=cross_session_limit,
+                )
+                for msg in cross_session_msgs:
+                    msg_id = getattr(msg, "id", None) or getattr(msg, "message_id", id(msg))
+                    msg_id = str(msg_id)
+                    if msg_id not in seen_ids:
+                        seen_ids.add(msg_id)
+                        final_messages.append(msg)
+                        cross_session_count += 1
+                
+                if cross_session_count > 0:
+                    logger.info(
+                        f"Cross-session recall: added {cross_session_count} messages "
+                        f"from previous sessions for user {user_id}"
+                    )
+            except Exception as e:
+                logger.warning(f"Cross-session recall failed (non-critical): {e}")
+
         result.messages = final_messages
         # 只保留 final_messages 中出现的 msg_id 的分数
         final_msg_ids = set()
@@ -415,6 +441,7 @@ class MultiSignalRecall:
             f"bm25={result.bm25_hits}(active={bm25_active}), "
             f"vec={result.vector_hits}(active={vec_active}), "
             f"recent={result.recent_turns_added}, "
+            f"cross_session={cross_session_count}, "
             f"gating_dropped={signals_dropped}, "
             f"total={len(final_messages)}"
         )

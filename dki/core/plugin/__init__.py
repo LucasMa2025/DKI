@@ -24,7 +24,6 @@ from dki.core.plugin.injection_plan import (
     SafetyEnvelope,
     QueryContext,
     ExecutionResult,
-    FactBlock,
 )
 
 from dki.core.plugin.injection_planner import InjectionPlanner
@@ -37,7 +36,6 @@ __all__ = [
     "SafetyEnvelope",
     "QueryContext",
     "ExecutionResult",
-    "FactBlock",
     # 组件
     "InjectionPlanner",
     "InjectionExecutor",

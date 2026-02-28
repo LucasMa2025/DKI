@@ -1096,6 +1096,107 @@ def create_app() -> FastAPI:
             logger.error(f"PersonaChat experiment error: {e}")
             raise HTTPException(status_code=500, detail=str(e))
     
+    # ================================================================
+    # LongMemEval Experiment Endpoints
+    # ================================================================
+    
+    class LongMemEvalRequest(BaseModel):
+        """LongMemEval 实验请求"""
+        modes: List[str] = ["dki", "rag", "baseline"]
+        max_samples: int = 10
+        max_new_tokens: int = 256
+        force_alpha: float = 0.4
+    
+    @app.post("/api/experiment/run-longmem-multi-turn")
+    async def run_longmem_multi_turn(request: LongMemEvalRequest):
+        """
+        运行 LongMemEval 长会话验证测试 (multi_turn 模式)
+        
+        测试 DKI 在多轮长对话中的记忆召回能力:
+        1. 设置实验用户和偏好
+        2. 加载/生成 LongMemEval multi_turn 数据 (证据 + 干扰会话)
+        3. 对每个样本: 播放历史对话 → 发送评估问题
+        4. 比较 DKI vs RAG vs Baseline 的关键词召回率和答案匹配度
+        
+        multi_turn 模式: 证据会话 + 少量干扰会话 (~20 轮/样本)
+        适合验证 DKI 的历史压缩和多信号召回能力
+        
+        预估时间 (L20 48G, 14B model):
+        - 10 samples × 3 modes: ~20 min
+        - 50 samples × 3 modes: ~2 hours
+        """
+        try:
+            dki = get_dki_system()
+            rag = get_rag_system()
+            runner = ExperimentRunner(
+                dki_system=dki,
+                rag_system=rag,
+            )
+            results = runner.run_longmemeval(
+                modes=request.modes,
+                longmemeval_modes=["multi_turn"],
+                max_samples=request.max_samples,
+                max_new_tokens=request.max_new_tokens,
+                force_alpha=request.force_alpha,
+                setup_users=True,
+                auto_generate=True,
+            )
+            return {
+                "status": "success",
+                "benchmark": "longmemeval_multi_turn",
+                "summary": results.get('summary', {}),
+                "config": results.get('config', {}),
+                "completed_at": results.get('completed_at', ''),
+            }
+        except Exception as e:
+            logger.error(f"LongMemEval multi_turn experiment error: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    @app.post("/api/experiment/run-longmem-needle")
+    async def run_longmem_needle(request: LongMemEvalRequest):
+        """
+        运行 LongMemEval 大海捞针测试 (needle 模式)
+        
+        测试 DKI 在复杂长会话中的精确记忆检索能力:
+        1. 设置实验用户和偏好
+        2. 加载/生成 LongMemEval needle 数据 (证据隐藏在大量干扰会话中)
+        3. 对每个样本: 播放 40+ 轮历史对话 → 发送评估问题
+        4. 比较 DKI vs RAG vs Baseline
+        
+        needle 模式: 证据会话被大量干扰会话包围 (~43 轮/样本)
+        这是最困难的设置, 测试 DKI 在高上下文压力下的召回精度
+        
+        预估时间 (L20 48G, 14B model):
+        - 10 samples × 3 modes: ~40 min
+        - 50 samples × 3 modes: ~3.5 hours
+        """
+        try:
+            dki = get_dki_system()
+            rag = get_rag_system()
+            runner = ExperimentRunner(
+                dki_system=dki,
+                rag_system=rag,
+            )
+            results = runner.run_longmemeval(
+                modes=request.modes,
+                longmemeval_modes=["needle"],
+                max_samples=request.max_samples,
+                max_new_tokens=request.max_new_tokens,
+                force_alpha=request.force_alpha,
+                setup_users=True,
+                auto_generate=True,
+            )
+            return {
+                "status": "success",
+                "benchmark": "longmemeval_needle",
+                "summary": results.get('summary', {}),
+                "config": results.get('config', {}),
+                "completed_at": results.get('completed_at', ''),
+            }
+        except Exception as e:
+            logger.error(f"LongMemEval needle experiment error: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+    
     @app.get("/api/experiments")
     async def list_experiments():
         """List all experiments."""

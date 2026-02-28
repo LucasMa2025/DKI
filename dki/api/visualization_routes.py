@@ -88,7 +88,8 @@ class InjectionVisualizationResponse(BaseModel):
     attention_viz: Optional[AttentionVisualization] = Field(None, description="注意力可视化")
     
     # 最终输入
-    final_input_preview: str = Field("", description="最终输入预览 (截断)")
+    final_input: str = Field("", description="最终完整输入 (v6.2: 不截断)")
+    final_input_preview: str = Field("", description="最终输入预览 (向后兼容)")
     
     # 注入明文信息 (用于显示, 不显示实际 K/V)
     preference_text: str = Field("", description="偏好原文")
@@ -614,9 +615,9 @@ def build_visualization_response(data: Dict[str, Any]) -> InjectionVisualization
         "total": data.get("total_tokens", 0),
     }
     
-    # 最终输入预览 (保留更多内容以便调试分析)
+    # v6.2: 不再截断, 完整保留最终输入 (用于特性分析和调试)
     final_input = data.get("final_input", data.get("query", ""))
-    final_input_preview = final_input[:2000] + "..." if len(final_input) > 2000 else final_input
+    final_input_preview = final_input
     
     # 判断模式
     request_id = data.get("request_id", "")
@@ -648,6 +649,8 @@ def build_visualization_response(data: Dict[str, Any]) -> InjectionVisualization
         flow_steps=flow_steps,
         token_distribution=token_distribution,
         attention_viz=None,  # 简化版不包含完整注意力矩阵
+        # v6.2: 完整最终输入 (不截断) + 向后兼容预览字段
+        final_input=final_input_preview,
         final_input_preview=final_input_preview,
         # 注入明文信息
         preference_text=data.get("preference_text", ""),

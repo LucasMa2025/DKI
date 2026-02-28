@@ -131,11 +131,6 @@ class InjectionMetadata:
     # 安全违规 (v3.0)
     safety_violations: Optional[List[str]] = None
     
-    # Planner-only Fact Resolution (v3.3)
-    fact_blocks_resolved: int = 0
-    fact_tokens_total: int = 0
-    fact_strategy: str = "none"
-    
     # 时间戳
     timestamp: datetime = field(default_factory=datetime.utcnow)
     request_id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
@@ -180,12 +175,6 @@ class InjectionMetadata:
                 "scope": self.reference_scope,
             },
             "safety_violations": self.safety_violations or [],
-            # Planner-only Fact Resolution (v3.3)
-            "fact_resolution": {
-                "blocks_resolved": self.fact_blocks_resolved,
-                "tokens_total": self.fact_tokens_total,
-                "strategy": self.fact_strategy,
-            },
         }
 
 
@@ -299,13 +288,15 @@ class DKIPlugin:
         self._mis: Optional[MemoryInfluenceScaling] = None
         self._gating: Optional[DualFactorGating] = None
         
-        # ============ Recall v4 组件 (Planner-only Fact Resolution, v3.3) ============
+        # ============ Recall v4 组件 ============
         self._fact_retriever = None
         self._prompt_formatter = None
         self._recall_config = None
+        self._suffix_builder = None
         try:
             from dki.core.recall import (
                 RecallConfig,
+                SuffixBuilder,
                 FactRetriever,
                 create_formatter,
             )
@@ -323,20 +314,35 @@ class DKIPlugin:
                 language=language,
             )
             
+            # v6.2: 创建 SuffixBuilder (修复历史消息压缩缺失的 Bug)
+            # DKI Plugin 使用 adapter 做召回, 但仍需 SuffixBuilder 做 token 预算分配和压缩
+            token_counter = None
+            if model_adapter and hasattr(model_adapter, 'tokenizer') and model_adapter.tokenizer:
+                tokenizer = model_adapter.tokenizer
+                token_counter = lambda text: len(tokenizer.encode(text)) if text else 0
+            self._suffix_builder = SuffixBuilder(
+                config=self._recall_config,
+                prompt_formatter=self._prompt_formatter,
+                token_counter=token_counter,
+                model_adapter=model_adapter,
+            )
+            
             # FactRetriever 需要 conversation_repo, 延迟初始化
-            # 在 from_config 中会设置 conversation_repo
             self._fact_retriever = FactRetriever(
                 config=self._recall_config,
                 conversation_repo=None,  # 延迟设置
             )
             
-            logger.info("Recall v4 components initialized for Planner-only fact resolution")
+            logger.info("Recall v4 components initialized (SuffixBuilder + FactRetriever)")
         except ImportError:
             logger.info("Recall v4 components not available, fact resolution disabled")
         except Exception as recall_err:
             logger.warning(f"Recall v4 init failed (non-critical): {recall_err}")
         
-        # ============ Planner (纯决策, v3.3: 含 Fact Resolution) ============
+        # ============ 获取 context_window ============
+        self._context_window = self._resolve_context_window()
+        
+        # ============ Planner (纯决策, v6.2: 含 SuffixBuilder) ============
         self._planner = InjectionPlanner(
             config=self.config,
             language=language,
@@ -344,6 +350,7 @@ class DKIPlugin:
             memory_trigger_config=memory_trigger_config,
             reference_resolver_config=reference_resolver_config,
             recall_config=self._recall_config,
+            suffix_builder=self._suffix_builder,  # v6.2: 传递 SuffixBuilder
             fact_retriever=self._fact_retriever,
             prompt_formatter=self._prompt_formatter,
         )
@@ -401,6 +408,47 @@ class DKIPlugin:
             f"(strategy=recall_v4, language={language}, "
             f"cache={cache_status}, architecture=planner+executor)"
         )
+    
+    # ================================================================
+    # 内部方法
+    # ================================================================
+    
+    def _resolve_context_window(self) -> int:
+        """
+        v6.2: 从配置或模型中获取上下文窗口大小
+        
+        优先级:
+        1. config.model.engines.{engine}.max_model_len
+        2. model_adapter.tokenizer.model_max_length
+        3. 默认 4096
+        """
+        context_window = 4096
+        
+        # 尝试从配置获取
+        try:
+            if hasattr(self.config, 'model') and hasattr(self.config.model, 'engines'):
+                engine_name = getattr(self.config.model, 'default_engine', None)
+                if engine_name:
+                    engine_cfg = self.config.model.engines.get(engine_name, {})
+                    if hasattr(engine_cfg, 'max_model_len'):
+                        context_window = engine_cfg.max_model_len
+                    elif isinstance(engine_cfg, dict) and 'max_model_len' in engine_cfg:
+                        context_window = engine_cfg['max_model_len']
+        except Exception:
+            pass
+        
+        # 回退: 从 tokenizer 获取
+        if context_window <= 4096:
+            try:
+                if self.model and hasattr(self.model, 'tokenizer') and self.model.tokenizer:
+                    max_len = getattr(self.model.tokenizer, 'model_max_length', None)
+                    if max_len and max_len < 1_000_000:  # 排除 sentinel 值
+                        context_window = max_len
+            except Exception:
+                pass
+        
+        logger.info(f"DKI Plugin context_window resolved: {context_window}")
+        return context_window
     
     # ================================================================
     # 内部组件访问器 (高级用法 / 测试)
@@ -688,10 +736,12 @@ class DKIPlugin:
             preferences = await self._get_cached_preferences(user_id)
             metadata.preferences_count = len(preferences)
             
+            # v6.1: 不限制 session_id, 支持跨会话记忆检索
+            # 适配器会在所有该用户的会话中检索相关历史
             relevant_history = await self.data_adapter.search_relevant_history(
                 user_id=user_id,
                 query=query,
-                session_id=session_id,
+                session_id=None,  # 跨会话检索
                 limit=context.recall_limit,
             )
             metadata.relevant_history_count = len(relevant_history)
@@ -712,6 +762,7 @@ class DKIPlugin:
                 context=context,
                 force_alpha=force_alpha,
                 session_id=session_id,
+                context_window=self._context_window,  # v6.2: 传递实际上下文窗口
             )
             
             # 从 plan 填充 metadata
@@ -741,11 +792,6 @@ class DKIPlugin:
             metadata.preference_cache_hit = result.preference_cache_hit
             metadata.preference_cache_tier = result.preference_cache_tier
             
-            # Planner-only Fact Resolution 信息 (v3.3)
-            metadata.fact_blocks_resolved = result.fact_blocks_resolved
-            metadata.fact_tokens_total = result.fact_tokens_total
-            metadata.fact_strategy = result.fact_strategy
-            
             total_execution_ms = (time.time() - injection_start) * 1000
             metadata.injection_latency_ms = (
                 total_execution_ms - result.inference_latency_ms
@@ -759,6 +805,7 @@ class DKIPlugin:
                 user_id=user_id,
                 session_id=session_id,
                 final_input=plan.final_input,
+                plan=plan,
             )
             
             # v5.7: 移除 <think> 推理内容
@@ -861,6 +908,7 @@ class DKIPlugin:
         user_id: str = "",
         session_id: str = "",
         final_input: str = "",
+        plan: Optional[InjectionPlan] = None,
     ):
         """记录注入日志 (用于监控和可视化)"""
         self._injection_logs.append(metadata)
@@ -886,6 +934,34 @@ class DKIPlugin:
             self._stats["avg_alpha"] = (
                 total_alpha / self._stats["injection_enabled_count"]
             )
+        
+        # v6.2: 从 plan 提取可视化所需的明文信息
+        preference_text = ""
+        history_suffix_text = ""
+        history_messages = []
+        recall_v4_info = {}
+        
+        if plan:
+            preference_text = plan.preference_text or ""
+            history_suffix_text = plan.assembled_suffix or plan.history_suffix or ""
+            
+            # 从 plan.history_items 构造历史消息列表 (用于 UI 显示)
+            for item in (plan.history_items or []):
+                role = getattr(item, 'role', 'user') or 'user'
+                content = getattr(item, 'content', str(item))
+                if content and content.strip():
+                    history_messages.append({"role": role, "content": content})
+            
+            # Recall v4 元数据
+            if plan.strategy == "recall_v4":
+                recall_v4_info = {
+                    "enabled": True,
+                    "strategy": plan.recall_strategy,
+                    "trace_ids": plan.trace_ids or [],
+                    "fact_rounds_used": plan.fact_rounds_used,
+                    "summary_count": plan.summary_count,
+                    "message_count": plan.message_count,
+                }
         
         # 记录可视化数据
         try:
@@ -917,6 +993,17 @@ class DKIPlugin:
                 "reference_type": metadata.reference_type,
                 "safety_violations": metadata.safety_violations,
                 "final_input": final_input,
+                # v6.2: 注入明文信息 (用于可视化完整显示)
+                "preference_text": preference_text,
+                "history_suffix_text": history_suffix_text,
+                "history_messages": history_messages,
+                # v6.2: Recall v4 元数据
+                "recall_v4": recall_v4_info,
+                "recall_strategy": recall_v4_info.get("strategy", ""),
+                "trace_ids": recall_v4_info.get("trace_ids", []),
+                "fact_rounds_used": recall_v4_info.get("fact_rounds_used", 0),
+                "summary_count": recall_v4_info.get("summary_count", 0),
+                "message_count": recall_v4_info.get("message_count", 0),
             })
         except Exception as e:
             logger.debug(f"Failed to record visualization: {e}")

@@ -1138,6 +1138,671 @@ class ExperimentDataGenerator:
         )
         return data
 
+    # ================================================================
+    # LongMemEval Integration (ICLR 2025 Benchmark)
+    # ================================================================
+
+    def generate_longmemeval(
+        self,
+        source_path: str = "../longmem/longmemeval_s_cleaned.json",
+        mode: str = "multi_turn",
+        max_questions: int = 500,
+        max_history_sessions: int = 10,
+        max_turns_per_session: int = 6,
+        include_filler_sessions: int = 3,
+        question_types: Optional[List[str]] = None,
+        experiment_user: str = "exp_user_longmem",
+        output_name: str = "longmemeval",
+    ) -> List[Dict[str, Any]]:
+        """
+        Convert LongMemEval benchmark data to DKI experiment format.
+        
+        LongMemEval (ICLR 2025) tests five core long-term memory abilities:
+        - Information Extraction (single-session-user/assistant)
+        - Multi-Session Reasoning (multi-session)
+        - Knowledge Updates (knowledge-update)
+        - Temporal Reasoning (temporal-reasoning)
+        - Preference Recall (single-session-preference)
+        - Abstention (question_id ends with _abs)
+        
+        Data source: longmemeval_s_cleaned.json (~264MB, 500 questions,
+        each with ~47 haystack sessions of multi-turn conversations)
+        
+        Conversion modes:
+        - "oracle": Only evidence sessions as history (easiest, tests pure recall)
+        - "multi_turn": Evidence + filler sessions, flattened into multi-turn
+          conversation (medium, closest to DKI's design)
+        - "needle": All sessions up to token budget, evidence buried in middle
+          (hardest, needle-in-a-haystack style)
+        
+        Args:
+            source_path: Path to longmemeval_s_cleaned.json
+            mode: Conversion mode ("oracle", "multi_turn", "needle")
+            max_questions: Maximum number of questions to convert
+            max_history_sessions: Maximum sessions to include as history
+            max_turns_per_session: Max turns to keep per session (truncate long ones)
+            include_filler_sessions: Number of non-evidence sessions to include
+                                     (for "multi_turn" mode)
+            question_types: Filter by question types. None = all types.
+                Options: single-session-user, single-session-assistant,
+                         single-session-preference, multi-session,
+                         temporal-reasoning, knowledge-update
+            experiment_user: User name for experiment system
+            output_name: Output filename (without .json)
+            
+        Returns:
+            List of DKI-compatible experiment data items
+        """
+        # Check if output file already exists — skip regeneration
+        output_path = self.output_dir / f'{output_name}.json'
+        if output_path.exists():
+            file_size = output_path.stat().st_size
+            if file_size > 1024:  # > 1KB = valid data
+                logger.info(
+                    f"LongMemEval data already exists: {output_path} "
+                    f"({file_size / 1024:.1f} KB), skipping generation. "
+                    f"Delete the file to regenerate."
+                )
+                # Load and return existing data
+                with open(output_path, 'r', encoding='utf-8') as f:
+                    existing_data = json.load(f)
+                logger.info(f"Loaded {len(existing_data)} existing items from {output_path}")
+                return existing_data
+        
+        source = Path(source_path)
+        if not source.is_absolute():
+            # Try relative to output_dir parent
+            source = self.output_dir.parent / source_path
+        
+        if not source.exists():
+            # Try common locations
+            for candidate in [
+                Path("../longmem/longmemeval_s_cleaned.json"),
+                Path("longmem/longmemeval_s_cleaned.json"),
+                Path("./data/longmemeval_s_cleaned.json"),
+            ]:
+                if candidate.exists():
+                    source = candidate
+                    break
+            else:
+                logger.error(
+                    f"LongMemEval source not found: {source_path}. "
+                    "Please download from https://huggingface.co/datasets/"
+                    "xiaowu0162/longmemeval-cleaned and place in longmem/ directory."
+                )
+                return []
+        
+        logger.info(f"Loading LongMemEval data from {source}")
+        with open(source, 'r', encoding='utf-8') as f:
+            raw_data = json.load(f)
+        
+        logger.info(f"Loaded {len(raw_data)} LongMemEval questions")
+        
+        # Filter by question type
+        if question_types:
+            raw_data = [
+                item for item in raw_data
+                if item['question_type'] in question_types
+            ]
+            logger.info(
+                f"Filtered to {len(raw_data)} questions "
+                f"(types: {question_types})"
+            )
+        
+        # Skip abstention questions (no correct answer)
+        raw_data = [
+            item for item in raw_data
+            if not item['question_id'].endswith('_abs')
+        ]
+        
+        # Limit
+        raw_data = raw_data[:max_questions]
+        
+        # Convert based on mode
+        if mode == "oracle":
+            data = self._convert_longmemeval_oracle(
+                raw_data, max_turns_per_session, experiment_user
+            )
+        elif mode == "multi_turn":
+            data = self._convert_longmemeval_multi_turn(
+                raw_data, max_history_sessions, max_turns_per_session,
+                include_filler_sessions, experiment_user
+            )
+        elif mode == "needle":
+            data = self._convert_longmemeval_needle(
+                raw_data, max_history_sessions, max_turns_per_session,
+                experiment_user
+            )
+        else:
+            raise ValueError(
+                f"Unknown mode: {mode}. Use 'oracle', 'multi_turn', or 'needle'"
+            )
+        
+        # Save
+        output_path = self.output_dir / f'{output_name}.json'
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        
+        logger.info(
+            f"Generated {len(data)} LongMemEval items (mode={mode}) "
+            f"to {output_path}"
+        )
+        
+        # Print statistics
+        self._print_longmemeval_stats(data)
+        
+        return data
+    
+    def _convert_longmemeval_oracle(
+        self,
+        raw_data: List[Dict[str, Any]],
+        max_turns_per_session: int,
+        experiment_user: str,
+    ) -> List[Dict[str, Any]]:
+        """
+        Oracle mode: Only evidence sessions as history.
+        
+        This is the easiest setting — the model only needs to find
+        the answer within the evidence sessions (no distractors).
+        Tests pure memory recall ability.
+        """
+        data = []
+        
+        for item in raw_data:
+            qid = item['question_id']
+            question = item['question']
+            answer = str(item['answer'])  # Ensure string (some answers are int)
+            q_type = item['question_type']
+            
+            # Collect evidence sessions
+            evidence_sessions = []
+            for aid in item['answer_session_ids']:
+                if aid in item['haystack_session_ids']:
+                    idx = item['haystack_session_ids'].index(aid)
+                    session = item['haystack_sessions'][idx]
+                    date = item['haystack_dates'][idx]
+                    evidence_sessions.append({
+                        'session_id': aid,
+                        'date': date,
+                        'turns': session,
+                    })
+            
+            # Extract user facts from evidence sessions (as personas)
+            personas = self._extract_user_facts(evidence_sessions)
+            
+            # Build conversation turns from evidence sessions
+            turns = self._sessions_to_turns(
+                evidence_sessions, max_turns_per_session
+            )
+            
+            # Add the question as the final query
+            turns.append({
+                'turn_id': len(turns),
+                'query': question,
+                'expected_answer': answer,
+                'is_eval_query': True,
+                'expected_keywords': self._extract_answer_keywords(answer),
+            })
+            
+            data.append({
+                'session_id': f"longmem_oracle_{qid}",
+                'experiment_user': experiment_user,
+                'personas': personas,
+                'turns': turns,
+                'metadata': {
+                    'dataset': 'longmemeval',
+                    'source': 'longmemeval_s_cleaned',
+                    'mode': 'oracle',
+                    'question_id': qid,
+                    'question_type': q_type,
+                    'question_date': item.get('question_date', ''),
+                    'expected_answer': answer,
+                    'evidence_session_count': len(evidence_sessions),
+                    'experiment_user': experiment_user,
+                    'generated_at': datetime.now().isoformat(),
+                },
+            })
+        
+        return data
+    
+    def _convert_longmemeval_multi_turn(
+        self,
+        raw_data: List[Dict[str, Any]],
+        max_history_sessions: int,
+        max_turns_per_session: int,
+        include_filler_sessions: int,
+        experiment_user: str,
+    ) -> List[Dict[str, Any]]:
+        """
+        Multi-turn mode: Evidence + filler sessions as multi-turn history.
+        
+        This is the recommended mode for DKI testing.
+        The evidence sessions are mixed with filler sessions to create
+        a realistic multi-turn conversation history. The model needs
+        to recall information across multiple conversation turns.
+        
+        This mode best demonstrates DKI's advantage over RAG:
+        - Long conversation history tests DKI's history compression
+        - Mixed evidence/filler tests DKI's recall precision
+        - Multi-turn format tests DKI's session management
+        """
+        data = []
+        
+        for item in raw_data:
+            qid = item['question_id']
+            question = item['question']
+            answer = str(item['answer'])
+            q_type = item['question_type']
+            
+            all_session_ids = item['haystack_session_ids']
+            all_sessions = item['haystack_sessions']
+            all_dates = item['haystack_dates']
+            evidence_ids = set(item['answer_session_ids'])
+            
+            # Select sessions to include
+            selected_sessions = []
+            
+            # Always include evidence sessions
+            for i, sid in enumerate(all_session_ids):
+                if sid in evidence_ids:
+                    selected_sessions.append({
+                        'session_id': sid,
+                        'date': all_dates[i],
+                        'turns': all_sessions[i],
+                        'is_evidence': True,
+                        'position': i,
+                    })
+            
+            # Add filler sessions (non-evidence, randomly sampled)
+            filler_indices = [
+                i for i, sid in enumerate(all_session_ids)
+                if sid not in evidence_ids
+            ]
+            
+            n_fillers = min(include_filler_sessions, len(filler_indices))
+            if n_fillers > 0:
+                # Sample fillers, preferring ones near the evidence
+                evidence_positions = [s['position'] for s in selected_sessions]
+                avg_evidence_pos = sum(evidence_positions) / len(evidence_positions)
+                
+                # Sort fillers by distance to evidence center, pick nearby ones
+                filler_indices.sort(
+                    key=lambda i: abs(i - avg_evidence_pos)
+                )
+                chosen_fillers = filler_indices[:n_fillers * 2]
+                random.shuffle(chosen_fillers)
+                chosen_fillers = chosen_fillers[:n_fillers]
+                
+                for i in chosen_fillers:
+                    selected_sessions.append({
+                        'session_id': all_session_ids[i],
+                        'date': all_dates[i],
+                        'turns': all_sessions[i],
+                        'is_evidence': False,
+                        'position': i,
+                    })
+            
+            # Sort by original position (chronological order)
+            selected_sessions.sort(key=lambda s: s['position'])
+            
+            # Limit total sessions
+            if len(selected_sessions) > max_history_sessions:
+                # Keep all evidence sessions, trim fillers
+                evidence = [s for s in selected_sessions if s['is_evidence']]
+                fillers = [s for s in selected_sessions if not s['is_evidence']]
+                remaining = max_history_sessions - len(evidence)
+                selected_sessions = evidence + fillers[:remaining]
+                selected_sessions.sort(key=lambda s: s['position'])
+            
+            # Extract user facts as personas
+            evidence_only = [s for s in selected_sessions if s['is_evidence']]
+            personas = self._extract_user_facts(evidence_only)
+            
+            # Build conversation turns
+            turns = self._sessions_to_turns(
+                selected_sessions, max_turns_per_session
+            )
+            
+            # Add the question as the final query
+            turns.append({
+                'turn_id': len(turns),
+                'query': question,
+                'expected_answer': answer,
+                'is_eval_query': True,
+                'expected_keywords': self._extract_answer_keywords(answer),
+            })
+            
+            data.append({
+                'session_id': f"longmem_mt_{qid}",
+                'experiment_user': experiment_user,
+                'personas': personas,
+                'turns': turns,
+                'metadata': {
+                    'dataset': 'longmemeval',
+                    'source': 'longmemeval_s_cleaned',
+                    'mode': 'multi_turn',
+                    'question_id': qid,
+                    'question_type': q_type,
+                    'question_date': item.get('question_date', ''),
+                    'expected_answer': answer,
+                    'evidence_session_count': len(evidence_only),
+                    'filler_session_count': len(selected_sessions) - len(evidence_only),
+                    'total_turns': len(turns),
+                    'experiment_user': experiment_user,
+                    'generated_at': datetime.now().isoformat(),
+                },
+            })
+        
+        return data
+    
+    def _convert_longmemeval_needle(
+        self,
+        raw_data: List[Dict[str, Any]],
+        max_history_sessions: int,
+        max_turns_per_session: int,
+        experiment_user: str,
+    ) -> List[Dict[str, Any]]:
+        """
+        Needle mode: Many sessions with evidence buried in the middle.
+        
+        This is the hardest setting — the evidence sessions are surrounded
+        by many filler sessions, making it a "needle in a haystack" test.
+        Best for testing DKI's recall under high context pressure.
+        """
+        data = []
+        
+        for item in raw_data:
+            qid = item['question_id']
+            question = item['question']
+            answer = str(item['answer'])
+            q_type = item['question_type']
+            
+            all_session_ids = item['haystack_session_ids']
+            all_sessions = item['haystack_sessions']
+            all_dates = item['haystack_dates']
+            evidence_ids = set(item['answer_session_ids'])
+            
+            # Take up to max_history_sessions sessions
+            n_sessions = min(max_history_sessions, len(all_session_ids))
+            
+            # Ensure evidence sessions are included
+            evidence_indices = [
+                i for i, sid in enumerate(all_session_ids)
+                if sid in evidence_ids
+            ]
+            filler_indices = [
+                i for i, sid in enumerate(all_session_ids)
+                if sid not in evidence_ids
+            ]
+            
+            n_fillers_needed = n_sessions - len(evidence_indices)
+            if n_fillers_needed > 0 and filler_indices:
+                # Evenly sample fillers to spread them out
+                step = max(1, len(filler_indices) // n_fillers_needed)
+                chosen_fillers = filler_indices[::step][:n_fillers_needed]
+            else:
+                chosen_fillers = []
+            
+            selected_indices = sorted(evidence_indices + chosen_fillers)
+            
+            selected_sessions = []
+            for i in selected_indices:
+                selected_sessions.append({
+                    'session_id': all_session_ids[i],
+                    'date': all_dates[i],
+                    'turns': all_sessions[i],
+                    'is_evidence': all_session_ids[i] in evidence_ids,
+                    'position': i,
+                })
+            
+            # Extract user facts as personas
+            evidence_only = [s for s in selected_sessions if s['is_evidence']]
+            personas = self._extract_user_facts(evidence_only)
+            
+            # Build conversation turns
+            turns = self._sessions_to_turns(
+                selected_sessions, max_turns_per_session
+            )
+            
+            # Add the question as the final query
+            turns.append({
+                'turn_id': len(turns),
+                'query': question,
+                'expected_answer': answer,
+                'is_eval_query': True,
+                'expected_keywords': self._extract_answer_keywords(answer),
+            })
+            
+            data.append({
+                'session_id': f"longmem_needle_{qid}",
+                'experiment_user': experiment_user,
+                'personas': personas,
+                'turns': turns,
+                'metadata': {
+                    'dataset': 'longmemeval',
+                    'source': 'longmemeval_s_cleaned',
+                    'mode': 'needle',
+                    'question_id': qid,
+                    'question_type': q_type,
+                    'question_date': item.get('question_date', ''),
+                    'expected_answer': answer,
+                    'evidence_session_count': len(evidence_only),
+                    'filler_session_count': len(selected_sessions) - len(evidence_only),
+                    'total_turns': len(turns),
+                    'total_sessions_in_source': len(all_session_ids),
+                    'experiment_user': experiment_user,
+                    'generated_at': datetime.now().isoformat(),
+                },
+            })
+        
+        return data
+    
+    def _sessions_to_turns(
+        self,
+        sessions: List[Dict[str, Any]],
+        max_turns_per_session: int,
+    ) -> List[Dict[str, Any]]:
+        """
+        Convert LongMemEval sessions into DKI-compatible turns.
+        
+        Each LongMemEval session contains multiple user/assistant turns.
+        We flatten them into a linear sequence of conversation turns.
+        Only user turns become "query" turns in DKI format;
+        assistant turns are preserved as context that the model should
+        have generated (used for building conversation history).
+        """
+        turns = []
+        turn_id = 0
+        
+        for sess_info in sessions:
+            session_turns = sess_info['turns']
+            is_evidence = sess_info.get('is_evidence', False)
+            session_id = sess_info.get('session_id', '')
+            session_date = sess_info.get('date', '')
+            
+            # Truncate long sessions
+            kept_turns = session_turns[:max_turns_per_session]
+            
+            for t in kept_turns:
+                if t['role'] == 'user':
+                    turn_data = {
+                        'turn_id': turn_id,
+                        'query': t['content'],
+                        'expected_keywords': [],
+                        'source_session': session_id,
+                        'session_date': session_date,
+                    }
+                    if t.get('has_answer'):
+                        turn_data['has_evidence'] = True
+                    if is_evidence:
+                        turn_data['from_evidence_session'] = True
+                    turns.append(turn_data)
+                    turn_id += 1
+                elif t['role'] == 'assistant':
+                    # Store assistant response as the expected response
+                    # for the preceding user turn
+                    if turns and 'expected_response' not in turns[-1]:
+                        turns[-1]['expected_response'] = t['content']
+                        if t.get('has_answer'):
+                            turns[-1]['has_evidence'] = True
+        
+        return turns
+    
+    def _extract_user_facts(
+        self,
+        evidence_sessions: List[Dict[str, Any]],
+    ) -> List[str]:
+        """
+        Extract user-stated facts from evidence sessions to use as personas.
+        
+        Scans user turns in evidence sessions for first-person statements
+        that contain personal information (preferences, facts, background).
+        These become the "persona" entries that DKI should recall.
+        """
+        facts = []
+        seen = set()
+        
+        # Patterns that indicate user facts
+        fact_indicators = [
+            "i ", "i'm ", "i am ", "my ", "i have ", "i've ",
+            "i like ", "i love ", "i prefer ", "i enjoy ",
+            "i work ", "i live ", "i graduated ", "i used to ",
+            "i'm planning ", "i was ", "i recently ", "i want ",
+            "i need ", "i usually ", "i practice ", "i collect ",
+        ]
+        
+        for sess_info in evidence_sessions:
+            for turn in sess_info['turns']:
+                if turn['role'] != 'user':
+                    continue
+                
+                content = turn['content']
+                content_lower = content.lower()
+                
+                # Check if the turn contains personal information
+                has_fact = any(
+                    indicator in content_lower
+                    for indicator in fact_indicators
+                )
+                
+                if has_fact or turn.get('has_answer'):
+                    # Extract sentences that contain personal facts
+                    sentences = self._split_sentences(content)
+                    for sent in sentences:
+                        sent_lower = sent.lower().strip()
+                        if len(sent_lower) < 10:
+                            continue
+                        if any(ind in sent_lower for ind in fact_indicators):
+                            # Deduplicate by content similarity
+                            key = sent_lower[:50]
+                            if key not in seen:
+                                seen.add(key)
+                                facts.append(sent.strip())
+                                if len(facts) >= 8:  # Limit personas
+                                    return facts
+        
+        # If no explicit facts found, use the has_answer turns as-is
+        if not facts:
+            for sess_info in evidence_sessions:
+                for turn in sess_info['turns']:
+                    if turn.get('has_answer') and turn['role'] == 'user':
+                        content = turn['content']
+                        if len(content) > 200:
+                            content = content[:200] + "..."
+                        facts.append(content)
+        
+        return facts[:8]
+    
+    @staticmethod
+    def _split_sentences(text: str) -> List[str]:
+        """Split text into sentences (handles English and Chinese)."""
+        import re
+        # Split on sentence-ending punctuation
+        parts = re.split(r'(?<=[.!?;。！？；])\s*', text)
+        # Also split on newlines
+        result = []
+        for part in parts:
+            for line in part.split('\n'):
+                line = line.strip()
+                if line:
+                    result.append(line)
+        return result
+    
+    @staticmethod
+    def _extract_answer_keywords(answer) -> List[str]:
+        """Extract key words from the expected answer for evaluation."""
+        import re
+        # Handle non-string answers (e.g. numeric)
+        answer = str(answer)
+        # Remove common stop words and extract meaningful tokens
+        stop_words = {
+            'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been',
+            'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will',
+            'would', 'could', 'should', 'may', 'might', 'can', 'shall',
+            'to', 'of', 'in', 'for', 'on', 'with', 'at', 'by', 'from',
+            'or', 'and', 'not', 'no', 'but', 'if', 'then', 'that', 'this',
+            'it', 'its', 'they', 'them', 'their', 'also', 'more', 'than',
+            'only', 'very', 'just', 'about', 'user', 'would', 'prefer',
+            'response', 'responses', 'suggest', 'related', 'some',
+        }
+        
+        words = re.findall(r'\b\w+\b', answer.lower())
+        keywords = [
+            w for w in words
+            if w not in stop_words and len(w) > 2
+        ]
+        
+        # Deduplicate while preserving order
+        seen = set()
+        unique = []
+        for kw in keywords:
+            if kw not in seen:
+                seen.add(kw)
+                unique.append(kw)
+        
+        return unique[:10]  # Top 10 keywords
+    
+    def _print_longmemeval_stats(self, data: List[Dict[str, Any]]):
+        """Print statistics for generated LongMemEval data."""
+        if not data:
+            logger.info("No LongMemEval data generated")
+            return
+        
+        from collections import Counter
+        
+        types = Counter(
+            item['metadata']['question_type'] for item in data
+        )
+        modes = Counter(
+            item['metadata']['mode'] for item in data
+        )
+        turns_per_item = [len(item['turns']) for item in data]
+        personas_per_item = [len(item['personas']) for item in data]
+        
+        logger.info("=== LongMemEval Dataset Statistics ===")
+        logger.info(f"  Total items: {len(data)}")
+        logger.info(f"  Question types: {dict(types)}")
+        logger.info(f"  Modes: {dict(modes)}")
+        logger.info(
+            f"  Turns per item: min={min(turns_per_item)}, "
+            f"max={max(turns_per_item)}, "
+            f"avg={sum(turns_per_item)/len(turns_per_item):.1f}"
+        )
+        logger.info(
+            f"  Personas per item: min={min(personas_per_item)}, "
+            f"max={max(personas_per_item)}, "
+            f"avg={sum(personas_per_item)/len(personas_per_item):.1f}"
+        )
+        
+        # Estimate total tokens
+        total_chars = sum(
+            len(t.get('query', '')) + len(t.get('expected_response', ''))
+            for item in data
+            for t in item['turns']
+        )
+        est_tokens = total_chars / 4  # rough estimate
+        logger.info(f"  Estimated total tokens: {est_tokens:.0f}")
+    
     def generate_all(
         self,
         persona_sessions: int = 100,
@@ -1170,10 +1835,65 @@ class ExperimentDataGenerator:
 
 def main():
     """Generate all experiment data."""
-    generator = ExperimentDataGenerator("./data")
-    generator.generate_all(include_chinese=True, include_advanced=True, include_long_sessions=True)
-    generator.generate_alpha_sensitivity_data()
-    print("Experiment data generated successfully!")
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="DKI Experiment Data Generator")
+    parser.add_argument(
+        "--longmemeval", action="store_true",
+        help="Generate LongMemEval benchmark data"
+    )
+    parser.add_argument(
+        "--longmemeval-source",
+        default="../longmem/longmemeval_s_cleaned.json",
+        help="Path to longmemeval_s_cleaned.json"
+    )
+    parser.add_argument(
+        "--longmemeval-mode", default="multi_turn",
+        choices=["oracle", "multi_turn", "needle"],
+        help="LongMemEval conversion mode"
+    )
+    parser.add_argument(
+        "--longmemeval-max", type=int, default=500,
+        help="Maximum number of LongMemEval questions"
+    )
+    parser.add_argument(
+        "--longmemeval-filler", type=int, default=3,
+        help="Number of filler sessions in multi_turn mode"
+    )
+    parser.add_argument(
+        "--longmemeval-types", nargs="+", default=None,
+        help="Filter by question types"
+    )
+    parser.add_argument(
+        "--all", action="store_true",
+        help="Generate all standard datasets"
+    )
+    parser.add_argument(
+        "--output-dir", default="./data",
+        help="Output directory for generated data"
+    )
+    
+    args = parser.parse_args()
+    generator = ExperimentDataGenerator(args.output_dir)
+    
+    if args.longmemeval:
+        # Generate LongMemEval data
+        generator.generate_longmemeval(
+            source_path=args.longmemeval_source,
+            mode=args.longmemeval_mode,
+            max_questions=args.longmemeval_max,
+            include_filler_sessions=args.longmemeval_filler,
+            question_types=args.longmemeval_types,
+        )
+        print(f"LongMemEval data generated (mode={args.longmemeval_mode})")
+    elif args.all or not args.longmemeval:
+        generator.generate_all(
+            include_chinese=True,
+            include_advanced=True,
+            include_long_sessions=True,
+        )
+        generator.generate_alpha_sensitivity_data()
+        print("Experiment data generated successfully!")
 
 
 if __name__ == "__main__":

@@ -40,6 +40,8 @@ class ReferenceScope(str, Enum):
     CURRENT_SESSION = "current_session"  # 当前会话
     LAST_SHARED_TOPIC = "last_shared_topic"  # 上一个共享主题
     ASSISTANT_LAST_STANCE = "assistant_last_stance"  # 助手最后立场
+    FIRST_OCCURRENCE_SESSION = "first_occurrence_session"  # v6.3: 首次出现 (全会话范围, 从头搜索)
+    FIRST_TOPIC_GENESIS = "first_topic_genesis"  # v6.3: 主题起源 (语义成立点定位)
     CUSTOM = "custom"  # 自定义范围
 
 
@@ -95,6 +97,19 @@ class ReferenceResolverConfig:
         "你之前提到": {"scope": "assistant_last_stance", "type": "stance"},
         "上次": {"scope": "last_5_10_turns", "type": "temporal"},
         "前几天": {"scope": "last_5_10_turns", "type": "temporal"},
+        # v6.3: 首次/起始类指代 → 当前会话全范围 (无主题限定)
+        "第一次": {"scope": "first_occurrence_session", "type": "temporal"},
+        "首次": {"scope": "first_occurrence_session", "type": "temporal"},
+        "开始": {"scope": "first_occurrence_session", "type": "temporal"},
+        # v6.3: 主题起源指代 → 语义成立点定位 (带主题暗示)
+        "怎么聊起": {"scope": "first_topic_genesis", "type": "referential"},
+        "怎么说起": {"scope": "first_topic_genesis", "type": "referential"},
+        "最早提到": {"scope": "first_topic_genesis", "type": "referential"},
+        "什么时候开始说": {"scope": "first_topic_genesis", "type": "temporal"},
+        "聊起": {"scope": "current_session", "type": "referential"},
+        "说起": {"scope": "current_session", "type": "referential"},
+        # v6.3: "最后" → 最近 1-3 轮 (指最近一次提及)
+        "最后": {"scope": "last_1_3_turns", "type": "temporal"},
     })
     
     # 指代关键词映射 (英文)
@@ -109,7 +124,44 @@ class ReferenceResolverConfig:
         "you mentioned": {"scope": "assistant_last_stance", "type": "stance"},
         "last time": {"scope": "last_5_10_turns", "type": "temporal"},
         "earlier": {"scope": "last_5_10_turns", "type": "temporal"},
+        # v6.3: first-occurrence references → full session scope (no topic filter)
+        "first time": {"scope": "first_occurrence_session", "type": "temporal"},
+        "at the beginning": {"scope": "first_occurrence_session", "type": "temporal"},
+        "when we started": {"scope": "first_occurrence_session", "type": "temporal"},
+        # v6.3: topic genesis references → semantic commitment point (topic-seeking)
+        "how did we start talking about": {"scope": "first_topic_genesis", "type": "referential"},
+        "when did we first discuss": {"scope": "first_topic_genesis", "type": "referential"},
+        "when was the first mention of": {"scope": "first_topic_genesis", "type": "referential"},
+        "when we talked about": {"scope": "first_topic_genesis", "type": "referential"},
+        "when you first mentioned": {"scope": "first_topic_genesis", "type": "referential"},
+        # v6.3: "last" / "finally" → most recent 1-3 turns
+        "at last": {"scope": "last_1_3_turns", "type": "temporal"},
+        "in the end": {"scope": "last_1_3_turns", "type": "temporal"},
     })
+    
+    # v6.3: Topic Genesis 判定配置
+    # 三层递进判定: Level 1 (命名+定义, 强) → Level 2 (概念收敛, 中) → Level 3 (角色切换, 弱)
+    genesis_context_window: int = 1  # Genesis 命中后, 前后各取 N 条作为叙事上下文
+    genesis_confidence_levels: Dict[str, float] = field(default_factory=lambda: {
+        "naming_definition": 1.0,      # Level 1: 命名+定义 (强, e.g. "DKI 是 Dynamic K/V Injection")
+        "concept_convergence": 0.75,   # Level 2: 概念收敛 (中, e.g. 从类比过渡到实体)
+        "role_shift": 0.5,             # Level 3: 讨论角色切换 (弱, 从背景→前台)
+    })
+    # Level 1 判定模式: 命名+定义 (正则)
+    genesis_naming_patterns: List[str] = field(default_factory=lambda: [
+        r"(.+?)(?:是|叫做|叫|称为|全称是|的全称|stands?\s+for|means?)\s*(.+)",
+        r"(?:我把|我将|我们把|我们将)(?:它|这个|这套|这个系统)(?:叫做?|称为|命名为)\s*(.+)",
+    ])
+    # Level 2 判定模式: 概念收敛 (从类比/联想 → 实体)
+    genesis_convergence_markers: List[str] = field(default_factory=lambda: [
+        "想起了", "想到了", "联想到", "说到", "提到",
+        "reminds me of", "made me think of", "speaking of",
+    ])
+    # Level 3 判定模式: 角色切换 (从背景→前台)
+    genesis_role_shift_markers: List[str] = field(default_factory=lambda: [
+        "你知道为什么", "为什么", "怎么实现", "能不能",
+        "how does", "why does", "can you explain", "what about",
+    ])
     
     # 是否启用 LLM 辅助解析
     use_llm_fallback: bool = False
@@ -125,12 +177,19 @@ class ReferenceResolverConfig:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ReferenceResolverConfig":
         """从字典创建配置"""
+        defaults = cls()
         return cls(
             last_few_turns=data.get('last_few_turns', 3),
             recent_turns=data.get('recent_turns', 10),
             session_max_turns=data.get('session_max_turns', 50),
-            reference_mappings_cn=data.get('reference_mappings_cn', cls().reference_mappings_cn),
-            reference_mappings_en=data.get('reference_mappings_en', cls().reference_mappings_en),
+            reference_mappings_cn=data.get('reference_mappings_cn', defaults.reference_mappings_cn),
+            reference_mappings_en=data.get('reference_mappings_en', defaults.reference_mappings_en),
+            # v6.3: Topic Genesis 配置
+            genesis_context_window=data.get('genesis_context_window', 1),
+            genesis_confidence_levels=data.get('genesis_confidence_levels', defaults.genesis_confidence_levels),
+            genesis_naming_patterns=data.get('genesis_naming_patterns', defaults.genesis_naming_patterns),
+            genesis_convergence_markers=data.get('genesis_convergence_markers', defaults.genesis_convergence_markers),
+            genesis_role_shift_markers=data.get('genesis_role_shift_markers', defaults.genesis_role_shift_markers),
             use_llm_fallback=data.get('use_llm_fallback', False),
             llm_fallback_threshold=data.get('llm_fallback_threshold', 0.5),
         )
@@ -143,6 +202,11 @@ class ReferenceResolverConfig:
             'session_max_turns': self.session_max_turns,
             'reference_mappings_cn': self.reference_mappings_cn,
             'reference_mappings_en': self.reference_mappings_en,
+            'genesis_context_window': self.genesis_context_window,
+            'genesis_confidence_levels': self.genesis_confidence_levels,
+            'genesis_naming_patterns': self.genesis_naming_patterns,
+            'genesis_convergence_markers': self.genesis_convergence_markers,
+            'genesis_role_shift_markers': self.genesis_role_shift_markers,
             'use_llm_fallback': self.use_llm_fallback,
             'llm_fallback_threshold': self.llm_fallback_threshold,
         }
@@ -263,24 +327,31 @@ class ReferenceResolver:
                 # 如果有历史，根据范围提取内容
                 resolved_content = None
                 source_turns = []
+                extra_metadata = {}
+                confidence = 1.0
                 if history:
-                    resolved_content, source_turns = self._resolve_by_scope(
+                    resolved_content, source_turns, extra_metadata = self._resolve_by_scope(
                         scope=scope,
                         ref_type=ref_type,
                         history=history,
+                        query=query,
                         stance_cache=stance_cache,
                     )
+                    # Genesis 判定可能降低 confidence
+                    if 'genesis_confidence' in extra_metadata:
+                        confidence = extra_metadata['genesis_confidence']
                 
                 return ResolvedReference(
                     reference_type=ref_type,
                     scope=scope,
                     resolved_content=resolved_content,
-                    confidence=1.0,
+                    confidence=confidence,
                     source_turns=source_turns,
                     matched_keyword=keyword,
                     metadata={
                         'language': lang,
                         'recall_turns': recall_turns,
+                        **extra_metadata,
                     },
                 )
         
@@ -305,6 +376,12 @@ class ReferenceResolver:
             return self.config.last_few_turns * 2  # 主题上下文
         elif scope == ReferenceScope.ASSISTANT_LAST_STANCE:
             return self.config.recent_turns
+        elif scope == ReferenceScope.FIRST_OCCURRENCE_SESSION:
+            # v6.3: 首次出现需要全会话范围 (从头搜索)
+            return self.config.session_max_turns
+        elif scope == ReferenceScope.FIRST_TOPIC_GENESIS:
+            # v6.3: 主题起源需要全会话范围 (从头扫描找语义成立点)
+            return self.config.session_max_turns
         return self.config.recent_turns  # 默认
     
     def _resolve_by_scope(
@@ -312,16 +389,18 @@ class ReferenceResolver:
         scope: ReferenceScope,
         ref_type: ReferenceType,
         history: List[Message],
+        query: str = "",
         stance_cache: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[Optional[str], List[int]]:
+    ) -> Tuple[Optional[str], List[int], Dict[str, Any]]:
         """
         根据范围解析内容
         
         Returns:
-            (resolved_content, source_turns)
+            (resolved_content, source_turns, extra_metadata)
+            extra_metadata: 额外元数据 (如 genesis_level, genesis_confidence)
         """
         if not history:
-            return None, []
+            return None, [], {}
         
         if scope == ReferenceScope.LAST_1_3_TURNS:
             # 最近 N 轮 (可配置)
@@ -329,7 +408,7 @@ class ReferenceResolver:
             recent = history[-n*2:] if len(history) >= n*2 else history
             content = self._format_messages(recent)
             turns = list(range(max(0, len(history) - n*2), len(history)))
-            return content, turns
+            return content, turns, {}
         
         elif scope == ReferenceScope.LAST_5_10_TURNS:
             # 最近 5-10 轮
@@ -337,7 +416,7 @@ class ReferenceResolver:
             recent = history[-n*2:] if len(history) >= n*2 else history
             content = self._format_messages(recent)
             turns = list(range(max(0, len(history) - n*2), len(history)))
-            return content, turns
+            return content, turns, {}
         
         elif scope == ReferenceScope.CURRENT_SESSION:
             # 当前会话 (最多 session_max_turns)
@@ -345,17 +424,28 @@ class ReferenceResolver:
             recent = history[-max_turns*2:] if len(history) >= max_turns*2 else history
             content = self._format_messages(recent)
             turns = list(range(max(0, len(history) - max_turns*2), len(history)))
-            return content, turns
+            return content, turns, {}
         
         elif scope == ReferenceScope.LAST_SHARED_TOPIC:
             # 上一个共享主题
-            return self._find_last_topic(history)
+            content, turns = self._find_last_topic(history)
+            return content, turns, {}
         
         elif scope == ReferenceScope.ASSISTANT_LAST_STANCE:
             # 助手最后立场
-            return self._find_assistant_stance(history, stance_cache)
+            content, turns = self._find_assistant_stance(history, stance_cache)
+            return content, turns, {}
         
-        return None, []
+        elif scope == ReferenceScope.FIRST_OCCURRENCE_SESSION:
+            # v6.3: 首次出现 — 从会话开头搜索 (无主题过滤)
+            content, turns = self._find_first_occurrence(history)
+            return content, turns, {}
+        
+        elif scope == ReferenceScope.FIRST_TOPIC_GENESIS:
+            # v6.3: 主题起源 — 语义成立点定位 (带主题过滤)
+            return self._find_topic_genesis(query, history)
+        
+        return None, [], {}
     
     def _format_messages(self, messages: List[Message]) -> str:
         """格式化消息列表"""
@@ -388,6 +478,238 @@ class ReferenceResolver:
         n = self.config.last_few_turns
         recent = history[-n*2:] if len(history) >= n*2 else history
         return self._format_messages(recent), list(range(max(0, len(history) - n*2), len(history)))
+    
+    def _find_first_occurrence(
+        self,
+        history: List[Message],
+    ) -> Tuple[Optional[str], List[int]]:
+        """
+        v6.3: 查找会话中的首次出现
+        
+        用于处理 "第一次"、"首次"、"开始" 等**不带主题限定**的指代。
+        从会话开头开始搜索，返回最早的几条消息作为上下文。
+        
+        语义: 用户想知道会话一开始说了什么 (无主题过滤)。
+        
+        Returns:
+            (resolved_content, source_turns)
+        """
+        if not history:
+            return None, []
+        
+        # 从会话开头取前 N 条消息 (N = last_few_turns * 2, 即 user+assistant 对)
+        n = self.config.last_few_turns
+        first_messages = history[:n * 2] if len(history) >= n * 2 else history
+        content = self._format_messages(first_messages)
+        turns = list(range(len(first_messages)))
+        return content, turns
+    
+    def _find_topic_genesis(
+        self,
+        query: str,
+        history: List[Message],
+    ) -> Tuple[Optional[str], List[int], Dict[str, Any]]:
+        """
+        v6.3: 主题起源定位 (Topic Genesis)
+        
+        与 _find_first_occurrence 的区别:
+        - first_occurrence: 取会话开头 N 条 (无主题过滤)
+        - topic_genesis: 扫描全会话, 找主题 T 首次被当作讨论对象的那一轮
+        
+        三层递进判定 (只读, 不写入, 不画像):
+        - Level 1 (confidence=1.0):  命名+定义 — "DKI 是 Dynamic K/V Injection"
+        - Level 2 (confidence=0.75): 概念收敛 — 从类比/联想过渡到实体讨论
+        - Level 3 (confidence=0.5):  角色切换 — 从背景提及变成正式讨论对象
+        
+        如果三层都未命中, 降级到 _find_first_occurrence。
+        
+        Args:
+            query: 用户查询 (用于提取主题实体)
+            history: 完整会话历史
+            
+        Returns:
+            (resolved_content, source_turns, genesis_metadata)
+            genesis_metadata 包含: genesis_level, genesis_confidence, topic_entity
+        """
+        if not history:
+            return None, [], {}
+        
+        # ============ Phase 0: 从查询中提取主题实体 ============
+        topic_entity = self._extract_topic_from_query(query)
+        
+        if not topic_entity:
+            # 无法提取主题 → 降级到 first_occurrence
+            logger.debug("Topic genesis: no topic entity extracted, falling back to first_occurrence")
+            content, turns = self._find_first_occurrence(history)
+            return content, turns, {
+                "genesis_level": "fallback",
+                "genesis_confidence": 0.3,
+                "topic_entity": None,
+            }
+        
+        logger.debug(f"Topic genesis: searching for entity '{topic_entity}'")
+        
+        ctx_window = self.config.genesis_context_window
+        confidence_levels = self.config.genesis_confidence_levels
+        
+        # ============ Phase 1: 从头扫描, 三层判定 ============
+        for i, msg in enumerate(history):
+            content_lower = msg.content.lower()
+            topic_lower = topic_entity.lower()
+            
+            # 主题实体必须出现在该消息中
+            if topic_lower not in content_lower:
+                continue
+            
+            # --- Level 1: 命名+定义 (强) ---
+            for pattern in self.config.genesis_naming_patterns:
+                match = re.search(pattern, msg.content, re.IGNORECASE)
+                if match and topic_lower in match.group(0).lower():
+                    return self._build_genesis_result(
+                        history, i, ctx_window,
+                        level="naming_definition",
+                        confidence=confidence_levels.get("naming_definition", 1.0),
+                        topic_entity=topic_entity,
+                    )
+            
+            # --- Level 2: 概念收敛 (中) ---
+            # 同一条消息中同时出现收敛标记和主题实体
+            for marker in self.config.genesis_convergence_markers:
+                if marker in content_lower:
+                    return self._build_genesis_result(
+                        history, i, ctx_window,
+                        level="concept_convergence",
+                        confidence=confidence_levels.get("concept_convergence", 0.75),
+                        topic_entity=topic_entity,
+                    )
+            
+            # --- Level 3: 角色切换 (弱) ---
+            # 主题出现后, 下一条消息(或本条)出现深入讨论标记
+            next_msg = history[i + 1] if i + 1 < len(history) else None
+            check_msgs = [msg]
+            if next_msg:
+                check_msgs.append(next_msg)
+            
+            for check_msg in check_msgs:
+                for marker in self.config.genesis_role_shift_markers:
+                    if marker in check_msg.content.lower():
+                        return self._build_genesis_result(
+                            history, i, ctx_window,
+                            level="role_shift",
+                            confidence=confidence_levels.get("role_shift", 0.5),
+                            topic_entity=topic_entity,
+                        )
+        
+        # ============ Phase 2: 三层都未命中 → 找第一次出现主题实体的位置 ============
+        for i, msg in enumerate(history):
+            if topic_entity.lower() in msg.content.lower():
+                return self._build_genesis_result(
+                    history, i, ctx_window,
+                    level="keyword_only",
+                    confidence=0.4,
+                    topic_entity=topic_entity,
+                )
+        
+        # ============ Phase 3: 主题实体在历史中完全不存在 → 降级 ============
+        logger.debug(f"Topic genesis: entity '{topic_entity}' not found in history, falling back")
+        content, turns = self._find_first_occurrence(history)
+        return content, turns, {
+            "genesis_level": "fallback",
+            "genesis_confidence": 0.3,
+            "topic_entity": topic_entity,
+        }
+    
+    def _extract_topic_from_query(self, query: str) -> Optional[str]:
+        """
+        从查询中提取主题实体
+        
+        策略: 去除已知的指代关键词, 提取剩余的核心名词/实体。
+        这是一个轻量级规则提取, 不依赖 NER 或 LLM。
+        
+        Examples:
+            "我们怎么聊起 DKI 的？" → "DKI"
+            "最早提到机器学习是什么时候？" → "机器学习"
+            "how did we start talking about DKI?" → "DKI"
+        """
+        # 收集所有指代关键词 (用于剥离)
+        all_keywords = set()
+        for keyword in self.config.reference_mappings_cn:
+            all_keywords.add(keyword)
+        for keyword in self.config.reference_mappings_en:
+            all_keywords.add(keyword)
+        
+        # 额外的停用词/语气词
+        stopwords_cn = {"的", "了", "吗", "呢", "吧", "啊", "是", "在", "我们", "你", "我", 
+                        "什么时候", "什么", "怎么", "哪里", "为什么", "这个", "那个"}
+        stopwords_en = {"the", "a", "an", "is", "was", "were", "are", "we", "you", "i",
+                        "about", "of", "did", "do", "how", "when", "where", "what", "why",
+                        "first", "start", "talking", "discuss", "mention", "talked"}
+        
+        text = query.strip()
+        
+        # 去除指代关键词 (按长度降序, 避免短词误删长词的一部分)
+        sorted_keywords = sorted(all_keywords, key=len, reverse=True)
+        for kw in sorted_keywords:
+            text = text.replace(kw, " ")
+        
+        # 去除标点
+        text = re.sub(r'[？?！!。.，,、；;：:""''「」【】()（）]', ' ', text)
+        
+        # 检测语言
+        lang = self._detect_language(query)
+        
+        if lang == 'cn':
+            # 中文: 去除停用词后, 取最长的连续非空白片段
+            for sw in sorted(stopwords_cn, key=len, reverse=True):
+                text = text.replace(sw, " ")
+            parts = [p.strip() for p in text.split() if p.strip()]
+            if parts:
+                # 取最长的片段作为主题实体
+                return max(parts, key=len)
+        else:
+            # 英文: 去除停用词后, 取剩余词组
+            words = text.split()
+            filtered = [w for w in words if w.lower() not in stopwords_en and len(w) > 1]
+            if filtered:
+                return " ".join(filtered).strip()
+        
+        return None
+    
+    def _build_genesis_result(
+        self,
+        history: List[Message],
+        genesis_index: int,
+        ctx_window: int,
+        level: str,
+        confidence: float,
+        topic_entity: str,
+    ) -> Tuple[str, List[int], Dict[str, Any]]:
+        """
+        构建 Genesis 结果: 命中轮 + 前后 ctx_window 条上下文
+        
+        返回的不是单条消息, 而是 [genesis_index - ctx_window, genesis_index + ctx_window] 
+        范围内的消息, 保证叙事完整性。
+        """
+        start = max(0, genesis_index - ctx_window)
+        end = min(len(history), genesis_index + ctx_window + 1)
+        context_msgs = history[start:end]
+        
+        content = self._format_messages(context_msgs)
+        turns = list(range(start, end))
+        
+        logger.info(
+            f"Topic genesis found: level={level}, confidence={confidence:.2f}, "
+            f"entity='{topic_entity}', turn={genesis_index}"
+        )
+        
+        metadata = {
+            "genesis_level": level,
+            "genesis_confidence": confidence,
+            "genesis_turn_index": genesis_index,
+            "topic_entity": topic_entity,
+        }
+        
+        return content, turns, metadata
     
     def _find_assistant_stance(
         self,
