@@ -510,6 +510,10 @@
             <span>Total Characters: {{ (fullRawPrompt || '').length }}</span>
             <span>Mode: {{ latestData?.mode || 'dki' }}</span>
             <span v-if="latestData?.session_id">Session: {{ latestData.session_id }}</span>
+            <el-tag type="success" size="small" v-if="fullRawPrompt && fullRawPrompt.length > 0 && !fullRawPrompt.endsWith('...')">Complete</el-tag>
+            <el-tag type="warning" size="small" v-if="hasSummaryCompression">
+              {{ latestData?.recall_summary_count || 0 }} messages compressed
+            </el-tag>
           </div>
         </div>
       </section>
@@ -1109,11 +1113,17 @@ const rawPromptExpanded = ref(false)
 
 const fullRawPrompt = computed(() => {
   if (!latestData.value) return ''
-  // Priority: final_input > final_input_preview > original_query
+  // v6.2: Priority: final_input (完整, 不截断) > final_input_preview > original_query
   return latestData.value.final_input
     || latestData.value.final_input_preview
     || latestData.value.original_query
     || ''
+})
+
+// v6.2: 是否有 recall v4 的 summary 压缩
+const hasSummaryCompression = computed(() => {
+  if (!latestData.value) return false
+  return (latestData.value.recall_summary_count || 0) > 0
 })
 
 /**
