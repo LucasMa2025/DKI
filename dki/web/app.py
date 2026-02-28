@@ -62,7 +62,7 @@ class ChatRequest(BaseModel):
     session_id: Optional[str] = None
     mode: str = "auto"  # auto, dki, rag, baseline (v6.0: 默认 auto, 由路由器决策)
     force_alpha: Optional[float] = None
-    max_new_tokens: int = 1024  # v5.1: 从 256 提升到 1024, 防止中文/thinking 模型输出截断
+    max_new_tokens: int = 2048  # v5.1: 从 256 提升到 2048, 防止中文/thinking 模型输出截断
     temperature: float = 0.7
     # User isolation: identify user via token or user_id
     token: Optional[str] = None     # Bearer token (priority, resolves user_id from auth system)
@@ -1104,7 +1104,7 @@ def create_app() -> FastAPI:
         """LongMemEval 实验请求"""
         modes: List[str] = ["dki", "rag", "baseline"]
         max_samples: int = 10
-        max_new_tokens: int = 256
+        max_new_tokens: int = 2048  # v6.4: 从 256 提升到 2048, 防止中文/thinking 模型输出截断
         force_alpha: float = 0.4
     
     @app.post("/api/experiment/run-longmem-multi-turn")
@@ -1689,6 +1689,8 @@ def get_index_html() -> str:
                 <button class="experiment-btn" onclick="generateData()">📊 Generate Test Data</button>
                 <button class="experiment-btn" onclick="runExperiment()">🧪 Run Comparison</button>
                 <button class="experiment-btn" onclick="runPersonaChatExperiment()">🗣️ PersonaChat (Short+Long)</button>
+                <button class="experiment-btn" onclick="runLongMemEvalMultiTurn()">🧠 LongMemEval (Multi-Turn)</button>
+                <button class="experiment-btn" onclick="runLongMemEvalNeedle()">🔍 LongMemEval (Needle)</button>
                 <button class="experiment-btn" onclick="viewExperimentRecords()">📋 View Experiment Records</button>
                 
                 <div class="panel-title" style="margin-top: 20px;">Session</div>
@@ -1898,7 +1900,7 @@ def get_index_html() -> str:
                     query: query,
                     session_id: sessionId,
                     mode: currentMode,
-                    max_new_tokens: 1024,
+                    max_new_tokens: 2048,
                     temperature: 0.7,
                     token: authToken,
                     user_id: currentUserId
@@ -2034,6 +2036,65 @@ def get_index_html() -> str:
         async function runAlphaSensitivity() {
             alert('Running α sensitivity analysis...');
             alert('Feature coming soon!');
+        }
+        
+        // ============ LongMemEval Experiments ============
+        async function runLongMemEvalMultiTurn() {
+            if (!confirm('Run LongMemEval Multi-Turn experiment?\\nThis tests memory recall across long conversations.\\nEstimated time: ~20 min for 10 samples.')) return;
+            alert('Running LongMemEval Multi-Turn... Check console for progress.');
+            try {
+                const response = await fetch('/api/experiment/run-longmem-multi-turn', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        modes: ['dki', 'rag', 'baseline'],
+                        max_samples: 10,
+                        max_new_tokens: 2048,
+                        force_alpha: 0.4
+                    })
+                });
+                const data = await response.json();
+                if (data.status === 'success') {
+                    let msg = 'LongMemEval Multi-Turn completed!\\n\\n';
+                    for (const [key, val] of Object.entries(data.summary || {})) {
+                        msg += key + ': ' + JSON.stringify(val, null, 2).substring(0, 200) + '\\n';
+                    }
+                    alert(msg);
+                } else {
+                    alert('Experiment failed: ' + JSON.stringify(data));
+                }
+            } catch (error) {
+                alert('Error: ' + error.message);
+            }
+        }
+        
+        async function runLongMemEvalNeedle() {
+            if (!confirm('Run LongMemEval Needle-in-Haystack experiment?\\nThis is the hardest test with evidence buried in many filler sessions.\\nEstimated time: ~40 min for 10 samples.')) return;
+            alert('Running LongMemEval Needle... Check console for progress.');
+            try {
+                const response = await fetch('/api/experiment/run-longmem-needle', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        modes: ['dki', 'rag', 'baseline'],
+                        max_samples: 10,
+                        max_new_tokens: 2048,
+                        force_alpha: 0.4
+                    })
+                });
+                const data = await response.json();
+                if (data.status === 'success') {
+                    let msg = 'LongMemEval Needle completed!\\n\\n';
+                    for (const [key, val] of Object.entries(data.summary || {})) {
+                        msg += key + ': ' + JSON.stringify(val, null, 2).substring(0, 200) + '\\n';
+                    }
+                    alert(msg);
+                } else {
+                    alert('Experiment failed: ' + JSON.stringify(data));
+                }
+            } catch (error) {
+                alert('Error: ' + error.message);
+            }
         }
         
         // ============ PersonaChat Experiment ============
