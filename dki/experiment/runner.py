@@ -45,7 +45,7 @@ class ExperimentConfig:
     modes: List[str] = field(default_factory=lambda: ["rag", "dki", "baseline"])
     datasets: List[str] = field(default_factory=lambda: ["persona_chat", "memory_qa"])
     max_samples: int = 100
-    max_new_tokens: int = 256
+    max_new_tokens: int = 2048  # v6.4: 从 256 提升到 2048, 防止 thinking 模型输出截断
     temperature: float = 0.7
     alpha_values: List[float] = field(default_factory=lambda: [0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
     # force_alpha for DKI mode (v3.2): ensures injection actually fires
@@ -1777,7 +1777,7 @@ class ExperimentRunner:
                     else:  # baseline / vanilla
                         output = self.dki_system.model.generate(
                             prompt=query,
-                            max_new_tokens=256,
+                            max_new_tokens=2048,  # v6.4: 从 256 提升
                             temperature=0.7,
                         )
                         response_text = output.text
@@ -1879,7 +1879,7 @@ class ExperimentRunner:
         modes: Optional[List[str]] = None,
         longmemeval_modes: Optional[List[str]] = None,
         max_samples: int = 50,
-        max_new_tokens: int = 256,
+        max_new_tokens: int = 2048,  # v6.4: 从 256 提升到 2048, 防止 thinking 模型输出截断
         force_alpha: float = 0.4,
         setup_users: bool = True,
         auto_generate: bool = True,
@@ -2013,7 +2013,7 @@ class ExperimentRunner:
         self,
         mode: str,
         samples: List[Dict[str, Any]],
-        max_new_tokens: int = 256,
+        max_new_tokens: int = 2048,  # v6.4: 从 256 提升到 2048
         force_alpha: float = 0.4,
     ) -> Dict[str, Any]:
         """
@@ -2373,7 +2373,7 @@ class ExperimentRunner:
                                 session_id=session_id,
                                 user_id=user_id,
                                 force_alpha=0.5,
-                                max_new_tokens=256,
+                                max_new_tokens=1024,  # v6.4: 从 256 提升, 防止 thinking 模型截断
                             )
                             response_text = response.text
                             latency = response.latency_ms
@@ -2382,7 +2382,7 @@ class ExperimentRunner:
                                 query=query,
                                 session_id=session_id,
                                 user_id=user_id,
-                                max_new_tokens=256,
+                                max_new_tokens=1024,  # v6.4: 从 256 提升
                             )
                             response_text = response.text
                             latency = response.latency_ms
