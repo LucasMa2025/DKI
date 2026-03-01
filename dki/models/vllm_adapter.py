@@ -173,19 +173,20 @@ class VLLMAdapter(BaseModelAdapter):
                 enable_prefix_caching=True,  # 核心: 自动复用相同前缀的 KV Cache
             )
             
-            # 默认采样参数
-            self.sampling_params = SamplingParams(
-                temperature=0.7,
-                top_p=0.9,
-                max_tokens=512,
-            )
-            
-            # 加载 Tokenizer
+            # 加载 Tokenizer (先于 SamplingParams, 用于获取 stop tokens)
             self.tokenizer = AutoTokenizer.from_pretrained(
                 self.model_name,
                 trust_remote_code=self.trust_remote_code,
                 padding_side="left",
                 truncation_side="left",
+            )
+            
+            # 默认采样参数 (包含 stop tokens, 防止生成越过 <|im_end|> 后退化)
+            self.sampling_params = SamplingParams(
+                temperature=0.7,
+                top_p=0.9,
+                max_tokens=512,
+                stop=self._get_stop_strings(),
             )
             if self.tokenizer.pad_token is None:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -278,6 +279,46 @@ class VLLMAdapter(BaseModelAdapter):
         name_lower = self.model_name.lower()
         return any(kw in name_lower for kw in ('chat', 'instruct'))
     
+    def _get_stop_strings(self) -> list:
+        """
+        获取模型的 stop strings (防止生成越过 turn 边界后退化)
+        
+        v5.8 修复: 之前 SamplingParams 未设置 stop tokens, 导致模型在生成
+        <|im_end|> 后继续输出, 产生大量 <|im_start|>/<|im_end|> 垃圾 token。
+        
+        不同模型的 stop strings:
+        - DeepSeek/Qwen (ChatML): <|im_end|>
+        - Llama 3.x: <|eot_id|>
+        - Llama 2: </s>
+        - 通用: 使用 tokenizer.eos_token
+        
+        Returns:
+            stop strings 列表
+        """
+        stop_strings = []
+        
+        # ChatML 模型 (DeepSeek, Qwen): <|im_end|> 是 turn 结束标记
+        name_lower = self.model_name.lower()
+        if any(kw in name_lower for kw in ('deepseek', 'qwen')):
+            stop_strings.append("<|im_end|>")
+        
+        # Llama 3.x: <|eot_id|> 是 turn 结束标记
+        if 'llama' in name_lower and '3' in name_lower:
+            stop_strings.append("<|eot_id|>")
+        
+        # 通用: 从 tokenizer 获取 eos_token
+        if self.tokenizer:
+            eos = getattr(self.tokenizer, 'eos_token', None)
+            if eos and eos not in stop_strings:
+                stop_strings.append(eos)
+        
+        # 兜底: 至少包含 ChatML 的 <|im_end|> (大多数 vLLM 模型使用 ChatML)
+        if not stop_strings:
+            stop_strings.append("<|im_end|>")
+        
+        logger.debug(f"Stop strings for {self.model_name}: {stop_strings}")
+        return stop_strings
+    
     # ================================================================
     # 核心推理接口
     # ================================================================
@@ -317,6 +358,7 @@ class VLLMAdapter(BaseModelAdapter):
             temperature=temperature,
             top_p=top_p,
             max_tokens=max_new_tokens,
+            stop=self._get_stop_strings(),
         )
         
         outputs = self.llm.generate([formatted_prompt], sampling_params)
@@ -384,6 +426,7 @@ class VLLMAdapter(BaseModelAdapter):
             temperature=kwargs.get('temperature', 0.7),
             top_p=kwargs.get('top_p', 0.9),
             max_tokens=max_new_tokens,
+            stop=self._get_stop_strings(),
         )
         
         # prompt 已包含偏好前缀, 直接调用 vLLM generate

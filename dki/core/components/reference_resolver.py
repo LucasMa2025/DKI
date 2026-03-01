@@ -110,6 +110,18 @@ class ReferenceResolverConfig:
         "说起": {"scope": "current_session", "type": "referential"},
         # v6.3: "最后" → 最近 1-3 轮 (指最近一次提及)
         "最后": {"scope": "last_1_3_turns", "type": "temporal"},
+        # v6.4: 纠正/否定指代 → 助手最后立场 (用户否定或要求重新思考)
+        "不是的": {"scope": "assistant_last_stance", "type": "stance"},
+        "不对": {"scope": "assistant_last_stance", "type": "stance"},
+        "你说错了": {"scope": "assistant_last_stance", "type": "stance"},
+        "再想想": {"scope": "assistant_last_stance", "type": "stance"},
+        "重新想": {"scope": "assistant_last_stance", "type": "stance"},
+        "你搞错了": {"scope": "assistant_last_stance", "type": "stance"},
+        "不是这样": {"scope": "assistant_last_stance", "type": "stance"},
+        "你理解错了": {"scope": "assistant_last_stance", "type": "stance"},
+        "想错了": {"scope": "assistant_last_stance", "type": "stance"},
+        "答错了": {"scope": "assistant_last_stance", "type": "stance"},
+        "错了": {"scope": "assistant_last_stance", "type": "stance"},
     })
     
     # 指代关键词映射 (英文)
@@ -137,6 +149,17 @@ class ReferenceResolverConfig:
         # v6.3: "last" / "finally" → most recent 1-3 turns
         "at last": {"scope": "last_1_3_turns", "type": "temporal"},
         "in the end": {"scope": "last_1_3_turns", "type": "temporal"},
+        # v6.4: correction/negation references → assistant's last stance
+        "that's wrong": {"scope": "assistant_last_stance", "type": "stance"},
+        "that's not right": {"scope": "assistant_last_stance", "type": "stance"},
+        "you're wrong": {"scope": "assistant_last_stance", "type": "stance"},
+        "think again": {"scope": "assistant_last_stance", "type": "stance"},
+        "try again": {"scope": "assistant_last_stance", "type": "stance"},
+        "not correct": {"scope": "assistant_last_stance", "type": "stance"},
+        "that's incorrect": {"scope": "assistant_last_stance", "type": "stance"},
+        "no, that's not": {"scope": "assistant_last_stance", "type": "stance"},
+        "you got it wrong": {"scope": "assistant_last_stance", "type": "stance"},
+        "reconsider": {"scope": "assistant_last_stance", "type": "stance"},
     })
     
     # v6.3: Topic Genesis 判定配置
@@ -433,8 +456,13 @@ class ReferenceResolver:
         
         elif scope == ReferenceScope.ASSISTANT_LAST_STANCE:
             # 助手最后立场
-            content, turns = self._find_assistant_stance(history, stance_cache)
-            return content, turns, {}
+            # v6.4: 检测是否为纠正/否定场景
+            is_correction = self._is_correction_query(query)
+            content, turns = self._find_assistant_stance(
+                history, stance_cache, is_correction=is_correction,
+            )
+            extra = {"is_correction": is_correction} if is_correction else {}
+            return content, turns, extra
         
         elif scope == ReferenceScope.FIRST_OCCURRENCE_SESSION:
             # v6.3: 首次出现 — 从会话开头搜索 (无主题过滤)
@@ -711,15 +739,53 @@ class ReferenceResolver:
         
         return content, turns, metadata
     
+    # v6.4: 纠正/否定关键词集合
+    _CORRECTION_KEYWORDS_CN = {
+        "不是的", "不对", "你说错了", "再想想", "重新想", "你搞错了",
+        "不是这样", "你理解错了", "想错了", "答错了", "错了",
+    }
+    _CORRECTION_KEYWORDS_EN = {
+        "that's wrong", "that's not right", "you're wrong", "think again",
+        "try again", "not correct", "that's incorrect", "no, that's not",
+        "you got it wrong", "reconsider",
+    }
+    
+    def _is_correction_query(self, query: str) -> bool:
+        """
+        v6.4: 检测查询是否为纠正/否定类型
+        
+        用于区分:
+        - 纠正场景: "不是的,你再想想" → 直接返回助手最近回复
+        - 立场查询: "之前你说的那个观点" → 搜索助手的观点表达
+        """
+        query_lower = query.lower()
+        for kw in self._CORRECTION_KEYWORDS_CN:
+            if kw in query_lower:
+                return True
+        for kw in self._CORRECTION_KEYWORDS_EN:
+            if kw in query_lower:
+                return True
+        return False
+    
     def _find_assistant_stance(
         self,
         history: List[Message],
         stance_cache: Optional[Dict[str, Any]] = None,
+        is_correction: bool = False,
     ) -> Tuple[Optional[str], List[int]]:
         """
         查找助手的历史立场
         
-        优先使用 stance_cache，否则从历史中提取
+        优先使用 stance_cache，否则从历史中提取。
+        
+        v6.4: 当 is_correction=True 时 (纠正/否定场景),
+        直接返回助手最近一条回复及其上下文 (前一条用户消息),
+        因为用户否定的就是助手最近的回答。
+        
+        Args:
+            history: 历史消息列表
+            stance_cache: 立场缓存 (可选)
+            is_correction: 是否为纠正/否定场景
         """
         # 优先使用 stance_cache
         if stance_cache:
@@ -731,6 +797,16 @@ class ReferenceResolver:
             
             if latest_stance:
                 return f"关于「{latest_stance.get('topic', '未知')}」: {latest_stance.get('stance', '')}", []
+        
+        # v6.4: 纠正/否定场景 → 直接返回助手最近一条回复 + 上下文
+        if is_correction:
+            for i in range(len(history) - 1, -1, -1):
+                if history[i].role == "assistant":
+                    # 包含该回复及其前一条用户消息 (如果存在)
+                    start = max(0, i - 1)
+                    context = history[start:i + 1]
+                    return self._format_messages(context), list(range(start, i + 1))
+            return None, []
         
         # 从历史中查找助手的观点表达
         for i in range(len(history) - 1, -1, -1):

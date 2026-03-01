@@ -238,6 +238,9 @@ class InjectionPlan:
     # ============ P0-1: 记忆元数据 ============
     memory_metadata: str = ""             # 记忆元数据提示块文本
     
+    # ============ v6.5: 模糊指代澄清 ============
+    clarification_instruction: str = ""    # 澄清指令 (由 Plugin.chat 填充)
+    
     # ============ 安全 ============
     safety_violations: List[str] = field(default_factory=list)
     
@@ -269,6 +272,8 @@ class InjectionPlan:
             "trace_ids_count": len(self.trace_ids),
             # P0-1: Memory Metadata
             "memory_metadata": bool(self.memory_metadata),
+            # v6.5: Clarification
+            "clarification_instruction": bool(self.clarification_instruction),
         }
 
 

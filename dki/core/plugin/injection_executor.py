@@ -632,6 +632,13 @@ class InjectionExecutor:
                 strength = "轻微参考以下用户偏好（可酌情忽略）"
             system_content = f"请{strength}:\n{plan.preference_text}"
         
+        # v6.5: 追加模糊指代澄清指令 (如果有)
+        if plan.clarification_instruction:
+            if system_content:
+                system_content = system_content + "\n\n" + plan.clarification_instruction
+            else:
+                system_content = plan.clarification_instruction
+        
         # ============ 2. 收集历史消息 ============
         # 注入标记列表 (assistant 消息中包含这些标记时应过滤)
         _injection_markers = [
@@ -754,7 +761,7 @@ class InjectionExecutor:
                 prompt_with_prefix = self._build_multiturn_chat_prompt(plan=plan)
             else:
                 # 无历史消息时, 使用简单的 system + user 格式
-                system_content = ""
+                system_parts = []
                 if plan.preference_text and alpha > 0.1:
                     if alpha >= 0.7:
                         strength = "严格遵循以下用户偏好"
@@ -762,7 +769,13 @@ class InjectionExecutor:
                         strength = "适当参考以下用户偏好"
                     else:
                         strength = "轻微参考以下用户偏好（可酌情忽略）"
-                    system_content = f"请{strength}:\n{plan.preference_text}"
+                    system_parts.append(f"请{strength}:\n{plan.preference_text}")
+                
+                # v6.5: 模糊指代澄清指令
+                if plan.clarification_instruction:
+                    system_parts.append(plan.clarification_instruction)
+                
+                system_content = "\n\n".join(system_parts) if system_parts else ""
                 
                 prompt_with_prefix = self._build_chat_template_prompt(
                     system_content=system_content,
@@ -960,7 +973,7 @@ class InjectionExecutor:
                 stable_prompt = self._build_multiturn_chat_prompt(plan=plan)
             else:
                 # 使用 chat template 构造 prompt (偏好 → system, 查询 → user)
-                system_content = ""
+                system_parts = []
                 if plan.preference_text and alpha > 0.1:
                     if alpha >= 0.7:
                         strength = "严格遵循以下用户偏好"
@@ -968,7 +981,13 @@ class InjectionExecutor:
                         strength = "适当参考以下用户偏好"
                     else:
                         strength = "轻微参考以下用户偏好（可酌情忽略）"
-                    system_content = f"请{strength}:\n{plan.preference_text}"
+                    system_parts.append(f"请{strength}:\n{plan.preference_text}")
+                
+                # v6.5: 模糊指代澄清指令
+                if plan.clarification_instruction:
+                    system_parts.append(plan.clarification_instruction)
+                
+                system_content = "\n\n".join(system_parts) if system_parts else ""
                 
                 stable_prompt = self._build_chat_template_prompt(
                     system_content=system_content,

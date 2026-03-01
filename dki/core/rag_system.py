@@ -16,7 +16,10 @@ from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
-from dki.core.text_utils import strip_think_content, estimate_tokens_fast
+from dki.core.text_utils import (
+    strip_think_content, estimate_tokens_fast,
+    detect_vague_reference, build_clarification_instruction,
+)
 from dki.core.memory_router import MemoryRouter, MemorySearchResult
 from dki.core.embedding_service import EmbeddingService
 from dki.models.factory import ModelFactory
@@ -585,6 +588,24 @@ class RAGSystem:
             except Exception as e:
                 logger.warning(f"Failed to get conversation history: {e}")
                 history = None
+        
+        # ============ v6.5: 模糊指代澄清 ============
+        _vague_ref = detect_vague_reference(query)
+        if _vague_ref.is_vague:
+            history_count = len(history) if history else 0
+            history_insufficient = history_count <= 2
+            if history_insufficient:
+                clarification = build_clarification_instruction(_vague_ref.language)
+                if effective_system_prompt:
+                    effective_system_prompt = effective_system_prompt + "\n\n" + clarification
+                else:
+                    effective_system_prompt = clarification
+                logger.info(
+                    f"[Clarification] RAG path: "
+                    f"confidence={_vague_ref.confidence:.2f}, "
+                    f"pattern='{_vague_ref.matched_pattern}', "
+                    f"history_count={history_count}"
+                )
         
         # Build prompt with history (now returns tuple)
         prompt, prompt_info = self._build_prompt(

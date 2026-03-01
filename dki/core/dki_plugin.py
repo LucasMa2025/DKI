@@ -36,7 +36,11 @@ from datetime import datetime
 
 from loguru import logger
 
-from dki.core.text_utils import strip_think_content
+from dki.core.text_utils import (
+    strip_think_content,
+    detect_vague_reference,
+    build_clarification_instruction,
+)
 
 from dki.adapters.base import (
     IUserDataAdapter,
@@ -303,7 +307,15 @@ class DKIPlugin:
             # 从配置加载 recall config
             recall_dict = {}
             if hasattr(self.config, 'dki') and hasattr(self.config.dki, 'recall'):
-                recall_dict = self.config.dki.recall if isinstance(self.config.dki.recall, dict) else {}
+                recall_obj = self.config.dki.recall
+                if isinstance(recall_obj, dict):
+                    recall_dict = recall_obj
+                elif hasattr(recall_obj, 'model_dump'):
+                    # Pydantic v2 model (RecallConfigModel)
+                    recall_dict = recall_obj.model_dump()
+                elif hasattr(recall_obj, 'dict'):
+                    # Pydantic v1 model
+                    recall_dict = recall_obj.dict()
             self._recall_config = RecallConfig.from_dict(recall_dict)
             
             # 创建 PromptFormatter
@@ -776,6 +788,22 @@ class DKIPlugin:
             metadata.total_tokens = plan.total_tokens
             metadata.gating_decision = plan.gating_decision
             metadata.safety_violations = plan.safety_violations
+            
+            # ============ Step 3.5: 模糊指代澄清 (v6.5) ============
+            _vague_ref = detect_vague_reference(query)
+            if _vague_ref.is_vague:
+                # 历史不足时注入澄清指令
+                history_insufficient = len(relevant_history) <= 2
+                if history_insufficient:
+                    plan.clarification_instruction = build_clarification_instruction(
+                        _vague_ref.language
+                    )
+                    logger.info(
+                        f"[Clarification] Plugin path: "
+                        f"confidence={_vague_ref.confidence:.2f}, "
+                        f"pattern='{_vague_ref.matched_pattern}', "
+                        f"history_count={len(relevant_history)}"
+                    )
             
             # ============ Step 4: 执行注入计划 (Executor) ============
             injection_start = time.time()

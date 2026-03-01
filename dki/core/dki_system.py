@@ -61,7 +61,10 @@ from typing import Any, Dict, List, Optional, Union
 import torch
 from loguru import logger
 
-from dki.core.text_utils import strip_think_content, estimate_tokens_fast
+from dki.core.text_utils import (
+    strip_think_content, estimate_tokens_fast,
+    detect_vague_reference, build_clarification_instruction,
+)
 from dki.core.memory_router import MemoryRouter, MemorySearchResult
 from dki.core.embedding_service import EmbeddingService
 from dki.core.components.memory_influence_scaling import MemoryInfluenceScaling
@@ -313,6 +316,12 @@ class DKISystem:
                 recall_obj = self.config.dki.recall
                 if isinstance(recall_obj, dict):
                     recall_dict = recall_obj
+                elif hasattr(recall_obj, 'model_dump'):
+                    # Pydantic v2 model (RecallConfigModel)
+                    recall_dict = recall_obj.model_dump()
+                elif hasattr(recall_obj, 'dict'):
+                    # Pydantic v1 model
+                    recall_dict = recall_obj.dict()
                 elif hasattr(recall_obj, '__dict__'):
                     recall_dict = self._obj_to_dict(recall_obj)
             
@@ -846,6 +855,18 @@ class DKISystem:
         # 保存原始用户输入 (用于数据库记录，避免历史递归嵌套)
         original_query = query
         
+        # ============ v6.5: 模糊指代检测 ============
+        # 检测用户输入中的模糊指代 (如 "前段时间说的那件事你怎么想")
+        # 如果检测到且历史召回无法定位, 将在 system message 中注入澄清指令
+        _vague_ref = detect_vague_reference(original_query)
+        if _vague_ref.is_vague:
+            logger.info(
+                f"[Vague Reference Detected] "
+                f"confidence={_vague_ref.confidence:.2f}, "
+                f"pattern='{_vague_ref.matched_pattern}', "
+                f"lang={_vague_ref.language}"
+            )
+        
         # Start latency timer
         with LatencyTimer() as timer:
             cache_hit = False
@@ -958,6 +979,7 @@ class DKISystem:
                             preference=preference,
                             trace_ids=assembled.trace_ids if has_history else [],
                             has_fact_call_instruction=assembled.has_fact_call_instruction if has_history else False,
+                            vague_reference=_vague_ref,
                         )
                         logger.debug(
                             f"Chat prompt built: history_items={len(assembled.items) if has_history else 0}, "
@@ -1033,6 +1055,7 @@ class DKISystem:
                         history=history if has_history else None,
                         original_query=query,
                         preference=preference,
+                        vague_reference=_vague_ref,
                     )
                 
                 # v5.5: 跟踪 hybrid fallback 实际注入的历史 token 数
@@ -1051,7 +1074,7 @@ class DKISystem:
                         _hybrid_fallback_hist_tokens = len(_hist_text) // 2
                     
                     _hybrid_fallback_hist_messages = [
-                        {"role": getattr(m, 'role', 'user'), "content": getattr(m, 'content', '')[:500]}
+                        {"role": getattr(m, 'role', 'user'), "content": getattr(m, 'content', '')}
                         for m in history.messages
                     ]
                     
@@ -1074,6 +1097,7 @@ class DKISystem:
                     preference=preference,
                     trace_ids=[],
                     has_fact_call_instruction=False,
+                    vague_reference=_vague_ref,
                 )
                 logger.debug("Fallback: preference injected via chat template (no history path)")
             
@@ -1240,7 +1264,7 @@ class DKISystem:
                     for item in assembled.items:
                         _hist_messages_display.append({
                             'role': item.role or 'user',
-                            'content': item.content[:500] if item.content else '',
+                            'content': item.content or '',
                             'type': item.type,
                             'trace_id': item.trace_id,
                             'confidence': item.confidence,
@@ -1511,6 +1535,7 @@ class DKISystem:
         preference: Optional[Any] = None,
         trace_ids: Optional[list] = None,
         has_fact_call_instruction: bool = False,
+        vague_reference: Optional[Any] = None,
     ) -> str:
         """
         v5.1: 使用 chat template 构造正确的多轮对话格式
@@ -1547,7 +1572,7 @@ class DKISystem:
         elif hasattr(self, 'model') and hasattr(self.model, 'tokenizer'):
             tokenizer = self.model.tokenizer
         
-        # ============ 1. System message: 偏好 + 召回元数据 ============
+        # ============ 1. System message: 偏好 + 召回元数据 + 澄清指令 ============
         system_parts = []
         if preference and preference.content:
             system_parts.append(f"用户偏好:\n{preference.content}")
@@ -1557,6 +1582,19 @@ class DKISystem:
             if self._recall_formatter:
                 constraint = self._recall_formatter.format_constraint_instruction(trace_ids)
                 system_parts.append(constraint)
+        
+        # v6.5: 模糊指代澄清指令
+        # 当检测到模糊指代且历史召回不足时, 注入澄清指令引导模型主动提问
+        if vague_reference and vague_reference.is_vague:
+            # 判断历史召回是否足够: 如果 items 为空或很少, 说明无法定位
+            history_insufficient = len(items) <= 2
+            if history_insufficient:
+                clarification = build_clarification_instruction(vague_reference.language)
+                system_parts.append(clarification)
+                logger.info(
+                    f"[Clarification Injected] recall_v4 path, "
+                    f"history_items={len(items)}, lang={vague_reference.language}"
+                )
         
         system_content = "\n\n".join(system_parts) if system_parts else ""
         
@@ -1649,6 +1687,7 @@ class DKISystem:
         history,
         original_query: str,
         preference=None,
+        vague_reference: Optional[Any] = None,
     ) -> str:
         """
         v5.1: Hybrid 模式下使用 chat template 构造正确的多轮对话格式
@@ -1673,11 +1712,25 @@ class DKISystem:
             tokenizer = self.model.tokenizer
         
         # ============ 1. System message ============
-        system_content = ""
+        system_parts = []
         if preference:
             pref_content = getattr(preference, 'content', str(preference))
             if pref_content:
-                system_content = f"用户偏好:\n{pref_content}"
+                system_parts.append(f"用户偏好:\n{pref_content}")
+        
+        # v6.5: 模糊指代澄清指令
+        if vague_reference and vague_reference.is_vague:
+            history_count = len(history.messages) if history and hasattr(history, 'messages') else 0
+            history_insufficient = history_count <= 2
+            if history_insufficient:
+                clarification = build_clarification_instruction(vague_reference.language)
+                system_parts.append(clarification)
+                logger.info(
+                    f"[Clarification Injected] hybrid path, "
+                    f"history_msgs={history_count}, lang={vague_reference.language}"
+                )
+        
+        system_content = "\n\n".join(system_parts) if system_parts else ""
         
         # ============ 2. 历史消息还原为独立 messages ============
         history_messages = []

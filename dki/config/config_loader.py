@@ -115,6 +115,24 @@ class HybridInjectionConfigModel(BaseModel):
     history: HybridHistoryConfig = Field(default_factory=HybridHistoryConfig)
 
 
+class RecallConfigModel(BaseModel):
+    """Recall v4 configuration (v4.0).
+    
+    透传到 dki.core.recall.recall_config.RecallConfig.from_dict()。
+    使用 Dict[str, Any] 子字段以兼容 RecallConfig dataclass 的嵌套结构。
+    """
+    enabled: bool = True
+    strategy: str = "summary_with_fact_call"
+    signals: Dict[str, Any] = Field(default_factory=dict)
+    score_weights: Dict[str, Any] = Field(default_factory=dict)
+    budget: Dict[str, Any] = Field(default_factory=dict)
+    summary: Dict[str, Any] = Field(default_factory=dict)
+    fact_call: Dict[str, Any] = Field(default_factory=dict)
+    prompt_formatter: str = "auto"
+    epistemic_modes: Dict[str, Any] = Field(default_factory=dict)
+    signal_gating: Dict[str, Any] = Field(default_factory=dict)
+
+
 class DKIConfig(BaseModel):
     """DKI module configuration."""
     enabled: bool = True
@@ -130,6 +148,9 @@ class DKIConfig(BaseModel):
     
     # Injection strategy (v3.2: only recall_v4 supported)
     injection_strategy: str = "recall_v4"
+    
+    # Recall v4 configuration (v4.0: 多信号召回 + Summary + Fact Call)
+    recall: RecallConfigModel = Field(default_factory=RecallConfigModel)
     
     # Hybrid injection configuration (v3.2)
     hybrid_injection: HybridInjectionConfigModel = Field(default_factory=HybridInjectionConfigModel)
@@ -265,11 +286,44 @@ class ConfigLoader:
         
         raise FileNotFoundError("Configuration file not found")
     
+    @staticmethod
+    def _resolve_env_vars(obj: Any) -> Any:
+        """
+        递归替换配置中的环境变量占位符。
+        
+        支持语法:
+          ${ENV_VAR}          — 必须存在, 否则保留原文
+          ${ENV_VAR:-default} — 不存在时使用 default
+        
+        示例:
+          model_name: "${DKI_MODEL_PATH:-/opt/ai-demo/models/deepseek-r1-distill-qwen-7b}"
+        """
+        import re
+        _env_pattern = re.compile(r'\$\{([^}]+)\}')
+
+        def _replace(match: re.Match) -> str:
+            expr = match.group(1)
+            if ':-' in expr:
+                var_name, default_val = expr.split(':-', 1)
+                return os.environ.get(var_name.strip(), default_val.strip())
+            return os.environ.get(expr.strip(), match.group(0))
+
+        if isinstance(obj, str):
+            return _env_pattern.sub(_replace, obj)
+        elif isinstance(obj, dict):
+            return {k: ConfigLoader._resolve_env_vars(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [ConfigLoader._resolve_env_vars(item) for item in obj]
+        return obj
+
     def _load_config(self) -> None:
-        """Load configuration from YAML file."""
+        """Load configuration from YAML file with environment variable substitution."""
         try:
             with open(self._config_path, 'r', encoding='utf-8') as f:
                 raw_config = yaml.safe_load(f)
+            
+            # 环境变量替换 (支持 ${VAR} 和 ${VAR:-default} 语法)
+            raw_config = self._resolve_env_vars(raw_config)
             
             # Parse engine configs
             if 'model' in raw_config and 'engines' in raw_config['model']:

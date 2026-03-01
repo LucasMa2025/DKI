@@ -78,6 +78,10 @@ class MemoryTriggerConfig:
         r"其实我(想|觉得|认为)",
         r"我的(偏好|喜好|习惯)是",
         r"我(不再|不想|不要).*?了",
+        # v6.4: 纠正/否定模式 — 用户否定助手的回答
+        r"不是的.*(再想想|重新想|再想一下|再考虑)",
+        r"(不对|不是的|错了|你说错了|你搞错了|不是这样|你理解错了)",
+        r"(再想想|重新想|想错了|答错了)",
     ])
     
     # 状态变化模式 (英文)
@@ -87,6 +91,10 @@ class MemoryTriggerConfig:
         r"actually I (think|believe|want)",
         r"my (preference|habit) is",
         r"I (no longer|don't want to)",
+        # v6.4: correction/negation patterns — user corrects assistant's answer
+        r"(that's wrong|that's not right|you're wrong|that's incorrect)",
+        r"(think again|try again|reconsider)",
+        r"(not correct|you got it wrong|no,? that's not)",
     ])
     
     # 长期价值信号 (中文)
