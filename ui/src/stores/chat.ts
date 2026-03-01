@@ -85,6 +85,37 @@ export const useChatStore = defineStore("chat", () => {
         }
     }
 
+    /**
+     * 从用户消息内容生成可读的会话标题
+     * 规则:
+     * 1. 去除换行和多余空白
+     * 2. 如果内容是问句, 保留问号
+     * 3. 截取前 30 个字符 (中文友好)
+     * 4. 如果被截断, 添加 "..."
+     */
+    function generateSessionTitle(content: string): string {
+        const cleaned = content.trim().replace(/\s+/g, ' ');
+        const maxLen = 30;
+        if (cleaned.length <= maxLen) {
+            return cleaned;
+        }
+        // 尝试在标点或空格处截断, 避免截断到词中间
+        const truncated = cleaned.slice(0, maxLen);
+        const lastPunct = Math.max(
+            truncated.lastIndexOf('，'),
+            truncated.lastIndexOf(','),
+            truncated.lastIndexOf('。'),
+            truncated.lastIndexOf(' '),
+            truncated.lastIndexOf('、'),
+            truncated.lastIndexOf('？'),
+            truncated.lastIndexOf('?'),
+        );
+        if (lastPunct > maxLen * 0.5) {
+            return truncated.slice(0, lastPunct) + '...';
+        }
+        return truncated + '...';
+    }
+
     // Send message
     // 修正: 只传递 user_id 和原始输入，移除 prompt 拼接逻辑
     // DKI 会自动通过适配器读取用户偏好和历史消息进行注入
@@ -93,6 +124,9 @@ export const useChatStore = defineStore("chat", () => {
         const settingsStore = useSettingsStore();
 
         if (!content.trim()) return;
+
+        // 记录是否是新会话 (用于自动命名)
+        const isNewSession = !currentSessionId.value;
 
         // Ensure we have a session
         if (!currentSessionId.value) {
@@ -169,6 +203,15 @@ export const useChatStore = defineStore("chat", () => {
                 session.messageCount = messages.value.length;
                 session.updatedAt = new Date().toISOString();
             }
+
+            // 自动命名: 新会话的第一条消息发送成功后, 用消息内容生成可读标题
+            if (isNewSession && currentSessionId.value) {
+                const autoTitle = generateSessionTitle(content);
+                // 异步更新标题, 不阻塞主流程
+                renameSession(currentSessionId.value, autoTitle).catch((e) => {
+                    console.warn('Auto-rename session failed:', e);
+                });
+            }
         } catch (e) {
             const errMsg =
                 e instanceof Error ? e.message : "Failed to send message";
@@ -204,6 +247,16 @@ export const useChatStore = defineStore("chat", () => {
         error.value = null;
     }
 
+    // 重置所有状态 (用户切换/登出时调用)
+    function resetState() {
+        sessions.value = [];
+        currentSessionId.value = null;
+        messages.value = [];
+        loading.value = false;
+        streaming.value = false;
+        error.value = null;
+    }
+
     return {
         sessions,
         currentSessionId,
@@ -220,5 +273,6 @@ export const useChatStore = defineStore("chat", () => {
         sendMessage,
         clearMessages,
         clearError,
+        resetState,
     };
 });

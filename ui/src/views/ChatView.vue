@@ -3,7 +3,37 @@
     <!-- Chat Header -->
     <header class="chat-header">
       <div class="header-left">
-        <h2 class="session-title">{{ currentSession?.title || 'New Chat' }}</h2>
+        <template v-if="editingTitle">
+          <el-input
+            v-model="editTitleValue"
+            size="small"
+            class="title-input"
+            maxlength="50"
+            show-word-limit
+            @keydown.enter="saveTitle"
+            @keydown.escape="cancelEditTitle"
+            @blur="saveTitle"
+            ref="titleInputRef"
+          />
+          <el-button size="small" type="primary" text @click="saveTitle">保存</el-button>
+          <el-button size="small" text @click="cancelEditTitle">取消</el-button>
+        </template>
+        <template v-else>
+          <h2
+            class="session-title"
+            :title="'点击编辑会话名称'"
+            @click="startEditTitle"
+          >
+            {{ currentSession?.title || 'New Chat' }}
+          </h2>
+          <el-icon
+            v-if="currentSession"
+            class="edit-title-icon"
+            @click="startEditTitle"
+          >
+            <Edit />
+          </el-icon>
+        </template>
         <el-tag v-if="settingsStore.dkiEnabled" type="success" size="small">
           DKI Enabled
         </el-tag>
@@ -206,8 +236,8 @@
 
 <script setup lang="ts">
 import { ref, computed, nextTick, watch } from 'vue'
-import { Delete, InfoFilled, Promotion } from '@element-plus/icons-vue'
-import { ElMessageBox } from 'element-plus'
+import { Delete, Edit, InfoFilled, Promotion } from '@element-plus/icons-vue'
+import { ElMessageBox, ElMessage } from 'element-plus'
 import { useChatStore } from '@/stores/chat'
 import { useAuthStore } from '@/stores/auth'
 import { useSettingsStore } from '@/stores/settings'
@@ -221,6 +251,11 @@ const settingsStore = useSettingsStore()
 const messagesContainer = ref<HTMLElement>()
 const inputMessage = ref('')
 const showDebugPanel = ref(false)
+
+// 标题编辑状态
+const editingTitle = ref(false)
+const editTitleValue = ref('')
+const titleInputRef = ref<any>(null)
 
 const messages = computed(() => chatStore.messages)
 const currentSession = computed(() => chatStore.currentSession)
@@ -275,6 +310,35 @@ function handleQuickPrompt(prompt: string) {
   handleSend()
 }
 
+// ============ 标题编辑 ============
+function startEditTitle() {
+  if (!currentSession.value) return
+  editTitleValue.value = currentSession.value.title || ''
+  editingTitle.value = true
+  nextTick(() => {
+    titleInputRef.value?.focus?.()
+  })
+}
+
+async function saveTitle() {
+  if (!editingTitle.value) return
+  const newTitle = editTitleValue.value.trim()
+  if (!newTitle || !currentSession.value) {
+    cancelEditTitle()
+    return
+  }
+  if (newTitle !== currentSession.value.title) {
+    await chatStore.renameSession(currentSession.value.id, newTitle)
+    ElMessage.success('会话名称已更新')
+  }
+  editingTitle.value = false
+}
+
+function cancelEditTitle() {
+  editingTitle.value = false
+  editTitleValue.value = ''
+}
+
 async function handleClearChat() {
   if (messages.value.length === 0) return
   
@@ -321,6 +385,27 @@ watch(
     font-weight: 600;
     margin: 0;
     color: var(--text-primary);
+    cursor: pointer;
+    transition: color 0.2s;
+    
+    &:hover {
+      color: var(--primary-color);
+    }
+  }
+  
+  .edit-title-icon {
+    font-size: 14px;
+    color: var(--text-muted);
+    cursor: pointer;
+    transition: color 0.2s;
+    
+    &:hover {
+      color: var(--primary-color);
+    }
+  }
+  
+  .title-input {
+    width: 300px;
   }
 }
 

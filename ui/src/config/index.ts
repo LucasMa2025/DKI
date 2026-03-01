@@ -5,7 +5,7 @@ export const config = {
     // 各 API 端点会自行添加正确的前缀 (/api/*, /v1/*)
     api: {
         baseUrl: import.meta.env.VITE_API_BASE_URL || "",
-        timeout: 120000,  // 120s — 14B 模型单 GPU 推理可能需要 40-60s+
+        timeout: 240000, // 240s — 14B think模型单 GPU 推理可能需要 40-180s+
     },
 
     // Stats page authentication

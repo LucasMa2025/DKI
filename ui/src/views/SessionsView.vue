@@ -199,7 +199,8 @@ const selectedSession = ref<Session | null>(null)
 const previewMessages = ref<ChatMessage[]>([])
 const loadingMessages = ref(false)
 
-const loading = computed(() => false) // Would be from store
+const isLoading = ref(false)
+const loading = computed(() => isLoading.value)
 const sessions = computed(() => chatStore.sessions)
 const currentSessionId = computed(() => chatStore.currentSessionId)
 
@@ -315,8 +316,15 @@ async function handleDelete(session: Session) {
   ElMessage.success('Session deleted')
 }
 
-onMounted(() => {
-  chatStore.loadSessions()
+onMounted(async () => {
+  // 每次进入 Sessions 页面都强制重新加载当前用户的 sessions
+  // 确保不会显示上一个用户的数据
+  isLoading.value = true
+  try {
+    await chatStore.loadSessions()
+  } finally {
+    isLoading.value = false
+  }
 })
 </script>
 

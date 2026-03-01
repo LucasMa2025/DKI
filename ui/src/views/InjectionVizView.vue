@@ -741,10 +741,13 @@
               {{ row.latency_ms.toFixed(1) }}ms
             </template>
           </el-table-column>
-          <el-table-column label="Action" width="80">
+          <el-table-column label="Action" width="180">
             <template #default="{ row }">
               <el-button type="primary" link size="small" @click="viewDetail(row.request_id)">
                 Detail
+              </el-button>
+              <el-button type="success" link size="small" @click="viewInjectionDetail(row.request_id)">
+                Injection
               </el-button>
             </template>
           </el-table-column>
@@ -784,6 +787,143 @@
           readonly
         />
       </div>
+    </el-dialog>
+
+    <!-- Injection Detail Dialog (查看注入详情弹窗) -->
+    <el-dialog
+      v-model="showInjectionDialog"
+      title="Injection Content Detail"
+      width="900px"
+      top="5vh"
+      destroy-on-close
+    >
+      <div v-if="injectionDetailData" class="injection-dialog-content">
+        <!-- 基本信息 -->
+        <el-descriptions :column="3" border size="small" style="margin-bottom: 16px;">
+          <el-descriptions-item label="Request ID">{{ injectionDetailData.request_id }}</el-descriptions-item>
+          <el-descriptions-item label="Mode">
+            <el-tag :type="injectionDetailData.mode === 'dki' ? 'success' : injectionDetailData.mode === 'rag' ? 'warning' : 'info'" size="small">
+              {{ injectionDetailData.mode || 'dki' }}
+            </el-tag>
+          </el-descriptions-item>
+          <el-descriptions-item label="Timestamp">{{ formatTimestamp(injectionDetailData.timestamp) }}</el-descriptions-item>
+          <el-descriptions-item label="Alpha">{{ injectionDetailData.injection_layers?.[0]?.alpha?.toFixed(2) || '0.00' }}</el-descriptions-item>
+          <el-descriptions-item label="Pref Tokens">{{ injectionDetailData.token_distribution?.preference || 0 }}</el-descriptions-item>
+          <el-descriptions-item label="Hist Tokens">{{ injectionDetailData.token_distribution?.history || 0 }}</el-descriptions-item>
+        </el-descriptions>
+
+        <!-- 原始查询 -->
+        <div class="inj-section">
+          <div class="inj-section-title">
+            <el-icon><Edit /></el-icon>
+            Original Query
+          </div>
+          <el-input
+            type="textarea"
+            :value="injectionDetailData.original_query || '(None)'"
+            :rows="2"
+            readonly
+            resize="none"
+          />
+        </div>
+
+        <!-- DKI 偏好注入 -->
+        <div class="inj-section" v-if="injectionDetailData.preference_text">
+          <div class="inj-section-title preference-title">
+            <el-icon><User /></el-icon>
+            Preference Injection (K/V)
+            <el-tag type="success" size="small" style="margin-left: 8px;">
+              {{ injectionDetailData.token_distribution?.preference || 0 }} tokens
+            </el-tag>
+          </div>
+          <el-input
+            type="textarea"
+            :value="injectionDetailData.preference_text"
+            :rows="4"
+            readonly
+            resize="none"
+          />
+        </div>
+
+        <!-- DKI 历史后缀 -->
+        <div class="inj-section" v-if="injectionDetailData.history_suffix_text">
+          <div class="inj-section-title history-title">
+            <el-icon><ChatDotRound /></el-icon>
+            History Suffix
+            <el-tag type="warning" size="small" style="margin-left: 8px;">
+              {{ injectionDetailData.token_distribution?.history || 0 }} tokens
+            </el-tag>
+          </div>
+          <el-input
+            type="textarea"
+            :value="injectionDetailData.history_suffix_text"
+            :rows="5"
+            readonly
+            resize="none"
+          />
+        </div>
+
+        <!-- 历史消息列表 -->
+        <div class="inj-section" v-if="injectionDetailData.history_messages?.length > 0">
+          <div class="inj-section-title">
+            <el-icon><List /></el-icon>
+            History Messages ({{ injectionDetailData.history_messages.length }})
+          </div>
+          <div class="inj-messages-list">
+            <div
+              v-for="(msg, idx) in injectionDetailData.history_messages"
+              :key="idx"
+              class="inj-message-item"
+              :class="[`message-${msg.role}`]"
+            >
+              <span class="inj-msg-role">{{ msg.role === 'user' ? 'User' : 'Assistant' }}:</span>
+              <span class="inj-msg-content">{{ msg.content }}</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- RAG 上下文 (RAG 模式) -->
+        <div class="inj-section" v-if="injectionDetailData.rag_context_text">
+          <div class="inj-section-title rag-title">
+            <el-icon><DataLine /></el-icon>
+            RAG Retrieved Context
+          </div>
+          <el-input
+            type="textarea"
+            :value="injectionDetailData.rag_context_text"
+            :rows="4"
+            readonly
+            resize="none"
+          />
+        </div>
+
+        <!-- 最终输入 -->
+        <div class="inj-section">
+          <div class="inj-section-title final-title">
+            <el-icon><View /></el-icon>
+            Final Input to LLM
+            <el-tag type="primary" size="small" style="margin-left: 8px;">
+              {{ injectionDetailData.token_distribution?.total || 0 }} tokens
+            </el-tag>
+          </div>
+          <el-input
+            type="textarea"
+            :value="injectionDetailData.final_input || injectionDetailData.final_input_preview || '(None)'"
+            :rows="8"
+            readonly
+            resize="none"
+          />
+        </div>
+      </div>
+      <el-empty v-else description="Loading..." />
+
+      <template #footer>
+        <el-button @click="showInjectionDialog = false">Close</el-button>
+        <el-button type="primary" @click="copyInjectionDialogText">
+          <el-icon><CopyDocument /></el-icon>
+          Copy All
+        </el-button>
+      </template>
     </el-dialog>
   </div>
 </template>
@@ -833,6 +973,10 @@ const functionCallLogs = ref<any[]>([])
 const fcLoading = ref(false)
 const fcStats = ref<any>(null)
 const expandedFC = ref<number | null>(null)
+
+// Injection Detail Dialog state
+const showInjectionDialog = ref(false)
+const injectionDetailData = ref<any>(null)
 
 // Computed
 const flowSteps = computed(() => latestData.value?.flow_steps || defaultFlowSteps)
@@ -1063,11 +1207,7 @@ function copyInjectionText() {
   lines.push('═══════════════════════════════════════════════════════')
   
   const text = lines.join('\n')
-  navigator.clipboard.writeText(text).then(() => {
-    ElMessage.success('Copied to clipboard')
-  }).catch(() => {
-    ElMessage.error('Copy failed')
-  })
+  copyToClipboard(text)
 }
 
 // ===== Function Call Logs Methods (v3.2) =====
@@ -1105,6 +1245,115 @@ function truncateText(text: string, maxLen: number): string {
   if (!text) return ''
   if (text.length <= maxLen) return text
   return text.substring(0, maxLen) + '...'
+}
+
+// ===== Injection Detail Dialog Methods =====
+async function viewInjectionDetail(requestId: string) {
+  try {
+    const res = await api.visualization.getDetail(requestId).catch(() => null)
+    if (res) {
+      injectionDetailData.value = res
+    } else {
+      // Fallback: 从 latestData 中查找
+      injectionDetailData.value = latestData.value
+    }
+    showInjectionDialog.value = true
+  } catch (error) {
+    console.error('Failed to load injection detail:', error)
+    ElMessage.error('Failed to load injection detail')
+  }
+}
+
+function copyInjectionDialogText() {
+  if (!injectionDetailData.value) {
+    ElMessage.warning('No data to copy')
+    return
+  }
+  const d = injectionDetailData.value
+  const lines: string[] = []
+  lines.push('═══════════════════════════════════════════════════════')
+  lines.push(`  Injection Detail — ${d.request_id || 'N/A'}`)
+  lines.push('═══════════════════════════════════════════════════════')
+  lines.push('')
+  lines.push(`[Original Query]`)
+  lines.push(d.original_query || '(None)')
+  lines.push('')
+  if (d.preference_text) {
+    lines.push(`[Preference Injection] (α=${d.injection_layers?.[0]?.alpha?.toFixed(2) || '0.00'}, ${d.token_distribution?.preference || 0} tokens)`)
+    lines.push('───────────────────────────────────────────────────────')
+    lines.push(d.preference_text)
+    lines.push('')
+  }
+  if (d.history_suffix_text) {
+    lines.push(`[History Suffix] (${d.token_distribution?.history || 0} tokens)`)
+    lines.push('───────────────────────────────────────────────────────')
+    lines.push(d.history_suffix_text)
+    lines.push('')
+  }
+  if (d.history_messages?.length > 0) {
+    lines.push(`[History Messages] (${d.history_messages.length} items)`)
+    lines.push('───────────────────────────────────────────────────────')
+    for (const msg of d.history_messages) {
+      lines.push(`  [${msg.role === 'user' ? 'User' : 'Assistant'}] ${msg.content}`)
+    }
+    lines.push('')
+  }
+  if (d.rag_context_text) {
+    lines.push(`[RAG Context]`)
+    lines.push('───────────────────────────────────────────────────────')
+    lines.push(d.rag_context_text)
+    lines.push('')
+  }
+  lines.push(`[Final Input to LLM] (${d.token_distribution?.total || 0} tokens)`)
+  lines.push('───────────────────────────────────────────────────────')
+  lines.push(d.final_input || d.final_input_preview || '(None)')
+  lines.push('')
+  lines.push('═══════════════════════════════════════════════════════')
+
+  copyToClipboard(lines.join('\n'))
+}
+
+// ===== Clipboard Helper (兼容非 HTTPS 环境) =====
+function copyToClipboard(text: string) {
+  if (!text) {
+    ElMessage.warning('No data to copy')
+    return
+  }
+  // 优先使用 Clipboard API
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text).then(() => {
+      ElMessage.success('Copied to clipboard')
+    }).catch(() => {
+      fallbackCopy(text)
+    })
+  } else {
+    fallbackCopy(text)
+  }
+}
+
+function fallbackCopy(text: string) {
+  // Fallback: 使用 textarea + execCommand (兼容 HTTP 环境)
+  const textarea = document.createElement('textarea')
+  textarea.value = text
+  textarea.style.position = 'fixed'
+  textarea.style.left = '-9999px'
+  textarea.style.top = '-9999px'
+  textarea.style.opacity = '0'
+  document.body.appendChild(textarea)
+  textarea.focus()
+  textarea.select()
+  try {
+    const ok = document.execCommand('copy')
+    if (ok) {
+      ElMessage.success('Copied to clipboard')
+    } else {
+      ElMessage.error('Copy failed — please copy manually')
+    }
+  } catch {
+    ElMessage.error('Copy failed — please copy manually')
+  } finally {
+    document.body.removeChild(textarea)
+  }
 }
 
 // ===== Raw Prompt Display (v5.4) =====
@@ -1186,11 +1435,7 @@ function copyRawPrompt() {
     ElMessage.warning('No prompt data to copy')
     return
   }
-  navigator.clipboard.writeText(text).then(() => {
-    ElMessage.success('Raw prompt copied to clipboard')
-  }).catch(() => {
-    ElMessage.error('Copy failed')
-  })
+  copyToClipboard(text)
 }
 
 // ===== Recall v4 Signal Details (v5.4) =====
@@ -1918,6 +2163,79 @@ section {
 
     &:first-child {
       margin-top: 16px;
+    }
+  }
+}
+
+// Injection Detail Dialog
+.injection-dialog-content {
+  max-height: 70vh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.inj-section {
+  .inj-section-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin-bottom: 8px;
+    padding: 6px 12px;
+    border-radius: 6px;
+    background: var(--bg-hover);
+
+    &.preference-title { border-left: 3px solid #10b981; }
+    &.history-title { border-left: 3px solid #f59e0b; }
+    &.rag-title { border-left: 3px solid #ef4444; }
+    &.final-title { border-left: 3px solid #3b82f6; }
+  }
+
+  :deep(.el-textarea__inner) {
+    background: var(--bg-surface);
+    border: 1px solid var(--border-color);
+    font-family: 'Fira Code', 'Consolas', monospace;
+    font-size: 12px;
+    line-height: 1.5;
+  }
+}
+
+.inj-messages-list {
+  max-height: 200px;
+  overflow-y: auto;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: 8px;
+
+  .inj-message-item {
+    padding: 6px 10px;
+    border-radius: 6px;
+    margin-bottom: 6px;
+    font-size: 13px;
+    line-height: 1.5;
+
+    &.message-user {
+      background: var(--bg-hover);
+    }
+
+    &.message-assistant {
+      background: rgba(16, 185, 129, 0.08);
+      border: 1px solid rgba(16, 185, 129, 0.2);
+    }
+
+    .inj-msg-role {
+      font-weight: 600;
+      color: var(--text-secondary);
+      margin-right: 6px;
+    }
+
+    .inj-msg-content {
+      color: var(--text-primary);
+      word-break: break-word;
     }
   }
 }
