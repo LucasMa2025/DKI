@@ -31,7 +31,7 @@ import torch
 
 from dki.models.base import KVCacheEntry, PackedKV
 from dki.core.plugin.injection_plan import (
-    InjectionPlan, AlphaProfile, SafetyEnvelope, QueryContext, ExecutionResult, FactBlock,
+    InjectionPlan, AlphaProfile, SafetyEnvelope, QueryContext, ExecutionResult,
 )
 
 
@@ -163,7 +163,6 @@ class TestHistoryAlphaDecay:
             "stable_plans": 0,
             "memory_trigger_count": 0,
             "reference_resolved_count": 0,
-            "fact_blocks_resolved": 0,
         }
         return planner
 
@@ -275,7 +274,6 @@ class TestMemoryTriggerAlpha:
         planner._stats = {
             "plans_built": 0, "recall_v4_plans": 0, "stable_plans": 0,
             "memory_trigger_count": 0, "reference_resolved_count": 0,
-            "fact_blocks_resolved": 0,
         }
         return planner
 
@@ -616,7 +614,6 @@ class TestAlphaProfileCombined:
         planner._stats = {
             "plans_built": 0, "recall_v4_plans": 0, "stable_plans": 0,
             "memory_trigger_count": 0, "reference_resolved_count": 0,
-            "fact_blocks_resolved": 0,
         }
         return planner
 

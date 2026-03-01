@@ -346,7 +346,7 @@ class TestTotalTokensCalculation:
 
         assert plan.preference_tokens > 0
         assert plan.query_tokens > 0
-        assert plan.total_tokens == plan.query_tokens + plan.history_tokens + plan.preference_tokens + plan.fact_tokens
+        assert plan.total_tokens == plan.query_tokens + plan.history_tokens + plan.preference_tokens
 
     def test_total_tokens_no_preference(self):
         """没有偏好时 preference_tokens = 0"""

@@ -54,7 +54,7 @@ class TestRecallBudgetConfig:
     def test_default_values(self):
         cfg = RecallBudgetConfig()
         assert cfg.generation_reserve == 512
-        assert cfg.instruction_reserve == 150
+        assert cfg.instruction_reserve == 120  # v5.8: 从 150 调整为 120
         assert cfg.min_recent_turns == 2
         assert cfg.max_recent_turns == 5
 
@@ -70,7 +70,7 @@ class TestRecallSummaryConfig:
 
     def test_default_values(self):
         cfg = RecallSummaryConfig()
-        assert cfg.per_message_threshold == 200
+        assert cfg.per_message_threshold == 300  # v5.8: 从 200 调整为 300
         assert cfg.max_tokens_per_summary == 150
         assert cfg.strategy == "extractive"
 

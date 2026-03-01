@@ -353,9 +353,12 @@ class TestRecallV4EndToEnd:
             context_window=500,  # 很小的窗口
         )
 
-        # 不应包含所有消息
+        # v6.0: 全局分配策略可能通过 summary 保留所有消息
+        # 验证: 至少有一条被压缩, 或总 token 不超过预算
         total_items = suffix.message_count + suffix.summary_count
-        assert total_items < len(conversation_messages)
+        assert total_items <= len(conversation_messages)
+        # 至少有 summary 或者 token 被控制在预算内
+        assert suffix.summary_count >= 1 or suffix.total_tokens <= 500
 
 
 class TestFormatterFactory:

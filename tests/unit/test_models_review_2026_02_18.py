@@ -596,12 +596,13 @@ class TestDeepSeekAdapterSpecifics:
     """验证 DeepSeek 适配器的特殊处理"""
 
     def test_deepseek_format_prompt(self):
-        """DeepSeek 应有正确的聊天格式"""
+        """DeepSeek 应有正确的聊天格式 (v5.5: 已改为 ChatML)"""
         from dki.models.deepseek_adapter import DeepSeekAdapter
         
         source = inspect.getsource(DeepSeekAdapter._format_prompt)
-        assert "User:" in source
-        assert "Assistant:" in source
+        # v5.5: DeepSeek 回退模板改为 ChatML 格式
+        assert "im_start" in source or "User:" in source
+        assert "assistant" in source or "Assistant:" in source
 
     def test_deepseek_generate_checks_chat_model(self):
         """generate 应检查是否为 chat 模型"""

@@ -33,10 +33,10 @@ class TestChatRequest:
     def test_default_values(self):
         req = ChatRequest(query="Hello")
         assert req.query == "Hello"
-        assert req.mode == "dki"
+        assert req.mode == "auto"  # v5.6: 默认模式从 "dki" 改为 "auto"
         assert req.session_id is None
         assert req.force_alpha is None
-        assert req.max_new_tokens == 256
+        assert req.max_new_tokens == 2048  # v6.4: 从 256 提升到 2048
         assert req.temperature == 0.7
         assert req.token is None
         assert req.user_id is None

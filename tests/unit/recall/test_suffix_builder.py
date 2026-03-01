@@ -1,8 +1,9 @@
 """
 SuffixBuilder 单元测试
 
-测试后缀组装器:
-- 逐消息阈值判断 (summary vs 原文)
+测试后缀组装器 (v6.0: 两阶段全局预算分配):
+- Phase 1: 完整收集 (不压缩)
+- Phase 2: 全局预算分配 — 短消息优先保留, 长消息只在预算不足时压缩
 - Context 预算管理
 - 认知标记提取
 - 抽取式摘要 (jieba TextRank)
@@ -120,14 +121,34 @@ class TestSuffixBuilder:
         assert result.has_fact_call_instruction is False
         assert "msg-001" in result.trace_ids
 
-    # ============ 长消息测试 (生成 summary) ============
+    # ============ 长消息测试 (v6.0: 全局预算分配) ============
 
-    def test_build_long_message_generates_summary(self, builder, long_message):
-        """超阈值消息应生成 summary"""
+    def test_build_long_message_fits_budget_keeps_full(self, builder, long_message):
+        """v6.0: 长消息在预算充足时应保留全文, 不压缩"""
         result = builder.build(
             query="你好",
             recalled_messages=[long_message],
             context_window=4096,
+        )
+        # 预算充足: 4096 - 1228(gen) - 50(tag) - 9(query) = 2809 >> 310
+        # 应保留原文, 不压缩
+        assert result.message_count == 1
+        assert result.summary_count == 0
+        assert result.has_fact_call_instruction is False
+        assert "msg-long" in result.trace_ids
+
+    def test_build_long_message_generates_summary(self, builder, long_message):
+        """v6.0: 长消息在预算不足时应生成 summary"""
+        # 使用很小的 context_window, 迫使长消息被压缩
+        # long_message 约 310 tokens, 设 context_window=600
+        # budget = 600 - 180(gen) - 50(tag) - 9(query) = 361
+        # 310 <= 361 → 仍然放得下
+        # 需要更小: context_window=400
+        # budget = 400 - 120(gen) - 50(tag) - 9(query) = 221 < 310 → 需要压缩
+        result = builder.build(
+            query="你好",
+            recalled_messages=[long_message],
+            context_window=400,
         )
         assert result.summary_count >= 1
         assert result.has_fact_call_instruction is True
@@ -138,7 +159,7 @@ class TestSuffixBuilder:
         result = builder.build(
             query="你好",
             recalled_messages=[long_message],
-            context_window=4096,
+            context_window=400,  # 小窗口迫使压缩
         )
         summary_items = [i for i in result.items if i.type == "summary"]
         if summary_items:
@@ -148,16 +169,28 @@ class TestSuffixBuilder:
 
     # ============ 混合消息测试 ============
 
-    def test_build_mixed_messages(self, builder, short_messages, long_message):
-        """混合消息: 短消息保留原文, 长消息生成 summary"""
+    def test_build_mixed_messages_budget_sufficient(self, builder, short_messages, long_message):
+        """v6.0: 预算充足时, 混合消息全部保留原文"""
         messages = short_messages + [long_message]
         result = builder.build(
             query="你好",
             recalled_messages=messages,
             context_window=4096,
         )
-        assert result.message_count >= 1
-        assert result.summary_count >= 1
+        # 所有消息都应保留为原文
+        assert result.message_count == 4
+        assert result.summary_count == 0
+
+    def test_build_mixed_messages_budget_tight(self, builder, short_messages, long_message):
+        """v6.0: 预算紧张时, 短消息保留原文, 长消息压缩"""
+        messages = short_messages + [long_message]
+        result = builder.build(
+            query="你好",
+            recalled_messages=messages,
+            context_window=400,  # 小窗口迫使长消息压缩
+        )
+        assert result.message_count >= 1  # 至少短消息保留
+        assert result.summary_count >= 1  # 长消息被压缩
 
     # ============ 预算限制测试 ============
 
@@ -215,7 +248,7 @@ class TestSuffixBuilder:
         result = builder.build(
             query="你好",
             recalled_messages=[long_message],
-            context_window=4096,
+            context_window=400,  # 小窗口迫使压缩
         )
         if result.summary_count > 0:
             assert "可信" in result.text or "SUMMARY" in result.text

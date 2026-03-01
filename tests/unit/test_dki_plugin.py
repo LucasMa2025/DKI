@@ -121,8 +121,18 @@ class MockUserDataAdapter(IUserDataAdapter):
         limit: int = 5,
         session_id=None,
     ) -> List[ChatMessage]:
-        # 简单的关键词匹配
-        all_messages = self._messages.get(session_id or user_id, [])
+        # v6.1: 支持跨会话检索
+        if session_id:
+            all_messages = self._messages.get(session_id, [])
+        else:
+            # 搜索用户的所有会话
+            all_messages = []
+            for sid, msgs in self._messages.items():
+                for msg in msgs:
+                    if getattr(msg, 'user_id', None) == user_id:
+                        all_messages.append(msg)
+        
+        # 简单的关键词匹配 (支持中文子串匹配)
         keywords = query.lower().split()
         
         relevant = []
