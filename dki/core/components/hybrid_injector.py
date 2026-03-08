@@ -419,9 +419,12 @@ Do NOT repeat or continue topics from the history unless the user explicitly ask
                         return_dict=True,
                     )
                     kv_cache = outputs.past_key_values
+                    # 兼容 Transformers 4.x/5.x: 通过 extract_kv_from_past 统一提取
+                    from dki.models.base import extract_kv_from_past
+                    kv_pairs = extract_kv_from_past(kv_cache)
                     # Detach and move to CPU to avoid GPU memory accumulation
                     cpu_kv_cache = tuple(
-                        (k.detach().cpu(), v.detach().cpu()) for k, v in kv_cache
+                        (k.detach().cpu(), v.detach().cpu()) for k, v in kv_pairs
                     )
                     del outputs, kv_cache
                     if torch.cuda.is_available():

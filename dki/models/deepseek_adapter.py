@@ -3,13 +3,18 @@ DeepSeek Model Adapter for DKI System
 HuggingFace Transformers-based adapter for DeepSeek models
 """
 
+import asyncio
 import time
-from typing import Any, Dict, List, Optional, Tuple
+import threading
+from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 import torch
 from loguru import logger
 
-from dki.models.base import BaseModelAdapter, ModelOutput, KVCacheEntry
+from dki.models.base import (
+    BaseModelAdapter, ModelOutput, KVCacheEntry,
+    extract_kv_from_past, build_dynamic_cache_from_entries,
+)
 
 
 class DeepSeekAdapter(BaseModelAdapter):
@@ -23,23 +28,44 @@ class DeepSeekAdapter(BaseModelAdapter):
         self,
         model_name: str = "deepseek-ai/deepseek-llm-7b-chat",
         device: str = "cuda",
-        torch_dtype: str = "float16",
+        dtype: str = "float16",
         trust_remote_code: bool = True,
+        quantization: str = "none",
+        quantization_config: dict = None,
         **kwargs
     ):
-        super().__init__(model_name, device, torch_dtype, **kwargs)
+        super().__init__(
+            model_name, device, dtype,
+            quantization=quantization,
+            quantization_config=quantization_config,
+            **kwargs
+        )
         
         self.trust_remote_code = trust_remote_code
     
     def load(self) -> None:
-        """Load DeepSeek model and tokenizer."""
+        """
+        Load DeepSeek model and tokenizer.
+        
+        支持量化模式:
+        - "none": 原始精度 (dtype)
+        - "4bit": 4-bit NF4 量化 (bitsandbytes)
+        - "8bit": 8-bit LLM.int8() 量化 (bitsandbytes)
+        - "gptq": GPTQ 预量化模型
+        - "awq": AWQ 预量化模型
+        """
         if self._is_loaded:
             return
         
         try:
+            # HuggingFace Hub 兼容性补丁 (huggingface_hub ≥0.25)
+            from dki.models.hf_compat import ensure_hf_compat
+            ensure_hf_compat()
+            
             from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
             
-            logger.info(f"Loading DeepSeek model: {self.model_name}")
+            quant_desc = f" (quantization={self.quantization})" if self.is_quantized else ""
+            logger.info(f"Loading DeepSeek model: {self.model_name}{quant_desc}")
             
             # Load tokenizer
             self.tokenizer = AutoTokenizer.from_pretrained(
@@ -50,14 +76,27 @@ class DeepSeekAdapter(BaseModelAdapter):
             if self.tokenizer.pad_token is None:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
             
-            # Load model with eager attention for output_attentions support
-            # SDPA attention does not support output_attentions=True
+            # Build model kwargs
+            model_kwargs = {
+                'device_map': 'auto',
+                'trust_remote_code': self.trust_remote_code,
+                'attn_implementation': 'eager',  # Required for output_attentions support
+            }
+            
+            # ============ 量化配置 ============
+            if self.quantization in ("4bit", "8bit"):
+                bnb_config = self._build_bnb_config()
+                model_kwargs['quantization_config'] = bnb_config
+                if self.is_4bit:
+                    model_kwargs['torch_dtype'] = self.dtype
+            elif self.quantization in ("gptq", "awq"):
+                model_kwargs['torch_dtype'] = self.dtype
+            else:
+                model_kwargs['torch_dtype'] = self.dtype
+            
             self.model = AutoModelForCausalLM.from_pretrained(
                 self.model_name,
-                torch_dtype=self.torch_dtype,
-                device_map="auto",
-                trust_remote_code=self.trust_remote_code,
-                attn_implementation="eager",  # Required for output_attentions support
+                **model_kwargs,
             )
             self.model.eval()
             
@@ -73,7 +112,10 @@ class DeepSeekAdapter(BaseModelAdapter):
             self.head_dim = self.hidden_dim // self.num_heads
             
             self._is_loaded = True
-            logger.info(f"DeepSeek adapter loaded: {self.model_name}")
+            logger.info(
+                f"DeepSeek adapter loaded: {self.model_name} "
+                f"(quantization={self.quantization})"
+            )
             
         except Exception as e:
             logger.error(f"Failed to load DeepSeek model: {e}")
@@ -120,7 +162,7 @@ class DeepSeekAdapter(BaseModelAdapter):
     def generate(
         self,
         prompt: str,
-        max_new_tokens: int = 512,
+        max_new_tokens: int = 2048,
         temperature: float = 0.7,
         top_p: float = 0.9,
         **kwargs
@@ -183,6 +225,128 @@ class DeepSeekAdapter(BaseModelAdapter):
             return True
         return False
     
+    # ================================================================
+    # 流式生成 (Streaming)
+    # ================================================================
+    
+    async def async_stream_generate(
+        self,
+        prompt: str,
+        max_new_tokens: int = 2048,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        **kwargs
+    ) -> AsyncIterator[str]:
+        """
+        Async streaming generation using HuggingFace TextIteratorStreamer.
+        
+        Yields:
+            str: decoded text chunks (token-by-token)
+        """
+        if not self._is_loaded:
+            self.load()
+        
+        from transformers import TextIteratorStreamer
+        
+        # Format prompt
+        if self._has_chat_template_tokens(prompt):
+            formatted_prompt = prompt
+        elif 'chat' in self.model_name.lower() or 'instruct' in self.model_name.lower():
+            formatted_prompt = self._format_prompt(prompt)
+        else:
+            formatted_prompt = prompt
+        
+        inputs = self.tokenize(formatted_prompt)
+        input_ids = inputs['input_ids']
+        
+        streamer = TextIteratorStreamer(
+            self.tokenizer,
+            skip_prompt=True,
+            skip_special_tokens=True,
+        )
+        
+        generation_kwargs = {
+            'input_ids': input_ids,
+            'attention_mask': inputs['attention_mask'],
+            'max_new_tokens': max_new_tokens,
+            'do_sample': True,
+            'temperature': temperature,
+            'top_p': top_p,
+            'pad_token_id': self.tokenizer.pad_token_id,
+            'streamer': streamer,
+        }
+        
+        thread = threading.Thread(
+            target=lambda: self.model.generate(**generation_kwargs),
+            daemon=True,
+        )
+        thread.start()
+        
+        for text_chunk in streamer:
+            if text_chunk:
+                yield text_chunk
+            await asyncio.sleep(0)
+        
+        thread.join(timeout=5)
+    
+    def stream_generate(
+        self,
+        prompt: str,
+        max_new_tokens: int = 2048,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        **kwargs
+    ):
+        """
+        Synchronous streaming generation using HuggingFace TextIteratorStreamer.
+        
+        Yields:
+            str: decoded text chunks (token-by-token)
+        """
+        if not self._is_loaded:
+            self.load()
+        
+        from transformers import TextIteratorStreamer
+        
+        if self._has_chat_template_tokens(prompt):
+            formatted_prompt = prompt
+        elif 'chat' in self.model_name.lower() or 'instruct' in self.model_name.lower():
+            formatted_prompt = self._format_prompt(prompt)
+        else:
+            formatted_prompt = prompt
+        
+        inputs = self.tokenize(formatted_prompt)
+        input_ids = inputs['input_ids']
+        
+        streamer = TextIteratorStreamer(
+            self.tokenizer,
+            skip_prompt=True,
+            skip_special_tokens=True,
+        )
+        
+        generation_kwargs = {
+            'input_ids': input_ids,
+            'attention_mask': inputs['attention_mask'],
+            'max_new_tokens': max_new_tokens,
+            'do_sample': True,
+            'temperature': temperature,
+            'top_p': top_p,
+            'pad_token_id': self.tokenizer.pad_token_id,
+            'streamer': streamer,
+        }
+        
+        thread = threading.Thread(
+            target=lambda: self.model.generate(**generation_kwargs),
+            daemon=True,
+        )
+        thread.start()
+        
+        for text_chunk in streamer:
+            if text_chunk:
+                yield text_chunk
+        
+        thread.join(timeout=5)
+    
     def embed(self, text: str) -> torch.Tensor:
         """Get embeddings for text."""
         if not self._is_loaded:
@@ -226,10 +390,12 @@ class DeepSeekAdapter(BaseModelAdapter):
             )
         
         # Extract K/V cache — detach and move to CPU to prevent GPU memory leak
+        # 兼容 Transformers 4.x / 5.x: 通过 extract_kv_from_past 统一提取
         kv_entries = []
         past_kv = outputs.past_key_values
         
-        for layer_idx, (key, value) in enumerate(past_kv):
+        kv_pairs = extract_kv_from_past(past_kv)
+        for layer_idx, (key, value) in enumerate(kv_pairs):
             entry = KVCacheEntry(
                 key=key.detach().cpu(),
                 value=value.detach().cpu(),
@@ -253,7 +419,7 @@ class DeepSeekAdapter(BaseModelAdapter):
         prompt: str,
         injected_kv: List[KVCacheEntry],
         alpha: float = 1.0,
-        max_new_tokens: int = 512,
+        max_new_tokens: int = 2048,
         **kwargs
     ) -> ModelOutput:
         """Generate with K/V injection."""
@@ -275,16 +441,12 @@ class DeepSeekAdapter(BaseModelAdapter):
         input_ids = inputs['input_ids']
         attention_mask = inputs['attention_mask']
         
-        # Scale K/V with alpha
-        scaled_kv = []
-        for entry in injected_kv:
-            scaled_value = entry.value * alpha if alpha < 1.0 else entry.value
-            scaled_kv.append((entry.key, scaled_value))
-        
-        past_kv = tuple(scaled_kv)
-        
-        # Extend attention mask
-        mem_len = injected_kv[0].key.shape[2] if injected_kv else 0
+        # Scale K/V with alpha, 构建 DynamicCache (兼容 Transformers 4.x/5.x)
+        past_kv, mem_len = build_dynamic_cache_from_entries(
+            entries=injected_kv,
+            device=input_ids.device,
+            alpha=alpha,
+        )
         if mem_len > 0:
             mem_mask = torch.ones(
                 (input_ids.shape[0], mem_len),
@@ -313,7 +475,7 @@ class DeepSeekAdapter(BaseModelAdapter):
         input_len = input_ids.shape[1]
         
         # Cleanup: free GPU memory from intermediate tensors
-        del past_kv, outputs, scaled_kv, input_ids, attention_mask
+        del past_kv, outputs, input_ids, attention_mask
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         

@@ -778,7 +778,7 @@ class TwoStageGenerator:
         original_query: str,
         session_id: str,
         user_id: Optional[str] = None,
-        max_new_tokens: int = 512,
+        max_new_tokens: int = 2048,
         temperature: float = 0.7,
         probe_tokens: int = 64,
         logprobs_k: int = 5,

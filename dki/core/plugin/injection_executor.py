@@ -286,7 +286,7 @@ class InjectionExecutor:
     
     用法:
         executor = InjectionExecutor(model_adapter=model)
-        result = await executor.execute(plan, max_new_tokens=512)
+        result = await executor.execute(plan, max_new_tokens=2048)
         
         # result.text 是生成结果
         # result.inference_latency_ms 是推理耗时
@@ -335,13 +335,41 @@ class InjectionExecutor:
         }
     
     # ================================================================
+    # 异步推理辅助方法
+    # ================================================================
+    # SGLang Engine.generate() 内部调用 self.loop.run_until_complete(),
+    # 在 uvicorn async 上下文中会触发 "event loop is already running".
+    # SGLangAdapter 提供了 async_generate() / async_forward_with_kv_injection()
+    # 来绕过此问题. 以下辅助方法自动检测并使用异步版本.
+    # vLLM 不受影响 (LLM.generate() 不使用 event loop).
+    # ================================================================
+    
+    async def _model_generate(self, **kwargs) -> ModelOutput:
+        """
+        调用 model.generate(), 自动使用异步版本 (如果可用).
+        SGLangAdapter 提供 async_generate(); VLLMAdapter 无需异步.
+        """
+        if hasattr(self.model, 'async_generate'):
+            return await self.model.async_generate(**kwargs)
+        return self.model.generate(**kwargs)
+    
+    async def _model_forward_with_kv_injection(self, **kwargs) -> ModelOutput:
+        """
+        调用 model.forward_with_kv_injection(), 自动使用异步版本 (如果可用).
+        SGLangAdapter 提供 async_forward_with_kv_injection(); VLLMAdapter 无需异步.
+        """
+        if hasattr(self.model, 'async_forward_with_kv_injection'):
+            return await self.model.async_forward_with_kv_injection(**kwargs)
+        return self.model.forward_with_kv_injection(**kwargs)
+    
+    # ================================================================
     # 主执行入口
     # ================================================================
     
     async def execute(
         self,
         plan: InjectionPlan,
-        max_new_tokens: int = 512,
+        max_new_tokens: int = 2048,
         temperature: float = 0.7,
         **kwargs,
     ) -> ExecutionResult:
@@ -530,7 +558,7 @@ class InjectionExecutor:
         history_messages: list,
         system_content: str,
         original_query: str,
-        max_new_tokens: int = 512,
+        max_new_tokens: int = 2048,
     ) -> list:
         """
         v5.7: 重新设计的历史消息修剪
@@ -782,10 +810,28 @@ class InjectionExecutor:
                     user_content=plan.final_input,
                 )
             
+            # ============ v7.3: 更新 final_input 以包含偏好详情 (可视化用) ============
+            # plan.final_input 原本只含 memory_metadata + assembled_suffix,
+            # 不含偏好详情. 但实际传给模型的 prompt_with_prefix 包含偏好
+            # (在 system message 中). 更新 final_input 以便可视化能看到完整信息.
+            if plan.preference_text and alpha > 0.1:
+                _pref_prefix = self._build_preference_prefix(
+                    plan.preference_text, alpha
+                )
+                if _pref_prefix and _pref_prefix not in plan.final_input:
+                    plan.final_input = _pref_prefix + plan.final_input
+            
+            logger.debug(
+                f"[prompt_prefix mode] prompt_len={len(prompt_with_prefix)}, "
+                f"has_preference={'yes' if plan.preference_text else 'no'}, "
+                f"alpha={alpha:.2f}, "
+                f"history_items={len(plan.history_items) if plan.history_items else 0}"
+            )
+            
             inference_start = time.time()
             
-            # vLLM 原生推理: prompt 已含 chat template, prefix_caching 自动复用 KV
-            output = self.model.forward_with_kv_injection(
+            # vLLM/SGLang 原生推理: prompt 已含 chat template, prefix_caching 自动复用 KV
+            output = await self._model_forward_with_kv_injection(
                 prompt=prompt_with_prefix,
                 injected_kv=[],           # 不使用
                 alpha=alpha,
@@ -799,6 +845,18 @@ class InjectionExecutor:
             result.input_tokens = output.input_tokens
             result.output_tokens = output.output_tokens
             result.raw_output = output
+            
+            logger.info(
+                f"[KV injection result] output_len={len(result.text) if result.text else 0}, "
+                f"input_tokens={result.input_tokens}, "
+                f"output_tokens={result.output_tokens}, "
+                f"latency={result.inference_latency_ms:.0f}ms"
+            )
+            if not result.text:
+                logger.warning(
+                    f"[KV injection] Empty output from model! "
+                    f"raw_output={repr(output)[:300]}"
+                )
             
             # F1-4: 防御性拦截
             result.text, fact_stripped = _strip_retrieve_fact_calls(result.text)
@@ -843,7 +901,7 @@ class InjectionExecutor:
                     user_id=plan.user_id,
                     kv_entries=preference_kv,
                 ):
-                    output = self.model.forward_with_kv_injection(
+                    output = await self._model_forward_with_kv_injection(
                         prompt=plan.final_input,
                         injected_kv=preference_kv,
                         alpha=alpha,
@@ -852,7 +910,7 @@ class InjectionExecutor:
                         **kwargs,
                     )
             else:
-                output = self.model.forward_with_kv_injection(
+                output = await self._model_forward_with_kv_injection(
                     prompt=plan.final_input,
                     injected_kv=preference_kv,
                     alpha=alpha,
@@ -862,7 +920,7 @@ class InjectionExecutor:
                 )
         else:
             # 无注入推理 (alpha 太低或无 K/V)
-            output = self.model.generate(
+            output = await self._model_generate(
                 prompt=plan.final_input,
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
@@ -901,7 +959,7 @@ class InjectionExecutor:
         result = ExecutionResult()
         
         inference_start = time.time()
-        output = self.model.generate(
+        output = await self._model_generate(
             prompt=plan.final_input,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
@@ -996,7 +1054,7 @@ class InjectionExecutor:
             
             inference_start = time.time()
             
-            output = self.model.forward_with_kv_injection(
+            output = await self._model_forward_with_kv_injection(
                 prompt=stable_prompt,
                 injected_kv=[],
                 alpha=alpha,
@@ -1042,7 +1100,7 @@ class InjectionExecutor:
                     user_id=plan.user_id,
                     kv_entries=preference_kv,
                 ):
-                    output = self.model.forward_with_kv_injection(
+                    output = await self._model_forward_with_kv_injection(
                         prompt=stable_input,
                         injected_kv=preference_kv,
                         alpha=alpha,
@@ -1051,7 +1109,7 @@ class InjectionExecutor:
                         **kwargs,
                     )
             else:
-                output = self.model.forward_with_kv_injection(
+                output = await self._model_forward_with_kv_injection(
                     prompt=stable_input,
                     injected_kv=preference_kv,
                     alpha=alpha,
@@ -1060,7 +1118,7 @@ class InjectionExecutor:
                     **kwargs,
                 )
         else:
-            output = self.model.generate(
+            output = await self._model_generate(
                 prompt=stable_input,
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
@@ -1106,7 +1164,7 @@ class InjectionExecutor:
         
         try:
             inference_start = time.time()
-            output = self.model.generate(
+            output = await self._model_generate(
                 prompt=plan.original_query,
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,

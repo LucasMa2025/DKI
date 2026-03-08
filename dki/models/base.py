@@ -7,8 +7,9 @@ Supports FlashAttention-3/2 integration for optimized K/V injection
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple, Union, TYPE_CHECKING
+from typing import Any, AsyncIterator, Dict, List, Optional, Tuple, Union, TYPE_CHECKING
 
+import asyncio
 import torch
 import numpy as np
 from loguru import logger
@@ -262,6 +263,125 @@ class PackedKV:
         )
 
 
+def extract_kv_from_past(past_key_values) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+    """
+    从 model.forward() 返回的 past_key_values 中提取 (key, value) 对列表。
+    
+    兼容 Transformers 4.x 和 5.x:
+    - Transformers < 4.45: past_key_values 是 tuple of (key, value) per layer
+    - Transformers 4.45-4.x: DynamicCache 支持 __getitem__ 返回 (key, value) 元组
+    - Transformers 5.x: DynamicCache 使用 DynamicLayer 结构:
+      - 5.x 某些版本仍支持 __getitem__ / 迭代 (返回 tuple)
+      - 5.x 某些版本移除了 __getitem__, 需通过 layers[i].keys/.values 访问
+      - 也可能有 key_cache / value_cache 列表属性
+    
+    Args:
+        past_key_values: model forward 返回的 past_key_values
+        
+    Returns:
+        List[(key_tensor, value_tensor)] — 每层一个元组
+    """
+    # 尝试导入 DynamicCache (可能不可用)
+    try:
+        from transformers import DynamicCache
+        _is_dynamic_cache = isinstance(past_key_values, DynamicCache)
+    except ImportError:
+        _is_dynamic_cache = False
+    
+    if _is_dynamic_cache:
+        # 策略 1: key_cache / value_cache 列表属性 (某些 5.x 版本)
+        if hasattr(past_key_values, 'key_cache') and hasattr(past_key_values, 'value_cache'):
+            kc = past_key_values.key_cache
+            vc = past_key_values.value_cache
+            if isinstance(kc, (list, tuple)) and len(kc) > 0:
+                return [(kc[i], vc[i]) for i in range(len(kc))]
+        
+        # 策略 2: layers[i].keys / .values (Transformers 5.x DynamicLayer)
+        if hasattr(past_key_values, 'layers'):
+            layers = past_key_values.layers
+            if layers and hasattr(layers[0], 'keys') and hasattr(layers[0], 'values'):
+                return [(layer.keys, layer.values) for layer in layers]
+        
+        # 策略 3: __getitem__ (Transformers 4.45+ 和部分 5.x)
+        try:
+            num_layers = len(past_key_values)
+            result = past_key_values[0]
+            if isinstance(result, tuple) and len(result) >= 2:
+                return [past_key_values[i] for i in range(num_layers)]
+        except (TypeError, IndexError):
+            pass
+        
+        # 策略 4: 迭代
+        try:
+            return list(past_key_values)
+        except TypeError:
+            pass
+        
+        # 策略 5: to_legacy_cache() 方法
+        if hasattr(past_key_values, 'to_legacy_cache'):
+            legacy = past_key_values.to_legacy_cache()
+            return list(legacy)
+        
+        raise TypeError(
+            f"Cannot extract KV from DynamicCache: no known access method works. "
+            f"Attributes: {[a for a in dir(past_key_values) if not a.startswith('_')]}"
+        )
+    
+    # Legacy tuple format (Transformers < 4.45)
+    return list(past_key_values)
+
+
+def build_dynamic_cache_from_entries(
+    entries: List[KVCacheEntry],
+    device: torch.device,
+    alpha: float = 1.0,
+) -> Tuple[Any, int]:
+    """
+    从 KVCacheEntry 列表构建 DynamicCache (或 legacy tuple) 用于注入。
+    
+    兼容 Transformers 4.x 和 5.x:
+    - Transformers >= 4.45: 返回 DynamicCache 实例
+    - Transformers < 4.45: 返回 tuple of (key, value) per layer
+    
+    Value 会按 alpha 缩放 (Key 不缩放, 保护 attention addressing)。
+    
+    Args:
+        entries: KVCacheEntry 列表 (每层一个, 通常在 CPU 上)
+        device: 目标设备 (通常是 GPU)
+        alpha: Value 缩放因子 [0, 1]
+        
+    Returns:
+        (past_kv, mem_len):
+        - past_kv: DynamicCache 或 tuple, 可直接传给 model.generate()
+        - mem_len: 偏好 token 数
+    """
+    if not entries:
+        return None, 0
+    
+    mem_len = entries[0].key.shape[2]
+    
+    try:
+        from transformers import DynamicCache
+        cache = DynamicCache()
+        for entry in entries:
+            key = entry.key.to(device)
+            value = entry.value.to(device)
+            if alpha < 1.0:
+                value = value * alpha
+            cache.update(key, value, entry.layer_idx)
+        return cache, mem_len
+    except ImportError:
+        # Legacy tuple format
+        scaled_kv = []
+        for entry in entries:
+            key = entry.key.to(device)
+            value = entry.value.to(device)
+            if alpha < 1.0:
+                value = value * alpha
+            scaled_kv.append((key, value))
+        return tuple(scaled_kv), mem_len
+
+
 class BaseModelAdapter(ABC):
     """
     Abstract base class for model adapters.
@@ -271,19 +391,32 @@ class BaseModelAdapter(ABC):
     Supports FlashAttention-3/2 integration for optimized K/V injection.
     """
     
+    # 支持的量化模式
+    SUPPORTED_QUANTIZATIONS = ("none", "4bit", "int4", "8bit", "int8", "gptq", "awq", "fp8")
+    
     def __init__(
         self,
         model_name: str,
         device: str = "cuda",
-        torch_dtype: str = "float16",
+        dtype: str = "float16",
+        quantization: str = "none",
+        quantization_config: Optional[Dict[str, Any]] = None,
+        # 向后兼容: 接受旧参数名 torch_dtype
+        torch_dtype: Optional[str] = None,
         **kwargs
     ):
         self.model_name = model_name
         self.device = device
-        self.torch_dtype = getattr(torch, torch_dtype, torch.float16)
+        # 向后兼容: torch_dtype 优先 (旧代码可能传入), 否则使用 dtype
+        _dtype_str = torch_dtype if torch_dtype is not None else dtype
+        self.dtype = getattr(torch, _dtype_str, torch.float16)
         self.model = None
         self.tokenizer = None
         self._is_loaded = False
+        
+        # ============ 量化配置 ============
+        self.quantization = self._normalize_quantization(quantization)
+        self.quantization_config = quantization_config or {}
         
         # Model architecture info
         self.hidden_dim: int = 0
@@ -296,7 +429,8 @@ class BaseModelAdapter(ABC):
         self._flash_attn_backend: Optional[str] = None
         self._kv_injection_optimizer: Optional["KVInjectionOptimizer"] = None
         
-        logger.info(f"Initializing {self.__class__.__name__} with {model_name}")
+        quant_info = f", quantization={self.quantization}" if self.quantization != "none" else ""
+        logger.info(f"Initializing {self.__class__.__name__} with {model_name}{quant_info}")
     
     @abstractmethod
     def load(self) -> None:
@@ -307,7 +441,7 @@ class BaseModelAdapter(ABC):
     def generate(
         self,
         prompt: str,
-        max_new_tokens: int = 512,
+        max_new_tokens: int = 2048,
         temperature: float = 0.7,
         top_p: float = 0.9,
         **kwargs
@@ -344,7 +478,7 @@ class BaseModelAdapter(ABC):
         prompt: str,
         injected_kv: List[KVCacheEntry],
         alpha: float = 1.0,
-        max_new_tokens: int = 512,
+        max_new_tokens: int = 2048,
         **kwargs
     ) -> ModelOutput:
         """
@@ -374,6 +508,91 @@ class BaseModelAdapter(ABC):
             Entropy value
         """
         pass
+    
+    # ================================================================
+    # 异步与流式生成 (默认实现, 子类可覆盖)
+    # ================================================================
+    
+    async def async_generate(
+        self,
+        prompt: str,
+        max_new_tokens: int = 2048,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        **kwargs
+    ) -> ModelOutput:
+        """
+        Async version of generate().
+        
+        Default implementation: runs synchronous generate() in a thread pool
+        to avoid blocking the event loop. Subclasses (e.g. SGLangAdapter)
+        can override with native async implementations.
+        """
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self.generate(
+                prompt=prompt,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                **kwargs,
+            ),
+        )
+    
+    async def async_stream_generate(
+        self,
+        prompt: str,
+        max_new_tokens: int = 2048,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        **kwargs
+    ) -> AsyncIterator[str]:
+        """
+        Async streaming generation — yields text chunks as they are produced.
+        
+        Default implementation: falls back to async_generate() and yields
+        the full text as a single chunk. Subclasses should override this
+        with true token-by-token streaming when the engine supports it.
+        
+        Yields:
+            str: text chunks (tokens or groups of tokens)
+        """
+        output = await self.async_generate(
+            prompt=prompt,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            **kwargs,
+        )
+        yield output.text
+    
+    def stream_generate(
+        self,
+        prompt: str,
+        max_new_tokens: int = 2048,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        **kwargs
+    ):
+        """
+        Synchronous streaming generation — yields text chunks.
+        
+        Default implementation: falls back to generate() and yields
+        the full text as a single chunk. Subclasses should override this
+        with true token-by-token streaming when the engine supports it.
+        
+        Yields:
+            str: text chunks
+        """
+        output = self.generate(
+            prompt=prompt,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            **kwargs,
+        )
+        yield output.text
     
     def tokenize(self, text: str) -> Dict[str, torch.Tensor]:
         """Tokenize text."""
@@ -415,12 +634,137 @@ class BaseModelAdapter(ABC):
         self._is_loaded = False
         logger.info(f"Unloaded {self.model_name}")
     
+    # ============ 量化支持 ============
+    
+    @classmethod
+    def _normalize_quantization(cls, quantization: str) -> str:
+        """
+        规范化量化模式名称.
+        
+        将各种别名统一为标准名称:
+        - "int4" → "4bit"
+        - "int8" → "8bit"
+        - "none" / "" / None → "none"
+        
+        Args:
+            quantization: 量化模式字符串
+            
+        Returns:
+            规范化后的量化模式
+        """
+        if not quantization or quantization.lower() in ("none", ""):
+            return "none"
+        
+        normalized = quantization.lower().strip()
+        
+        # 别名映射
+        alias_map = {
+            "int4": "4bit",
+            "int8": "8bit",
+            "4": "4bit",
+            "8": "8bit",
+            "float8": "fp8",
+            "e4m3": "fp8",
+            "fp8_e4m3fn": "fp8",
+        }
+        normalized = alias_map.get(normalized, normalized)
+        
+        if normalized not in cls.SUPPORTED_QUANTIZATIONS:
+            logger.warning(
+                f"Unknown quantization mode '{quantization}', "
+                f"supported: {cls.SUPPORTED_QUANTIZATIONS}. Falling back to 'none'."
+            )
+            return "none"
+        
+        return normalized
+    
+    @property
+    def is_quantized(self) -> bool:
+        """是否启用了量化."""
+        return self.quantization != "none"
+    
+    @property
+    def is_4bit(self) -> bool:
+        """是否使用 4-bit 量化."""
+        return self.quantization == "4bit"
+    
+    @property
+    def is_8bit(self) -> bool:
+        """是否使用 8-bit 量化."""
+        return self.quantization == "8bit"
+    
+    @property
+    def is_fp8(self) -> bool:
+        """是否使用 FP8 量化."""
+        return self.quantization == "fp8"
+    
+    def _build_bnb_config(self) -> Optional[Any]:
+        """
+        构建 BitsAndBytesConfig (4bit/8bit 量化).
+        
+        仅在 quantization 为 "4bit" 或 "8bit" 时有效。
+        GPTQ/AWQ 不使用 BitsAndBytesConfig, 由 AutoModelForCausalLM 自动检测。
+        
+        Returns:
+            BitsAndBytesConfig 实例, 或 None (非 bitsandbytes 量化)
+            
+        Raises:
+            ImportError: bitsandbytes 未安装
+        """
+        if self.quantization not in ("4bit", "8bit"):
+            return None
+        
+        try:
+            from transformers import BitsAndBytesConfig
+        except ImportError:
+            raise ImportError(
+                "BitsAndBytesConfig requires 'bitsandbytes' package. "
+                "Install with: pip install bitsandbytes>=0.41.0"
+            )
+        
+        if self.quantization == "4bit":
+            # 4-bit NF4 量化 (QLoRA 论文推荐)
+            compute_dtype_str = self.quantization_config.get(
+                "bnb_4bit_compute_dtype", "bfloat16"
+            )
+            compute_dtype = getattr(torch, compute_dtype_str, torch.bfloat16)
+            
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type=self.quantization_config.get(
+                    "bnb_4bit_quant_type", "nf4"
+                ),
+                bnb_4bit_use_double_quant=self.quantization_config.get(
+                    "bnb_4bit_use_double_quant", True
+                ),
+                bnb_4bit_compute_dtype=compute_dtype,
+            )
+            logger.info(
+                f"4-bit quantization config: "
+                f"quant_type={bnb_config.bnb_4bit_quant_type}, "
+                f"double_quant={bnb_config.bnb_4bit_use_double_quant}, "
+                f"compute_dtype={compute_dtype}"
+            )
+            return bnb_config
+        
+        elif self.quantization == "8bit":
+            # 8-bit LLM.int8() 量化
+            bnb_config = BitsAndBytesConfig(
+                load_in_8bit=True,
+            )
+            logger.info("8-bit quantization config: LLM.int8()")
+            return bnb_config
+        
+        return None
+    
     def get_model_info(self) -> Dict[str, Any]:
         """Get model architecture information."""
         return {
             'model_name': self.model_name,
             'device': self.device,
-            'dtype': str(self.torch_dtype),
+            'dtype': str(self.dtype),
+            'quantization': self.quantization,
+            'is_quantized': self.is_quantized,
             'hidden_dim': self.hidden_dim,
             'num_layers': self.num_layers,
             'num_heads': self.num_heads,

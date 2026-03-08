@@ -177,8 +177,120 @@ class TableMapping:
 
 
 @dataclass
+class VectorIndexCoreConfig:
+    """向量索引核心配置"""
+    index_type: str = "HNSW"           # HNSW | FLAT | IVF
+    dimension: int = 768               # 向量维度
+    vector_data_type: str = "float32"  # float32 | float16
+    similarity_metric: str = "cosine"  # cosine | l2 | ip (inner product)
+
+
+@dataclass
+class VectorIndexEmbeddingConfig:
+    """向量索引 Embedding 配置"""
+    api_type: str = "local"            # openai | local | aliyun | pinecone | custom
+    model_name: str = "all-MiniLM-L6-v2"
+    api_endpoint: Optional[str] = None  # 远程 API 地址
+    api_key: Optional[str] = None       # API 密钥 (本地模型填 "local")
+    normalization: bool = True          # 是否归一化向量
+
+
+@dataclass
+class VectorIndexRetrievalConfig:
+    """向量索引检索配置"""
+    top_k: int = 10
+    index_file_path: Optional[str] = None  # 本地索引文件路径
+
+
+@dataclass
+class VectorIndexMetadataConfig:
+    """向量索引元数据配置"""
+    id_mapping_table: str = "vector_id_mapping"
+    primary_key: str = "vector_id"
+
+
+@dataclass
+class VectorIndexConfig:
+    """
+    完整的向量索引配置
+    
+    当外部消息系统提供此配置时，DKI 启用语义检索 (BM25 + Embedding)。
+    未提供此配置时，DKI 仅使用 BM25 召回。
+    
+    配置示例:
+    ```yaml
+    vector_index_config:
+      core:
+        index_type: HNSW
+        dimension: 768
+        vector_data_type: float32
+        similarity_metric: cosine
+      embedding:
+        api_type: openai
+        model_name: text-embedding-ada-002
+        api_endpoint: https://api.openai.com/v1/embeddings
+        api_key: your-api-key
+        normalization: true
+      retrieval:
+        top_k: 10
+        index_file_path: ./vector_index.index
+      metadata:
+        id_mapping_table: vector_id_mapping
+        primary_key: vector_id
+    ```
+    """
+    core: VectorIndexCoreConfig = field(default_factory=VectorIndexCoreConfig)
+    embedding: VectorIndexEmbeddingConfig = field(default_factory=VectorIndexEmbeddingConfig)
+    retrieval: VectorIndexRetrievalConfig = field(default_factory=VectorIndexRetrievalConfig)
+    metadata: VectorIndexMetadataConfig = field(default_factory=VectorIndexMetadataConfig)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "VectorIndexConfig":
+        """从字典创建配置"""
+        config = cls()
+        if "core" in data:
+            c = data["core"]
+            config.core = VectorIndexCoreConfig(
+                index_type=c.get("index_type", "HNSW"),
+                dimension=c.get("dimension", 768),
+                vector_data_type=c.get("vector_data_type", "float32"),
+                similarity_metric=c.get("similarity_metric", "cosine"),
+            )
+        if "embedding" in data:
+            e = data["embedding"]
+            config.embedding = VectorIndexEmbeddingConfig(
+                api_type=e.get("api_type", "local"),
+                model_name=e.get("model_name", "all-MiniLM-L6-v2"),
+                api_endpoint=e.get("api_endpoint"),
+                api_key=e.get("api_key"),
+                normalization=e.get("normalization", True),
+            )
+        if "retrieval" in data:
+            r = data["retrieval"]
+            config.retrieval = VectorIndexRetrievalConfig(
+                top_k=r.get("top_k", 10),
+                index_file_path=r.get("index_file_path"),
+            )
+        if "metadata" in data:
+            m = data["metadata"]
+            config.metadata = VectorIndexMetadataConfig(
+                id_mapping_table=m.get("id_mapping_table", "vector_id_mapping"),
+                primary_key=m.get("primary_key", "vector_id"),
+            )
+        return config
+
+
+@dataclass
 class VectorSearchConfig:
-    """向量检索配置"""
+    """
+    向量检索配置
+    
+    核心逻辑:
+    - 如果提供了 vector_index_config → 启用语义检索 (BM25 + Embedding)
+    - 如果未提供 vector_index_config → 仅使用 BM25 召回
+    - type 字段控制已有预计算向量的检索方式 (pgvector/faiss)
+    - type=dynamic + vector_index_config → DKI 内部做 BM25 + Embedding
+    """
     enabled: bool = True
     type: VectorSearchType = VectorSearchType.DYNAMIC
     
@@ -195,6 +307,31 @@ class VectorSearchConfig:
     # 检索参数
     top_k: int = 10
     similarity_threshold: float = 0.5
+    
+    # ============ v7.0: 向量索引配置 (核心新增) ============
+    # 外部消息系统提供此配置时才启用语义检索
+    # 未提供时仅使用 BM25 召回
+    vector_index_config: Optional[VectorIndexConfig] = None
+    
+    @property
+    def has_vector_capability(self) -> bool:
+        """
+        判断是否具备向量检索能力
+        
+        条件:
+        1. vector_search.enabled = True
+        2. 提供了 vector_index_config (含 embedding 配置)
+        3. 或 type=pgvector 且有 embedding_field (上层 DB 已有预计算向量)
+        """
+        if not self.enabled:
+            return False
+        # 情况 1: 有完整的 vector_index_config
+        if self.vector_index_config is not None:
+            return True
+        # 情况 2: pgvector 模式且有 embedding_field (上层已有预计算向量)
+        if self.type == VectorSearchType.PGVECTOR and self.embedding_field:
+            return True
+        return False
 
 
 @dataclass
@@ -357,6 +494,12 @@ class ConfigDrivenAdapterConfig:
         # 向量检索配置
         if "vector_search" in data:
             vs_data = data["vector_search"]
+            
+            # v7.0: 解析 vector_index_config
+            vic = None
+            if "vector_index_config" in vs_data:
+                vic = VectorIndexConfig.from_dict(vs_data["vector_index_config"])
+            
             config.vector_search = VectorSearchConfig(
                 enabled=vs_data.get("enabled", True),
                 type=VectorSearchType(vs_data.get("type", "dynamic")),
@@ -368,6 +511,7 @@ class ConfigDrivenAdapterConfig:
                 embedding_api_key=vs_data.get("dynamic", {}).get("api_key"),
                 top_k=vs_data.get("top_k", 10),
                 similarity_threshold=vs_data.get("similarity_threshold", 0.5),
+                vector_index_config=vic,
             )
         
         # 缓存配置
@@ -458,6 +602,7 @@ class ConfigDrivenAdapter(IUserDataAdapter):
         # 动态向量处理器
         self._vector_handler = None
         self._embedding_service = None
+        self._bm25_only_mode = False  # v7.0: 无 vector_index_config 时降级为 BM25-only
         
         # 缓存
         self._cache: Dict[str, Any] = {}
@@ -575,66 +720,339 @@ class ConfigDrivenAdapter(IUserDataAdapter):
         except Exception as e:
             logger.warning(f"Failed to reflect table {table_name}: {e}")
     
+    def _build_active_session_join(
+        self,
+        msg_table: "Table",
+        mapping: "TableMapping",
+    ):
+        """
+        构建 JOIN sessions 表 + is_active 过滤的条件。
+        
+        当 sessions 表已配置且已反射时，返回 (join_clause, filter_condition)；
+        否则返回 (None, None)，调用方无需添加任何额外条件。
+        
+        设计原则: 软删除会话后，所有消息检索路径都应排除已删除会话的消息。
+        这是一个通用辅助方法，供 _get_user_messages / _search_with_keywords /
+        _search_with_pgvector / get_session_history 共用。
+        """
+        if (
+            not self.adapter_config.sessions
+            or "sessions" not in self._tables
+        ):
+            return None, None
+        
+        sess_table = self._tables["sessions"]
+        sess_mapping = self.adapter_config.sessions
+        
+        # 消息表的 session_id 字段
+        msg_session_id_field = self._get_field(mapping, "session_id")
+        # 会话表的 session_id 字段 (主键)
+        sess_id_field = self._get_field(sess_mapping, "session_id")
+        
+        if msg_session_id_field not in msg_table.c or sess_id_field not in sess_table.c:
+            logger.debug(
+                f"Cannot build session join: "
+                f"msg.{msg_session_id_field} or sess.{sess_id_field} not found"
+            )
+            return None, None
+        
+        # JOIN 条件
+        join_clause = msg_table.c[msg_session_id_field] == sess_table.c[sess_id_field]
+        
+        # is_active 过滤 — 优先使用 sessions mapping 的 filters 配置,
+        # 否则默认检查 is_active 字段
+        active_filter = None
+        if "is_active" in sess_table.c:
+            active_filter = sess_table.c["is_active"] == True
+        
+        return join_clause, active_filter
+    
     async def _init_vector_handler(self) -> None:
-        """初始化向量处理器"""
+        """
+        初始化向量处理器
+        
+        v7.0 核心逻辑:
+        - 有 vector_index_config → 创建真实 EmbeddingService + NonVectorizedDataHandler
+        - 无 vector_index_config 且 type=PGVECTOR + embedding_field → 仅创建 EmbeddingService (query embedding)
+        - 无 vector_index_config 且 type=DYNAMIC → 仅 BM25 (不创建向量处理器)
+        - 无 vector_index_config 且 type=NONE → 纯关键词
+        """
         vs_config = self.adapter_config.vector_search
         
         if not vs_config.enabled:
+            logger.info("Vector search disabled, using keyword-only retrieval")
             return
         
+        # ============ v7.0: 基于 vector_index_config 判断是否启用语义检索 ============
+        if not vs_config.has_vector_capability:
+            logger.info(
+                "No vector_index_config provided and no pgvector embedding_field, "
+                "falling back to BM25-only retrieval"
+            )
+            # 仍然创建 BM25-only handler (不需要 embedding_service)
+            if vs_config.type == VectorSearchType.DYNAMIC:
+                self._bm25_only_mode = True
+                logger.info("BM25-only mode enabled for DYNAMIC type (no vector_index_config)")
+            return
+        
+        # ============ 有向量能力: 创建 EmbeddingService ============
+        self._embedding_service = await self._create_embedding_service()
+        
+        if not self._embedding_service:
+            logger.warning("Failed to create embedding service, falling back to BM25-only")
+            self._bm25_only_mode = True
+            return
+        
+        # ============ DYNAMIC 模式: 创建 NonVectorizedDataHandler ============
         if vs_config.type == VectorSearchType.DYNAMIC:
-            # 使用动态向量处理
             from dki.cache.non_vectorized_handler import (
                 NonVectorizedDataHandler,
                 HandlerConfig,
                 SearchStrategy,
             )
             
-            # 创建 embedding 服务
-            self._embedding_service = await self._create_embedding_service()
-            
-            if self._embedding_service:
-                handler_config = HandlerConfig(
-                    default_strategy=SearchStrategy(vs_config.dynamic_strategy),
-                    cache_embeddings=True,
-                )
-                self._vector_handler = NonVectorizedDataHandler(
-                    embedding_service=self._embedding_service,
-                    config=handler_config,
-                )
-                logger.info(f"Dynamic vector handler initialized (strategy={vs_config.dynamic_strategy})")
+            handler_config = HandlerConfig(
+                default_strategy=SearchStrategy(vs_config.dynamic_strategy),
+                cache_embeddings=True,
+            )
+            self._vector_handler = NonVectorizedDataHandler(
+                embedding_service=self._embedding_service,
+                config=handler_config,
+            )
+            logger.info(
+                f"Dynamic vector handler initialized "
+                f"(strategy={vs_config.dynamic_strategy}, "
+                f"dim={vs_config.vector_index_config.core.dimension if vs_config.vector_index_config else vs_config.embedding_dim})"
+            )
+        elif vs_config.type == VectorSearchType.PGVECTOR:
+            logger.info(
+                f"PGVECTOR mode: using pre-computed embeddings from DB "
+                f"(field={vs_config.embedding_field}, dim={vs_config.embedding_dim})"
+            )
     
     async def _create_embedding_service(self):
-        """创建 embedding 服务"""
-        vs_config = self.adapter_config.vector_search
+        """
+        v7.0: 基于 vector_index_config 创建真实 Embedding 服务
         
-        # 简单的 embedding 服务封装
-        class EmbeddingService:
-            def __init__(self, model: str, api_url: Optional[str], api_key: Optional[str]):
+        路由逻辑:
+        1. vector_index_config.embedding.api_type == "local" → LocalEmbeddingService
+        2. vector_index_config.embedding.api_type == "openai"/"aliyun"/... → RemoteEmbeddingService
+        3. 回退: 使用旧的 embedding_model + embedding_api_url 配置
+        """
+        vs_config = self.adapter_config.vector_search
+        vic = vs_config.vector_index_config
+        
+        # ============ 优先使用 vector_index_config ============
+        if vic:
+            emb_cfg = vic.embedding
+            dimension = vic.core.dimension
+            normalize = emb_cfg.normalization
+            
+            if emb_cfg.api_type == "local" or (emb_cfg.api_key and emb_cfg.api_key.lower() == "local"):
+                # 本地模型
+                return self._create_local_embedding_service(
+                    model_name=emb_cfg.model_name,
+                    dimension=dimension,
+                    normalize=normalize,
+                )
+            else:
+                # 远程 API (openai / aliyun / pinecone / custom)
+                return self._create_remote_embedding_service(
+                    api_type=emb_cfg.api_type,
+                    model_name=emb_cfg.model_name,
+                    api_endpoint=emb_cfg.api_endpoint,
+                    api_key=emb_cfg.api_key,
+                    dimension=dimension,
+                    normalize=normalize,
+                )
+        
+        # ============ 回退: 使用旧配置 (向后兼容) ============
+        if vs_config.embedding_api_url or vs_config.embedding_api_key:
+            return self._create_remote_embedding_service(
+                api_type="openai",
+                model_name=vs_config.embedding_model,
+                api_endpoint=vs_config.embedding_api_url,
+                api_key=vs_config.embedding_api_key,
+                dimension=vs_config.embedding_dim,
+                normalize=True,
+            )
+        
+        # 本地模型回退
+        return self._create_local_embedding_service(
+            model_name=vs_config.embedding_model,
+            dimension=vs_config.embedding_dim,
+            normalize=True,
+        )
+    
+    def _create_remote_embedding_service(
+        self,
+        api_type: str,
+        model_name: str,
+        api_endpoint: Optional[str],
+        api_key: Optional[str],
+        dimension: int,
+        normalize: bool,
+    ):
+        """创建远程 Embedding 服务"""
+        
+        class RemoteEmbeddingService:
+            """
+            调用远程 Embedding API
+            
+            支持 OpenAI 兼容格式的 API (OpenAI / Azure / 阿里云 / 自建服务)
+            """
+            
+            def __init__(self, api_type: str, model: str, api_url: str,
+                         api_key: str, dim: int, normalize: bool):
+                self.api_type = api_type
                 self.model = model
-                self.api_url = api_url or "https://api.openai.com/v1"
+                self.api_url = api_url
                 self.api_key = api_key
+                self.dim = dim
+                self.normalize = normalize
             
             def embed(self, text: str) -> List[float]:
                 """计算单个文本的 embedding"""
-                # 这里应该调用实际的 embedding API
-                # 为了演示，返回模拟向量
-                import hashlib
-                import random
+                import httpx
                 
-                # 基于文本哈希生成伪随机向量 (仅用于演示)
-                seed = int(hashlib.md5(text.encode()).hexdigest()[:8], 16)
-                random.seed(seed)
-                return [random.gauss(0, 1) for _ in range(1536)]
+                headers = {}
+                if self.api_key:
+                    headers["Authorization"] = f"Bearer {self.api_key}"
+                headers["Content-Type"] = "application/json"
+                
+                try:
+                    resp = httpx.post(
+                        self.api_url,
+                        headers=headers,
+                        json={"input": text, "model": self.model},
+                        timeout=30.0,
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                    
+                    # OpenAI 兼容格式: {"data": [{"embedding": [...]}]}
+                    embedding = data["data"][0]["embedding"]
+                    
+                    if self.normalize:
+                        embedding = self._normalize_vector(embedding)
+                    
+                    return embedding
+                except Exception as e:
+                    logger.error(f"Remote embedding failed: {e}")
+                    raise
             
             def embed_batch(self, texts: List[str]) -> List[List[float]]:
                 """批量计算 embedding"""
-                return [self.embed(t) for t in texts]
+                import httpx
+                
+                headers = {}
+                if self.api_key:
+                    headers["Authorization"] = f"Bearer {self.api_key}"
+                headers["Content-Type"] = "application/json"
+                
+                try:
+                    resp = httpx.post(
+                        self.api_url,
+                        headers=headers,
+                        json={"input": texts, "model": self.model},
+                        timeout=60.0,
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                    
+                    embeddings = [d["embedding"] for d in data["data"]]
+                    
+                    if self.normalize:
+                        embeddings = [self._normalize_vector(e) for e in embeddings]
+                    
+                    return embeddings
+                except Exception as e:
+                    logger.error(f"Remote batch embedding failed: {e}")
+                    raise
+            
+            @staticmethod
+            def _normalize_vector(vec: List[float]) -> List[float]:
+                import math
+                norm = math.sqrt(sum(x * x for x in vec))
+                if norm == 0:
+                    return vec
+                return [x / norm for x in vec]
         
-        return EmbeddingService(
-            model=vs_config.embedding_model,
-            api_url=vs_config.embedding_api_url,
-            api_key=vs_config.embedding_api_key,
+        # 默认 API endpoint
+        default_endpoints = {
+            "openai": "https://api.openai.com/v1/embeddings",
+            "aliyun": "https://dashscope.aliyuncs.com/api/v1/services/embeddings/text-embedding/text-embedding",
+        }
+        url = api_endpoint or default_endpoints.get(api_type, "https://api.openai.com/v1/embeddings")
+        
+        logger.info(f"Creating RemoteEmbeddingService (api_type={api_type}, model={model_name}, dim={dimension})")
+        
+        return RemoteEmbeddingService(
+            api_type=api_type,
+            model=model_name,
+            api_url=url,
+            api_key=api_key or "",
+            dim=dimension,
+            normalize=normalize,
+        )
+    
+    def _create_local_embedding_service(
+        self,
+        model_name: str,
+        dimension: int,
+        normalize: bool,
+    ):
+        """创建本地 Embedding 服务 (sentence-transformers)"""
+        
+        class LocalEmbeddingService:
+            """
+            使用本地 sentence-transformers 模型
+            
+            DKI 自行加载模型，不依赖上层应用
+            """
+            
+            def __init__(self, model_name: str, dim: int, normalize: bool):
+                self.model_name = model_name
+                self.dim = dim
+                self.normalize = normalize
+                self._model = None
+            
+            def _ensure_model(self):
+                """延迟加载模型"""
+                if self._model is None:
+                    try:
+                        from sentence_transformers import SentenceTransformer
+                        self._model = SentenceTransformer(self.model_name)
+                        logger.info(f"Loaded local embedding model: {self.model_name}")
+                    except ImportError:
+                        logger.error(
+                            "sentence-transformers not installed. "
+                            "Install with: pip install sentence-transformers"
+                        )
+                        raise
+            
+            def embed(self, text: str) -> List[float]:
+                """计算单个文本的 embedding"""
+                self._ensure_model()
+                embedding = self._model.encode(
+                    text, normalize_embeddings=self.normalize
+                )
+                return embedding.tolist()
+            
+            def embed_batch(self, texts: List[str]) -> List[List[float]]:
+                """批量计算 embedding"""
+                self._ensure_model()
+                embeddings = self._model.encode(
+                    texts, normalize_embeddings=self.normalize
+                )
+                return embeddings.tolist()
+        
+        logger.info(f"Creating LocalEmbeddingService (model={model_name}, dim={dimension})")
+        
+        return LocalEmbeddingService(
+            model_name=model_name,
+            dim=dimension,
+            normalize=normalize,
         )
     
     def _get_field(self, mapping: TableMapping, target_field: str) -> str:
@@ -729,7 +1147,7 @@ class ConfigDrivenAdapter(IUserDataAdapter):
         before: Optional[datetime] = None,
         after: Optional[datetime] = None,
     ) -> List[ChatMessage]:
-        """获取会话历史"""
+        """获取会话历史 (过滤已软删除会话)"""
         if not self.adapter_config.messages or "messages" not in self._tables:
             return []
         
@@ -753,7 +1171,17 @@ class ConfigDrivenAdapter(IUserDataAdapter):
                 if filter_field in table.c:
                     conditions.append(table.c[filter_field] == filter_value)
             
-            stmt = select(table).where(and_(*conditions))
+            # JOIN sessions 表过滤已软删除会话
+            join_clause, active_filter = self._build_active_session_join(table, mapping)
+            
+            stmt = select(table)
+            if join_clause is not None:
+                sess_table = self._tables["sessions"]
+                stmt = stmt.select_from(table.join(sess_table, join_clause))
+                if active_filter is not None:
+                    conditions.append(active_filter)
+            
+            stmt = stmt.where(and_(*conditions))
             
             # 排序
             if timestamp_field in table.c:
@@ -784,22 +1212,36 @@ class ConfigDrivenAdapter(IUserDataAdapter):
         """
         检索相关历史消息
         
-        根据配置使用不同的检索策略:
-        1. pgvector - 使用 PostgreSQL 向量扩展
-        2. dynamic - 使用动态向量处理 (BM25 + embedding)
-        3. none - 简单的关键词匹配
+        v7.0 路由逻辑 (核心变更):
+        1. 有 vector_index_config + PGVECTOR → pgvector 向量检索
+        2. 有 vector_index_config + DYNAMIC + vector_handler → BM25 + Embedding 混合检索
+        3. 无 vector_index_config (BM25-only) → 仅 BM25 召回
+        4. type=NONE 或 disabled → 简单关键词匹配
+        
+        关键原则: 外部消息系统未提供向量化配置时，不做语义检索
         """
         if not self.adapter_config.messages or "messages" not in self._tables:
             return []
         
         vs_config = self.adapter_config.vector_search
         
-        if vs_config.type == VectorSearchType.PGVECTOR:
-            return await self._search_with_pgvector(user_id, query, limit, session_id)
-        elif vs_config.type == VectorSearchType.DYNAMIC and self._vector_handler:
-            return await self._search_with_dynamic_handler(user_id, query, limit, session_id)
-        else:
+        # ============ v7.0: 检查向量能力 ============
+        if not vs_config.enabled:
             return await self._search_with_keywords(user_id, query, limit, session_id)
+        
+        # 有向量能力: 使用对应的向量检索
+        if vs_config.has_vector_capability:
+            if vs_config.type == VectorSearchType.PGVECTOR:
+                return await self._search_with_pgvector(user_id, query, limit, session_id)
+            elif vs_config.type == VectorSearchType.DYNAMIC and self._vector_handler:
+                return await self._search_with_dynamic_handler(user_id, query, limit, session_id)
+        
+        # 无向量能力但 type=DYNAMIC: 使用 BM25-only
+        if self._bm25_only_mode or vs_config.type == VectorSearchType.DYNAMIC:
+            return await self._search_with_bm25_only(user_id, query, limit, session_id)
+        
+        # 最终回退: 关键词匹配
+        return await self._search_with_keywords(user_id, query, limit, session_id)
     
     async def _search_with_pgvector(
         self,
@@ -808,7 +1250,7 @@ class ConfigDrivenAdapter(IUserDataAdapter):
         limit: int,
         session_id: Optional[str],
     ) -> List[ChatMessage]:
-        """使用 pgvector 进行向量检索"""
+        """使用 pgvector 进行向量检索 (过滤已软删除会话)"""
         mapping = self.adapter_config.messages
         table = self._tables["messages"]
         vs_config = self.adapter_config.vector_search
@@ -827,26 +1269,44 @@ class ConfigDrivenAdapter(IUserDataAdapter):
             return await self._search_with_keywords(user_id, query, limit, session_id)
         
         async with self._session_factory() as session:
-            conditions = [table.c[user_id_field] == user_id]
-            
-            if session_id:
-                session_id_field = self._get_field(mapping, "session_id")
-                conditions.append(table.c[session_id_field] == session_id)
-            
-            # pgvector 相似度查询
-            # 注意: 这需要 pgvector 扩展已安装
             from sqlalchemy import text
             
             query_vec_str = "[" + ",".join(str(x) for x in query_embedding) + "]"
             
-            stmt = text(f"""
-                SELECT *, ({embedding_field} <=> :query_vec::vector) as distance
-                FROM {mapping.table}
-                WHERE {user_id_field} = :user_id
-                {"AND " + self._get_field(mapping, "session_id") + " = :session_id" if session_id else ""}
-                ORDER BY distance
-                LIMIT :limit
-            """)
+            # 构建 SQL — 如果有 sessions 表则 JOIN 过滤已删除会话
+            session_id_col = self._get_field(mapping, "session_id")
+            has_session_join = (
+                self.adapter_config.sessions
+                and "sessions" in self._tables
+            )
+            
+            if has_session_join:
+                sess_mapping = self.adapter_config.sessions
+                sess_table_name = sess_mapping.table
+                sess_id_field = self._get_field(sess_mapping, "session_id")
+                
+                join_clause = f"JOIN {sess_table_name} s ON m.{session_id_col} = s.{sess_id_field}"
+                active_clause = "AND s.is_active = true" if "is_active" in self._tables["sessions"].c else ""
+                
+                stmt = text(f"""
+                    SELECT m.*, (m.{embedding_field} <=> :query_vec::vector) as distance
+                    FROM {mapping.table} m
+                    {join_clause}
+                    WHERE m.{user_id_field} = :user_id
+                    {active_clause}
+                    {"AND m." + session_id_col + " = :session_id" if session_id else ""}
+                    ORDER BY distance
+                    LIMIT :limit
+                """)
+            else:
+                stmt = text(f"""
+                    SELECT *, ({embedding_field} <=> :query_vec::vector) as distance
+                    FROM {mapping.table}
+                    WHERE {user_id_field} = :user_id
+                    {"AND " + session_id_col + " = :session_id" if session_id else ""}
+                    ORDER BY distance
+                    LIMIT :limit
+                """)
             
             params = {
                 "query_vec": query_vec_str,
@@ -889,6 +1349,172 @@ class ConfigDrivenAdapter(IUserDataAdapter):
         
         return [r.message for r in results]
     
+    async def _search_with_bm25_only(
+        self,
+        user_id: str,
+        query: str,
+        limit: int,
+        session_id: Optional[str],
+    ) -> List[ChatMessage]:
+        """
+        v7.0: 仅使用 BM25 进行检索 (无向量化配置时的降级路径)
+        
+        v7.1 改进:
+        - BM25 分词改用 jieba (有效匹配 "纠正", "作者" 等中文词)
+        - 过滤 score=0 的消息 (避免返回无关消息)
+        - 当 BM25 无结果时回退到最近消息 (保证基本可用)
+        
+        与 _search_with_keywords 的区别:
+        - BM25 使用 TF-IDF 加权的词频匹配，考虑文档长度归一化
+        - _search_with_keywords 仅做简单的关键词包含匹配
+        
+        BM25 更适合作为无 Embedding 时的主要召回策略
+        """
+        # 获取用户消息
+        all_messages = await self._get_user_messages(user_id, session_id, limit=200)
+        
+        if not all_messages:
+            return []
+        
+        # 使用 BM25 评分
+        scored_messages = self._bm25_score(query, all_messages)
+        
+        # 按 BM25 分数排序, 过滤 score=0 的消息 (v7.1)
+        scored_messages.sort(key=lambda x: x[1], reverse=True)
+        relevant = [(msg, score) for msg, score in scored_messages if score > 0]
+        
+        if relevant:
+            logger.debug(
+                f"BM25 recall: {len(relevant)} messages with score > 0 "
+                f"(top score={relevant[0][1]:.3f})"
+            )
+            return [msg for msg, score in relevant[:limit]]
+        
+        # BM25 无结果时回退: 返回最近的消息 (按时间倒序, 已由 _get_user_messages 排序)
+        logger.info(
+            f"BM25 recall: no messages scored > 0 for query '{query[:50]}...', "
+            f"falling back to {min(limit, 5)} most recent messages"
+        )
+        return all_messages[:min(limit, 5)]
+    
+    # ============ BM25 中文停用词表 (高频无信息量词) ============
+    _CN_STOPWORDS = frozenset({
+        '的', '了', '在', '是', '我', '有', '和', '就', '不', '人', '都', '一',
+        '一个', '上', '也', '很', '到', '说', '要', '去', '你', '会', '着',
+        '没有', '看', '好', '自己', '这', '他', '她', '它', '们', '那', '些',
+        '什么', '吗', '呢', '吧', '啊', '哦', '嗯', '呀', '哈', '哪', '嘛',
+        '可以', '没', '还', '对', '把', '让', '被', '从', '给', '用', '但',
+        '而', '又', '所以', '因为', '如果', '这个', '那个', '怎么', '为什么',
+        '哪个', '多少', '几', '谁', '怎样', '这样', '那样',
+    })
+    
+    def _bm25_score(
+        self,
+        query: str,
+        messages: List["ChatMessage"],
+        k1: float = 1.5,
+        b: float = 0.75,
+    ) -> List[tuple]:
+        """
+        BM25 评分 (v7.1: 改进中文分词 + 停用词过滤)
+        
+        改进点:
+        1. 优先使用 jieba 分词 (比单字+bigram 更准确)
+        2. 过滤中文停用词 (避免高频无信息量词稀释权重)
+        3. 保留 bigram 作为 jieba 不可用时的回退
+        
+        参数:
+        - k1: 词频饱和参数 (默认 1.5)
+        - b: 文档长度归一化参数 (默认 0.75)
+        
+        返回: [(message, score), ...]
+        """
+        import math
+        import re
+        
+        # 尝试使用 jieba 分词 (更准确的中文分词)
+        try:
+            import jieba
+            _jieba_available = True
+        except ImportError:
+            _jieba_available = False
+        
+        def tokenize(text: str) -> List[str]:
+            """
+            中英文混合分词 (v7.1 改进)
+            
+            策略:
+            - 有 jieba: jieba 分词 + 英文单词 + 停用词过滤
+            - 无 jieba: 单字 + bigram + 英文单词 + 停用词过滤
+            """
+            tokens = []
+            text_lower = text.lower()
+            
+            # 英文单词 (保持不变)
+            en_tokens = re.findall(r'[a-zA-Z0-9]+', text_lower)
+            tokens.extend(en_tokens)
+            
+            if _jieba_available:
+                # jieba 分词: 产出有语义的词组 (如 "纠正", "作者", "挪威")
+                cn_text = re.sub(r'[a-zA-Z0-9]+', ' ', text_lower)  # 移除英文
+                words = jieba.lcut(cn_text)
+                for w in words:
+                    w = w.strip()
+                    if len(w) >= 1 and any('\u4e00' <= c <= '\u9fff' for c in w):
+                        # 过滤停用词
+                        if w not in self._CN_STOPWORDS:
+                            tokens.append(w)
+            else:
+                # 回退: 单字 + bigram (过滤停用词)
+                cn_chars = re.findall(r'[\u4e00-\u9fff]', text_lower)
+                for i in range(len(cn_chars)):
+                    if cn_chars[i] not in self._CN_STOPWORDS:
+                        tokens.append(cn_chars[i])
+                    if i + 1 < len(cn_chars):
+                        bigram = cn_chars[i] + cn_chars[i + 1]
+                        if bigram not in self._CN_STOPWORDS:
+                            tokens.append(bigram)
+            
+            return tokens
+        
+        query_tokens = tokenize(query)
+        if not query_tokens:
+            return [(msg, 0.0) for msg in messages]
+        
+        # 文档分词
+        doc_tokens_list = [tokenize(msg.content) for msg in messages]
+        
+        # 计算平均文档长度
+        avg_dl = sum(len(dt) for dt in doc_tokens_list) / max(len(doc_tokens_list), 1)
+        
+        # 计算 IDF
+        N = len(messages)
+        idf = {}
+        for qt in set(query_tokens):
+            df = sum(1 for dt in doc_tokens_list if qt in dt)
+            idf[qt] = math.log((N - df + 0.5) / (df + 0.5) + 1)
+        
+        # 计算每个文档的 BM25 分数
+        results = []
+        for msg, doc_tokens in zip(messages, doc_tokens_list):
+            score = 0.0
+            dl = len(doc_tokens)
+            
+            # 词频统计
+            tf_map = {}
+            for t in doc_tokens:
+                tf_map[t] = tf_map.get(t, 0) + 1
+            
+            for qt in query_tokens:
+                if qt not in tf_map:
+                    continue
+                tf = tf_map[qt]
+                score += idf.get(qt, 0) * (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * dl / max(avg_dl, 1)))
+            
+            results.append((msg, score))
+        
+        return results
+    
     async def _search_with_keywords(
         self,
         user_id: str,
@@ -896,7 +1522,7 @@ class ConfigDrivenAdapter(IUserDataAdapter):
         limit: int,
         session_id: Optional[str],
     ) -> List[ChatMessage]:
-        """使用关键词匹配进行检索"""
+        """使用关键词匹配进行检索 (过滤已软删除会话)"""
         mapping = self.adapter_config.messages
         table = self._tables["messages"]
         
@@ -921,7 +1547,17 @@ class ConfigDrivenAdapter(IUserDataAdapter):
                 ]
                 conditions.append(or_(*keyword_conditions))
             
-            stmt = select(table).where(and_(*conditions)).limit(limit * 2)
+            # JOIN sessions 表过滤已软删除会话
+            join_clause, active_filter = self._build_active_session_join(table, mapping)
+            
+            stmt = select(table)
+            if join_clause is not None:
+                sess_table = self._tables["sessions"]
+                stmt = stmt.select_from(table.join(sess_table, join_clause))
+                if active_filter is not None:
+                    conditions.append(active_filter)
+            
+            stmt = stmt.where(and_(*conditions)).limit(limit * 2)
             
             result = await session.execute(stmt)
             rows = result.fetchall()
@@ -946,7 +1582,7 @@ class ConfigDrivenAdapter(IUserDataAdapter):
         session_id: Optional[str],
         limit: int = 200,
     ) -> List[ChatMessage]:
-        """获取用户的消息"""
+        """获取用户的消息 (过滤已软删除会话)"""
         mapping = self.adapter_config.messages
         table = self._tables["messages"]
         
@@ -960,7 +1596,17 @@ class ConfigDrivenAdapter(IUserDataAdapter):
                 session_id_field = self._get_field(mapping, "session_id")
                 conditions.append(table.c[session_id_field] == session_id)
             
-            stmt = select(table).where(and_(*conditions))
+            # JOIN sessions 表过滤已软删除会话
+            join_clause, active_filter = self._build_active_session_join(table, mapping)
+            
+            stmt = select(table)
+            if join_clause is not None:
+                sess_table = self._tables["sessions"]
+                stmt = stmt.select_from(table.join(sess_table, join_clause))
+                if active_filter is not None:
+                    conditions.append(active_filter)
+            
+            stmt = stmt.where(and_(*conditions))
             
             if timestamp_field in table.c:
                 stmt = stmt.order_by(desc(table.c[timestamp_field]))
@@ -974,6 +1620,25 @@ class ConfigDrivenAdapter(IUserDataAdapter):
                 self._row_to_message(row, mapping)
                 for row in rows
             ]
+    
+    async def get_recent_messages(
+        self,
+        user_id: str,
+        limit: int = 10,
+    ) -> List[ChatMessage]:
+        """
+        获取用户最近的消息 (跨会话, 按时间降序后反转为正序)
+        
+        直接复用 _get_user_messages (session_id=None) 实现跨会话近轮获取
+        """
+        messages = await self._get_user_messages(
+            user_id=user_id,
+            session_id=None,  # 跨会话
+            limit=limit,
+        )
+        # _get_user_messages 返回时间降序, 反转为正序 (最旧在前)
+        messages.reverse()
+        return messages
     
     async def health_check(self) -> bool:
         """健康检查"""

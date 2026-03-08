@@ -88,12 +88,12 @@ def create_session_router() -> APIRouter:
             
             result = []
             for s in sessions:
-                # Get message count and preview
-                messages = conv_repo.get_by_session(s.id, limit=1)
-                message_count = len(conv_repo.get_by_session(s.id, limit=1000))
+                # Get exact message count using SQL COUNT (efficient, no limit cap)
+                message_count = conv_repo.count_by_session(s.id)
+                
+                # Get preview from first user message
                 preview = None
-                if messages:
-                    # Get the first user message as preview
+                if message_count > 0:
                     user_msgs = [m for m in conv_repo.get_by_session(s.id, limit=10) if m.role == 'user']
                     if user_msgs:
                         preview = user_msgs[0].content[:50] + "..." if len(user_msgs[0].content) > 50 else user_msgs[0].content
@@ -166,15 +166,15 @@ def create_session_router() -> APIRouter:
             if session.user_id != user["id"]:
                 raise HTTPException(status_code=403, detail="Access denied")
             
-            # Get message count
-            messages = conv_repo.get_by_session(session_id, limit=1000)
-            message_count = len(messages)
+            # Get exact message count using SQL COUNT
+            message_count = conv_repo.count_by_session(session_id)
             
-            # Get preview
+            # Get preview from first user message
             preview = None
-            user_msgs = [m for m in messages if m.role == 'user']
-            if user_msgs:
-                preview = user_msgs[0].content[:50] + "..." if len(user_msgs[0].content) > 50 else user_msgs[0].content
+            if message_count > 0:
+                user_msgs = [m for m in conv_repo.get_by_session(session_id, limit=10) if m.role == 'user']
+                if user_msgs:
+                    preview = user_msgs[0].content[:50] + "..." if len(user_msgs[0].content) > 50 else user_msgs[0].content
             
             # Get title from metadata
             title = session_id
@@ -205,6 +205,7 @@ def create_session_router() -> APIRouter:
         
         with db_manager.session_scope() as db:
             session_repo = SessionRepository(db)
+            conv_repo = ConversationRepository(db)
             
             session = session_repo.get(session_id)
             
@@ -228,11 +229,14 @@ def create_session_router() -> APIRouter:
             if session_meta:
                 title = session_meta.get('title', session_id)
             
+            # Get accurate message count
+            message_count = conv_repo.count_by_session(session_id)
+            
             return SessionResponse(
                 id=session.id,
                 title=title,
                 user_id=session.user_id,
-                message_count=0,
+                message_count=message_count,
                 created_at=session.created_at.isoformat() if session.created_at else datetime.now().isoformat(),
                 updated_at=session.updated_at.isoformat() if session.updated_at else datetime.now().isoformat(),
                 preview=None,

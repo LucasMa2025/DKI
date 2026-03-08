@@ -143,7 +143,12 @@ class SuffixBuilder:
         result.total_tokens = used_tokens
         result.message_count = sum(1 for i in items if i.type == "message")
         result.summary_count = sum(1 for i in items if i.type == "summary")
-        result.trace_ids = [i.trace_id for i in items if i.trace_id]
+        # 只收集 summary 类型条目的 trace_id (原文消息不需要 retrieve_fact 回溯)
+        # 每条 summary 对应一个唯一 trace_id, 用于 [可信+推理限定] 块
+        result.trace_ids = [
+            i.trace_id for i in items
+            if i.type == "summary" and i.trace_id
+        ]
         result.has_fact_call_instruction = result.summary_count > 0
 
         # ============ Phase 3: 格式化完整后缀 ============
@@ -459,26 +464,123 @@ class SuffixBuilder:
         - 这是摘要，不是事实
         - 不确定处必须标注
         - 不得推理、不得补全
+        
+        v6.1 修复: 使用 chat template (apply_chat_template) 构造 prompt,
+        避免 instruct 模型 (如 llama3.1-8b-instruct) 因纯文本 prompt 中
+        混入角色标签而输出无意义 token (如 "assistant")。
+        
+        策略:
+        1. 优先使用 tokenizer.apply_chat_template (system + user messages)
+        2. 回退: 使用 ChatML 格式手动构造
+        3. 最终回退: 纯文本 prompt (兼容非 chat 模型)
+        4. 输出验证: 如果生成结果太短或无意义, 回退到抽取式摘要
         """
-        prompt = (
-            f"请将以下对话内容压缩为不超过{max_tokens}字的摘要。\n"
+        system_instruction = (
+            "你是一个摘要助手。请严格按照要求生成摘要。\n"
             "要求:\n"
             "- 仅提取事实性陈述，不得推理或补充\n"
             "- 标注不确定或可能遗漏的信息\n"
             "- 使用\"提到了\"\"讨论了\"等不确定措辞\n"
-            f"\n原文:\n{text}\n\n摘要:"
+            f"- 摘要不超过{max_tokens}字"
         )
-
+        user_message = f"请将以下对话内容压缩为摘要:\n\n{text}"
+        
         try:
+            # 优先使用 chat template 构造正确的多轮格式
+            tokenizer = getattr(self._model_adapter, 'tokenizer', None)
+            
+            if tokenizer and hasattr(tokenizer, 'apply_chat_template'):
+                messages = [
+                    {"role": "system", "content": system_instruction},
+                    {"role": "user", "content": user_message},
+                ]
+                try:
+                    prompt = tokenizer.apply_chat_template(
+                        messages,
+                        add_generation_prompt=True,
+                        tokenize=False,
+                    )
+                except Exception as e:
+                    logger.debug(f"apply_chat_template failed for summary, using fallback: {e}")
+                    # 回退: ChatML 格式
+                    prompt = (
+                        f"<|im_start|>system\n{system_instruction}<|im_end|>\n"
+                        f"<|im_start|>user\n{user_message}<|im_end|>\n"
+                        f"<|im_start|>assistant\n"
+                    )
+            else:
+                # 无 tokenizer: 纯文本 prompt (兼容非 chat 模型)
+                prompt = (
+                    f"{system_instruction}\n\n{user_message}\n\n摘要:"
+                )
+            
             output = self._model_adapter.generate(
                 prompt=prompt,
                 max_new_tokens=max_tokens,
                 temperature=0.3,  # 低温度确保一致性
             )
-            return output.text.strip()
+            result = output.text.strip()
+            
+            # 输出验证: 检测无意义输出
+            # llama3.1-8b-instruct 等小模型可能输出角色标签或重复 token
+            if self._is_summary_invalid(result, text):
+                logger.warning(
+                    f"LLM summary invalid (len={len(result)}, "
+                    f"content='{result[:50]}...'), falling back to extractive"
+                )
+                return self._extractive_summarize(text, max_tokens)
+            
+            return result
         except Exception as e:
             logger.warning(f"LLM summarize failed, falling back to extractive: {e}")
             return self._extractive_summarize(text, max_tokens)
+    
+    @staticmethod
+    def _is_summary_invalid(summary: str, original: str) -> bool:
+        """
+        验证 LLM 生成的 summary 是否有效
+        
+        无效条件:
+        1. 空或太短 (< 10 字符)
+        2. 只包含角色标签 (assistant, user, system 等)
+        3. 重复 token 模式 (如 "assistant。assistant。assistant...")
+        4. 包含 chat template 特殊标记 (模型输出了格式标记而非内容)
+        """
+        if not summary or len(summary) < 10:
+            return True
+        
+        # 检测只包含角色标签的无意义输出
+        cleaned = summary.lower().strip()
+        invalid_tokens = {'assistant', 'user', 'system', '助手', '用户'}
+        
+        # 去除标点后检查
+        cleaned_no_punct = re.sub(r'[。.，,！!？?\s]+', '', cleaned)
+        if cleaned_no_punct in invalid_tokens or len(cleaned_no_punct) < 5:
+            return True
+        
+        # 检测重复 token 模式: 将文本按标点分割, 如果所有片段都是同一个词则无效
+        # 典型案例: "assistant。assistant。assistant。assistant。assistant"
+        segments = re.split(r'[。.，,！!？?\s\n]+', cleaned)
+        segments = [s.strip() for s in segments if s.strip()]
+        if segments and len(segments) >= 2:
+            unique_segments = set(segments)
+            # 如果所有片段都相同, 且这个片段是角色标签或无意义词
+            if len(unique_segments) == 1:
+                the_word = unique_segments.pop()
+                if the_word in invalid_tokens or len(the_word) < 4:
+                    return True
+        
+        # 检测 chat template 特殊标记泄漏
+        template_markers = [
+            '<|im_start|>', '<|im_end|>', '<|begin_of_text|>',
+            '<|start_header_id|>', '<|end_header_id|>', '<|eot_id|>',
+            '[INST]', '[/INST]', '<<SYS>>', '<</SYS>>',
+        ]
+        for marker in template_markers:
+            if marker in summary:
+                return True
+        
+        return False
 
     # ================================================================
     # 认知标记提取

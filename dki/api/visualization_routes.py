@@ -170,19 +170,25 @@ def create_visualization_router() -> APIRouter:
         "/history",
         response_model=InjectionHistoryResponse,
         summary="Get injection history",
-        description="Get recent DKI injection history records, filtered by authenticated user",
+        description="Get recent DKI injection history records, filtered by authenticated user. "
+                    "Optionally filter by session_id.",
     )
     async def get_injection_history(
         page: int = Query(1, ge=1, description="Page number"),
         page_size: int = Query(20, ge=1, le=100, description="Page size"),
+        session_id: Optional[str] = Query(None, description="可选：按 session_id 过滤"),
         user: Optional[dict] = Depends(get_current_user),
     ):
-        """Get injection history filtered by authenticated user."""
+        """Get injection history filtered by authenticated user and optional session_id."""
         history = get_visualization_history()
         
         # User-level isolation: filter by authenticated user_id
         if user and user.get("id"):
             history = [h for h in history if h.get("user_id") == user["id"]]
+        
+        # v8.1: Session-level filter
+        if session_id:
+            history = [h for h in history if h.get("session_id") == session_id]
         
         # Pagination
         total = len(history)
@@ -237,22 +243,58 @@ def create_visualization_router() -> APIRouter:
         "/latest",
         response_model=InjectionVisualizationResponse,
         summary="Get latest injection detail",
-        description="Get the most recent DKI injection visualization data, filtered by authenticated user",
+        description="Get the most recent DKI injection visualization data, filtered by authenticated user. "
+                    "Optionally filter by session_id to get the latest injection for a specific session.",
     )
     async def get_latest_injection(
+        session_id: Optional[str] = Query(None, description="可选：指定 session_id 获取该会话最后一次注入数据"),
         user: Optional[dict] = Depends(get_current_user),
     ):
-        """Get latest injection detail filtered by authenticated user."""
+        """Get latest injection detail filtered by authenticated user and optional session_id."""
         history = get_visualization_history()
         
         # User-level isolation: filter by authenticated user_id
         if user and user.get("id"):
             history = [h for h in history if h.get("user_id") == user["id"]]
         
+        # Session-level filter: if session_id provided, only show that session's data
+        if session_id:
+            history = [h for h in history if h.get("session_id") == session_id]
+        
         if not history:
             raise HTTPException(status_code=404, detail="No injection history available")
         
         return build_visualization_response(history[-1])
+    
+    @router.get(
+        "/sessions",
+        summary="Get sessions with visualization data",
+        description="Get a list of session IDs that have visualization data available in memory.",
+    )
+    async def get_visualization_sessions(
+        user: Optional[dict] = Depends(get_current_user),
+    ):
+        """Return session IDs that have at least one visualization record."""
+        history = get_visualization_history()
+        
+        # User-level isolation
+        if user and user.get("id"):
+            history = [h for h in history if h.get("user_id") == user["id"]]
+        
+        # Collect unique session_ids with their latest timestamp
+        sessions_map: Dict[str, str] = {}
+        for h in history:
+            sid = h.get("session_id", "")
+            if sid:
+                sessions_map[sid] = h.get("timestamp", "")
+        
+        return {
+            "sessions": [
+                {"session_id": sid, "latest_timestamp": ts}
+                for sid, ts in sessions_map.items()
+            ],
+            "total": len(sessions_map),
+        }
     
     @router.get(
         "/flow-diagram",

@@ -34,8 +34,9 @@ Author: AGI Demo Project
 Version: 5.0.0
 """
 
+import asyncio
 import time
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, AsyncIterator, Dict, List, Optional, Tuple, Union
 
 import torch
 from loguru import logger
@@ -84,6 +85,9 @@ class VLLMAdapter(BaseModelAdapter):
         trust_remote_code: bool = True,
         device: str = "cuda",
         injection_mode: str = "auto",  # 保留参数兼容, 但不影响行为
+        quantization: str = "none",
+        quantization_config: dict = None,
+        model_impl: str = "auto",
         **kwargs
     ):
         """
@@ -101,13 +105,33 @@ class VLLMAdapter(BaseModelAdapter):
                 - "prompt_prefix": 等同于 auto
                 - "hf_kv": 接受但发出废弃警告, 内部走 vLLM 原生推理
                 - "vllm_kv": 等同于 auto
+            quantization: 量化模式
+                - "none" (默认): 不量化
+                - "gptq": GPTQ 量化
+                - "awq": AWQ 量化
+                - "fp8": FP8 量化 (E4M3 格式, 需要 H100/L40/Ada Lovelace+ GPU)
+                - "4bit" / "8bit": bitsandbytes 量化 (通过 vLLM bitsandbytes 集成)
+            quantization_config: 量化详细配置
+                FP8 专属配置项:
+                - fp8_kv_cache: 是否对 KV Cache 也使用 FP8 (默认 false)
+                - fp8_compute_dtype: 计算精度 (默认 "bfloat16")
+            model_impl: vLLM 模型实现后端
+                - "auto" (默认): vLLM 自动选择最优实现
+                - "transformers": 强制使用 Transformers backend
+                  适用于 vLLM 原生尚不支持的新架构 (如 Qwen-3.5)
         """
-        super().__init__(model_name, device, **kwargs)
+        super().__init__(
+            model_name, device,
+            quantization=quantization,
+            quantization_config=quantization_config,
+            **kwargs
+        )
         
         self.tensor_parallel_size = tensor_parallel_size
         self.max_model_len = max_model_len
         self.gpu_memory_utilization = gpu_memory_utilization
         self.trust_remote_code = trust_remote_code
+        self.model_impl = model_impl
         
         # 注入模式: 保留参数兼容, 但所有值最终走 vLLM 原生推理
         valid_modes = ("auto", "prompt_prefix", "hf_kv", "vllm_kv")
@@ -152,26 +176,117 @@ class VLLMAdapter(BaseModelAdapter):
         
         v5.0: 只加载 vLLM, 不加载 HF 模型。
         开启 enable_prefix_caching 以自动复用相同前缀的 KV Cache。
+        
+        量化支持:
+        - "none": 原始精度
+        - "gptq": GPTQ 量化 (需要预量化模型)
+        - "awq": AWQ 量化 (需要预量化模型)
+        - "fp8": FP8 量化 (E4M3 格式, 需要 Ada Lovelace+ GPU)
+        - "4bit": bitsandbytes 4-bit 量化 (通过 vLLM bitsandbytes 集成)
+        - "8bit": bitsandbytes 8-bit 量化 (通过 vLLM bitsandbytes 集成)
+        
+        模型实现后端 (model_impl):
+        - "auto": vLLM 自动选择 (默认)
+        - "transformers": 强制使用 Transformers backend
+          适用于 vLLM 原生尚不支持的新架构 (如 Qwen-3.5)
         """
         if self._is_loaded:
             return
         
         try:
+            # ============ HuggingFace Hub 兼容性补丁 ============
+            # 必须在 import vllm/transformers 之前调用
+            # 解决 huggingface_hub ≥0.25 移除 is_offline_mode 导致导入失败
+            from dki.models.hf_compat import ensure_hf_compat
+            ensure_hf_compat()
+            
             from vllm import LLM, SamplingParams
             from transformers import AutoTokenizer, AutoConfig
             
+            quant_desc = f" (quantization={self.quantization})" if self.is_quantized else ""
             logger.info(
                 f"Loading vLLM engine (native KV injection via prefix caching): "
-                f"{self.model_name}"
+                f"{self.model_name}{quant_desc}"
             )
-            self.llm = LLM(
-                model=self.model_name,
-                tensor_parallel_size=self.tensor_parallel_size,
-                max_model_len=self.max_model_len,
-                gpu_memory_utilization=self.gpu_memory_utilization,
-                trust_remote_code=self.trust_remote_code,
-                enable_prefix_caching=True,  # 核心: 自动复用相同前缀的 KV Cache
-            )
+            
+            # ============ vLLM 引擎参数 ============
+            llm_kwargs = {
+                'model': self.model_name,
+                'tensor_parallel_size': self.tensor_parallel_size,
+                'max_model_len': self.max_model_len,
+                'gpu_memory_utilization': self.gpu_memory_utilization,
+                'trust_remote_code': self.trust_remote_code,
+                'enable_prefix_caching': True,  # 核心: 自动复用相同前缀的 KV Cache
+            }
+            
+            # ============ 模型实现后端 ============
+            # model_impl="transformers" 用于 vLLM 原生不支持的新架构
+            # 如 Qwen-3.5 (Qwen3_5ForConditionalGeneration)
+            if self.model_impl and self.model_impl != "auto":
+                llm_kwargs['model_impl'] = self.model_impl
+                logger.info(f"vLLM model_impl: {self.model_impl} (forced Transformers backend)")
+            
+            if self.quantization != "none":
+                # vLLM 量化参数映射
+                # vLLM 支持: gptq, awq, fp8, squeezellm, bitsandbytes 等
+                vllm_quant_map = {
+                    "gptq": "gptq",
+                    "awq": "awq",
+                    "fp8": "fp8",
+                    "4bit": "bitsandbytes",
+                    "8bit": "bitsandbytes",
+                }
+                vllm_quant = vllm_quant_map.get(self.quantization)
+                if vllm_quant:
+                    llm_kwargs['quantization'] = vllm_quant
+                    logger.info(f"vLLM quantization: {vllm_quant}")
+                    
+                    # ============ GPTQ dtype 兼容性 ============
+                    # GPTQ 量化仅支持 float16, 不支持 bfloat16
+                    # vLLM 默认 dtype="auto" 在某些 GPU 上会解析为 bfloat16,
+                    # 导致 ValueError: torch.bfloat16 is not supported for quantization method gptq
+                    # 强制设置 dtype="float16" 以确保 GPTQ 兼容性
+                    if vllm_quant in ("gptq",):
+                        llm_kwargs['dtype'] = 'float16'
+                        logger.info(
+                            "GPTQ quantization detected — forcing dtype=float16 "
+                            "(GPTQ only supports float16, not bfloat16)"
+                        )
+                    
+                    # ============ FP8 量化配置 ============
+                    # FP8 (E4M3) 量化: 权重存储为 FP8, 计算使用 bfloat16
+                    # 需要 Ada Lovelace+ GPU (L40, L20, RTX 4090, H100 等)
+                    # vLLM 原生支持 FP8 量化, 无需额外依赖
+                    # 显存节省约 50% (相比 float16), 精度损失 < 1%
+                    elif vllm_quant == "fp8":
+                        # FP8 模型通常基于 bfloat16 训练, 计算精度使用 bfloat16
+                        fp8_compute_dtype = self.quantization_config.get(
+                            "fp8_compute_dtype", "bfloat16"
+                        )
+                        llm_kwargs['dtype'] = fp8_compute_dtype
+                        
+                        # FP8 KV Cache: 进一步节省 KV Cache 显存
+                        # 默认关闭, 因为 KV Cache 精度对长上下文推理质量有影响
+                        if self.quantization_config.get("fp8_kv_cache", False):
+                            llm_kwargs['kv_cache_dtype'] = 'fp8_e4m3'
+                            logger.info(
+                                "FP8 quantization with FP8 KV Cache enabled — "
+                                "further VRAM savings but may affect long-context quality"
+                            )
+                        
+                        logger.info(
+                            f"FP8 quantization detected — "
+                            f"dtype={fp8_compute_dtype}, "
+                            f"kv_cache_dtype={llm_kwargs.get('kv_cache_dtype', 'auto')} "
+                            f"(FP8 E4M3 weights, requires Ada Lovelace+ GPU)"
+                        )
+                else:
+                    logger.warning(
+                        f"Quantization '{self.quantization}' not directly supported by vLLM, "
+                        f"proceeding without quantization parameter"
+                    )
+            
+            self.llm = LLM(**llm_kwargs)
             
             # 加载 Tokenizer (先于 SamplingParams, 用于获取 stop tokens)
             self.tokenizer = AutoTokenizer.from_pretrained(
@@ -210,7 +325,27 @@ class VLLMAdapter(BaseModelAdapter):
             )
             
         except ImportError as e:
-            logger.error(f"vLLM not installed: {e}")
+            error_msg = str(e)
+            # 精准诊断: 区分 "未安装" 和 "版本不兼容"
+            if "huggingface-hub" in error_msg and "is required" in error_msg:
+                # transformers 检测到 huggingface-hub 版本过低
+                logger.error(
+                    f"huggingface-hub 版本不兼容: {error_msg}\n"
+                    f"  修复: pip install huggingface-hub>=1.3.0 --upgrade\n"
+                    f"  或: pip install transformers huggingface-hub --upgrade"
+                )
+            elif "is_offline_mode" in error_msg:
+                # huggingface_hub 缺少 is_offline_mode (hf_compat 补丁未生效?)
+                logger.error(
+                    f"huggingface_hub 兼容性问题: {error_msg}\n"
+                    f"  修复: pip install huggingface-hub>=1.3.0 --upgrade"
+                )
+            elif "vllm" in error_msg.lower():
+                logger.error(f"vLLM 未安装: {error_msg}")
+            elif "transformers" in error_msg.lower():
+                logger.error(f"transformers 未安装: {error_msg}")
+            else:
+                logger.error(f"依赖导入失败: {error_msg}")
             raise
         except Exception as e:
             logger.error(f"Failed to load vLLM model: {e}")
@@ -326,7 +461,7 @@ class VLLMAdapter(BaseModelAdapter):
     def generate(
         self,
         prompt: str,
-        max_new_tokens: int = 512,
+        max_new_tokens: int = 2048,
         temperature: float = 0.7,
         top_p: float = 0.9,
         **kwargs
@@ -379,7 +514,7 @@ class VLLMAdapter(BaseModelAdapter):
         prompt: str,
         injected_kv: Union[List[KVCacheEntry], str, None] = None,
         alpha: float = 1.0,
-        max_new_tokens: int = 512,
+        max_new_tokens: int = 2048,
         **kwargs
     ) -> ModelOutput:
         """
@@ -447,6 +582,126 @@ class VLLMAdapter(BaseModelAdapter):
                 'injection_mode': 'vllm_native_prefix_caching',
             },
         )
+    
+    # ================================================================
+    # 异步与流式生成
+    # ================================================================
+    
+    async def async_generate(
+        self,
+        prompt: str,
+        max_new_tokens: int = 2048,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        **kwargs
+    ) -> ModelOutput:
+        """
+        Async version of generate() for vLLM.
+        
+        vLLM LLM.generate() 不使用 event loop (通过 zmq 多进程通信),
+        在 async 上下文中调用完全安全, 因此直接在线程池中执行。
+        """
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self.generate(
+                prompt=prompt,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                **kwargs,
+            ),
+        )
+    
+    async def async_stream_generate(
+        self,
+        prompt: str,
+        max_new_tokens: int = 2048,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        **kwargs
+    ) -> AsyncIterator[str]:
+        """
+        Async streaming generation using vLLM.
+        
+        vLLM 支持两种流式模式:
+        1. vllm.AsyncLLMEngine (服务端模式): 原生 async streaming
+        2. vllm.LLM (离线模式): 不支持原生 streaming
+        
+        当前 DKI 使用 vllm.LLM (离线模式), 不支持原生 token-by-token streaming。
+        因此使用 "模拟流式" 策略: 完整生成后按 chunk 分批 yield。
+        
+        如需真正的 token-by-token streaming, 应使用 vLLM 的 OpenAI-compatible
+        server (vllm serve) + httpx/aiohttp SSE client, 这是 vLLM 官方推荐的
+        streaming 方案。
+        
+        Yields:
+            str: text chunks
+        """
+        if not self._is_loaded:
+            self.load()
+        
+        from vllm import SamplingParams
+        
+        # Format prompt
+        if self._has_chat_template_tokens(prompt):
+            formatted_prompt = prompt
+        elif self._is_chat_model():
+            formatted_prompt = self._format_prompt(prompt)
+        else:
+            formatted_prompt = prompt
+        
+        sampling_params = SamplingParams(
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_new_tokens,
+            stop=self._get_stop_strings(),
+        )
+        
+        # vLLM LLM 离线模式: 完整生成后分 chunk yield
+        loop = asyncio.get_running_loop()
+        outputs = await loop.run_in_executor(
+            None,
+            lambda: self.llm.generate([formatted_prompt], sampling_params),
+        )
+        
+        output_text = outputs[0].outputs[0].text
+        
+        # 模拟流式: 按字符组分批 yield (每 chunk ~4-8 个字符, 模拟 token 粒度)
+        chunk_size = 4
+        for i in range(0, len(output_text), chunk_size):
+            yield output_text[i:i + chunk_size]
+            await asyncio.sleep(0)  # 让出控制权, 允许 SSE flush
+    
+    def stream_generate(
+        self,
+        prompt: str,
+        max_new_tokens: int = 2048,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        **kwargs
+    ):
+        """
+        Synchronous streaming generation for vLLM.
+        
+        vLLM LLM 离线模式不支持原生 streaming,
+        完整生成后按 chunk 分批 yield。
+        
+        Yields:
+            str: text chunks
+        """
+        output = self.generate(
+            prompt=prompt,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            **kwargs,
+        )
+        
+        chunk_size = 4
+        text = output.text
+        for i in range(0, len(text), chunk_size):
+            yield text[i:i + chunk_size]
     
     # ================================================================
     # BaseModelAdapter 抽象方法实现 (安全降级)
@@ -549,6 +804,8 @@ class VLLMAdapter(BaseModelAdapter):
             'prefix_caching_enabled': True,
             'hf_model_loaded': False,  # v5.0: 永远不加载 HF 模型
             'vllm_engine_loaded': self.llm is not None,
+            'quantization': self.quantization,
+            'model_impl': self.model_impl,
         })
         return info
     

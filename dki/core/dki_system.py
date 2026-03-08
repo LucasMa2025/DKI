@@ -816,7 +816,7 @@ class DKISystem:
         allow_injection: bool = True,
         use_hybrid: Optional[bool] = None,
         force_alpha: Optional[float] = None,
-        max_new_tokens: int = 512,
+        max_new_tokens: int = 2048,
         temperature: float = 0.7,
         task_type: str = "reasoning",
         **kwargs
@@ -1410,7 +1410,7 @@ class DKISystem:
             context_window = getattr(engine_cfg, 'max_model_len', 4096) if hasattr(engine_cfg, 'max_model_len') else 4096
         return context_window
     
-    def _get_max_prompt_tokens(self, max_new_tokens: int = 512) -> int:
+    def _get_max_prompt_tokens(self, max_new_tokens: int = 2048) -> int:
         """
         v5.7: 重新设计的 token 预算分配
         
@@ -1580,7 +1580,7 @@ class DKISystem:
         # 如果有 fact call 指令, 加入 system message
         if has_fact_call_instruction and trace_ids:
             if self._recall_formatter:
-                constraint = self._recall_formatter.format_constraint_instruction(trace_ids)
+                constraint = self._recall_formatter.format_constraint_instruction(trace_ids, position="below")
                 system_parts.append(constraint)
         
         # v6.5: 模糊指代澄清指令
@@ -1614,7 +1614,7 @@ class DKISystem:
             if item_type == 'summary':
                 trace_id = getattr(item, 'trace_id', '')
                 if trace_id:
-                    content = f"[摘要 trace_id={trace_id}] {content}"
+                    content = f"[SUMMARY trace_id={trace_id}] {content}"
             
             # 确保 role 是 chat template 支持的标准角色
             if role not in ('user', 'assistant', 'system'):

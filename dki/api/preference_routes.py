@@ -168,19 +168,19 @@ def create_preference_router() -> APIRouter:
             })
             
             logger.info(f"Created preference: {pref_id} for user: {request.user_id}")
-            
-            return PreferenceResponse(
-                id=pref_id,
-                userId=request.user_id,
-                preferenceText=request.preference_text,
-                preferenceType=request.preference_type,
-                priority=request.priority,
-                category=request.category,
-                metadata=request.metadata,
-                isActive=request.is_active,
-                createdAt=now.isoformat(),
-                updatedAt=now.isoformat(),
-            )
+        
+        return PreferenceResponse(
+            id=pref_id,
+            userId=request.user_id,
+            preferenceText=request.preference_text,
+            preferenceType=request.preference_type,
+            priority=request.priority,
+            category=request.category,
+            metadata=request.metadata,
+            isActive=request.is_active,
+            createdAt=now.isoformat(),
+            updatedAt=now.isoformat(),
+        )
     
     @router.get("/{preference_id}", response_model=PreferenceResponse)
     async def get_preference(
@@ -276,9 +276,9 @@ def create_preference_router() -> APIRouter:
                 db.execute(update_query, params)
             
             logger.info(f"Updated preference: {preference_id}")
-            
-            # Return updated preference
-            return await get_preference(preference_id, user)
+        
+        # Return updated preference
+        return await get_preference(preference_id, user)
     
     @router.delete("/{preference_id}")
     async def delete_preference(
@@ -309,8 +309,8 @@ def create_preference_router() -> APIRouter:
             db.execute(delete_query, {"id": preference_id})
             
             logger.info(f"Deleted preference: {preference_id}")
-            
-            return {"status": "deleted", "preference_id": preference_id}
+        
+        return {"status": "deleted", "preference_id": preference_id}
     
     return router
 

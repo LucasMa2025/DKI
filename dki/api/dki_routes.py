@@ -3,10 +3,17 @@ DKI Plugin API Routes
 
 DKI 插件 API 路由
 
+v8.2 重构:
+- /v1/dki/chat 端点优先使用 DKIPlugin (与实验系统一致)
+- 支持降级到 DKISystem (兼容旧配置)
+- DKIPlugin.chat() 是 async 方法, 直接 await (无需 ThreadPoolExecutor)
+- 响应映射从 DKIPluginResponse/InjectionMetadata 提取字段
+
 核心设计:
 - 上层应用只需传递 user_id 和原始输入
 - DKI 自动通过适配器读取用户偏好和历史消息
-- DKI 执行 K/V 注入后调用 LLM 推理
+- DKI 执行偏好注入(提示词前缀)后调用 LLM 推理
+- 消息持久化由上层应用负责 (如 demo/api/chat.py), DKI 本身只读
 
 安全设计 (v3.1):
 - 每个请求创建 UserIsolationContext，贯穿整个请求生命周期
@@ -14,7 +21,7 @@ DKI 插件 API 路由
 - 所有缓存操作都通过 UserIsolationContext 进行
 
 Author: AGI Demo Project
-Version: 3.1.0
+Version: 9.0.0
 """
 
 import asyncio
@@ -41,6 +48,13 @@ try:
 except ImportError:
     USER_ISOLATION_AVAILABLE = False
 
+# DKIPlugin 类型检测 (用于区分 DKIPlugin 和 DKISystem)
+try:
+    from dki.core.dki_plugin import DKIPlugin
+    DKIPLUGIN_AVAILABLE = True
+except ImportError:
+    DKIPLUGIN_AVAILABLE = False
+
 
 # ============ Request/Response Models ============
 
@@ -54,7 +68,7 @@ class DKIChatRequest(BaseModel):
     - session_id: 会话标识 (DKI 用于读取会话历史)
     
     DKI 会自动:
-    1. 通过适配器读取用户偏好 → K/V 注入 (负位置)
+    1. 通过适配器读取用户偏好 → 提示词前缀注入 (vLLM 环境)
     2. 通过适配器检索相关历史 → 后缀提示词 (正位置)
     3. 调用 LLM 推理
     """
@@ -86,6 +100,10 @@ class DKIMetadataResponse(BaseModel):
     cache_hit: bool = Field(False, description="缓存是否命中")
     cache_tier: str = Field("none", description="缓存层级")
     latency_ms: float = Field(0, description="延迟 (ms)")
+    # v8.2: 新增 DKIPlugin 特有字段
+    retrieval_mode: str = Field("unknown", description="检索模式 (bm25_only | bm25_embedding | keyword)")
+    preferences_count: int = Field(0, description="偏好数量")
+    relevant_history_count: int = Field(0, description="召回的相关历史消息数")
 
 
 class DKIChatResponse(BaseModel):
@@ -109,19 +127,38 @@ class DKIChatResponse(BaseModel):
 
 # ============ Global State ============
 
-_dki_system = None
+_dki_plugin = None
 _executor = ThreadPoolExecutor(max_workers=4)
 
 
-def set_dki_plugin(dki_system):
-    """设置 DKI 系统实例"""
-    global _dki_system
-    _dki_system = dki_system
+def set_dki_plugin(instance):
+    """
+    设置 DKI 实例
+    
+    v8.2: 优先接受 DKIPlugin 实例, 也兼容 DKISystem (降级)
+    """
+    global _dki_plugin
+    _dki_plugin = instance
+    
+    # 日志: 标记实际类型
+    type_name = type(instance).__name__ if instance else "None"
+    logger.info(f"DKI plugin set: type={type_name}")
 
 
 def get_dki_plugin():
-    """获取 DKI 系统实例"""
-    return _dki_system
+    """获取 DKI 实例"""
+    return _dki_plugin
+
+
+def _is_dki_plugin(instance) -> bool:
+    """检测实例是否为 DKIPlugin (而非 DKISystem)"""
+    if DKIPLUGIN_AVAILABLE and isinstance(instance, DKIPlugin):
+        return True
+    # 鸭子类型检测: DKIPlugin.chat 是 async 方法
+    chat_method = getattr(instance, 'chat', None)
+    if chat_method and asyncio.iscoroutinefunction(chat_method):
+        return True
+    return False
 
 
 # ============ Router ============
@@ -138,6 +175,8 @@ def create_dki_router() -> APIRouter:
         description="""
         DKI 增强的聊天接口
         
+        v8.2: 使用 DKIPlugin (与实验系统一致)
+        
         上层应用只需传递:
         - query: 原始用户输入 (不含任何 prompt 构造)
         - user_id: 用户标识 (将与 auth token 中的 user_id 交叉验证)
@@ -145,8 +184,8 @@ def create_dki_router() -> APIRouter:
         
         DKI 会自动:
         1. 验证 user_id 身份归属 (防止跨用户请求)
-        2. 通过适配器读取用户偏好 → K/V 注入 (负位置)
-        3. 通过适配器检索相关历史 → 后缀提示词 (正位置)
+        2. 通过适配器读取用户偏好 → 提示词前缀注入
+        3. 通过适配器检索相关历史 → 后缀提示词
         4. 调用 LLM 推理
         """,
     )
@@ -157,23 +196,17 @@ def create_dki_router() -> APIRouter:
         """
         DKI enhanced chat.
         
-        Security flow (v3.1):
-        1. Verify user_id (request body vs auth token cross-validation)
-        2. Create UserIsolationContext (spans the entire request lifecycle)
-        3. DKI reads user preferences and history via isolation context
-        4. DKI executes K/V injection (with inference isolation guard)
-        5. Return response
+        v8.2: 优先使用 DKIPlugin (async), 降级到 DKISystem (sync)
         """
-        dki_system = get_dki_plugin()
+        dki_instance = get_dki_plugin()
         
-        if not dki_system:
+        if not dki_instance:
             raise HTTPException(
                 status_code=503,
                 detail="DKI system not initialized. Please check configuration."
             )
         
         # ============ User Identity Verification ============
-        # user_id must not be empty
         if not request.user_id or not request.user_id.strip():
             raise HTTPException(
                 status_code=400,
@@ -191,110 +224,19 @@ def create_dki_router() -> APIRouter:
                 )
                 verified_user_id = auth_user["id"]
         
+        session_id = request.session_id or verified_user_id
+        
         try:
-            # 使用线程池执行同步的 DKI chat 方法
-            loop = asyncio.get_event_loop()
-            response = await loop.run_in_executor(
-                _executor,
-                lambda: dki_system.chat(
-                    query=request.query,  # 原始用户输入
-                    session_id=request.session_id or verified_user_id,
-                    user_id=verified_user_id,
-                    force_alpha=request.force_alpha,
-                    use_hybrid=request.use_hybrid,
-                    max_new_tokens=request.max_tokens,
-                    temperature=request.temperature,
+            if _is_dki_plugin(dki_instance):
+                # ============ DKIPlugin 路径 (v8.2 主路径) ============
+                return await _handle_dki_plugin_chat(
+                    dki_instance, request, verified_user_id, session_id
                 )
-            )
-            
-            # 构造响应
-            # 从 DKIResponse 中提取元数据
-            hybrid_info = response.metadata.get("hybrid_injection", {})
-            preference_tokens = hybrid_info.get("preference_tokens", 0)
-            history_tokens = hybrid_info.get("history_tokens", 0)
-            
-            # v5.3: 使用 preference_alpha (来自配置, 非门控决策)
-            _gating_alpha = response.gating_decision.alpha if response.gating_decision else 0.0
-            _pref_alpha = hybrid_info.get("preference_alpha", 0.0)
-            _display_alpha = max(_pref_alpha, _gating_alpha)
-            
-            dki_metadata = DKIMetadataResponse(
-                injection_enabled=(
-                    (response.gating_decision.should_inject if response.gating_decision else False)
-                    or bool(preference_tokens)  # v5.3: 偏好注入也算 enabled
-                    or bool(history_tokens)
-                ),
-                alpha=_display_alpha,
-                preference_tokens=preference_tokens,
-                history_tokens=history_tokens,
-                cache_hit=response.cache_hit,
-                cache_tier=response.cache_tier or "none",
-                latency_ms=response.latency_ms,
-            )
-            
-            request_id = f"dki-{uuid.uuid4().hex[:8]}"
-            
-            # 记录可视化数据
-            try:
-                # LatencyBreakdown 属性: router_ms, gating_ms, kv_compute_ms,
-                # kv_load_ms, projection_ms, prefill_ms, decode_ms, total_ms
-                lb = response.latency_breakdown
-                viz_data = {
-                    "request_id": request_id,
-                    "timestamp": datetime.utcnow().isoformat(),
-                    "mode": "dki",
-                    "query": request.query,
-                    "user_id": verified_user_id,
-                    "session_id": request.session_id or verified_user_id,
-                    "injection_enabled": dki_metadata.injection_enabled,
-                    "alpha": _display_alpha,
-                    "preference_tokens": preference_tokens,
-                    "history_tokens": history_tokens,
-                    "query_tokens": max(0, response.input_tokens - preference_tokens - history_tokens),
-                    "total_tokens": response.input_tokens,
-                    "cache_hit": response.cache_hit,
-                    "cache_tier": response.cache_tier or "none",
-                    "latency_ms": response.latency_ms,
-                    # 注入明文信息 (用于显示)
-                    "preference_text": hybrid_info.get("preference_text", ""),
-                    "history_suffix_text": hybrid_info.get("history_suffix_text", ""),
-                    "history_messages": hybrid_info.get("history_messages", []),
-                    "final_input": hybrid_info.get("final_input", request.query),
-                    "rag_prompt_text": "",
-                    "rag_context_text": "",
-                    # 延迟分解 (使用 LatencyBreakdown 正确属性)
-                    "adapter_latency_ms": (lb.router_ms if lb else 0),
-                    "injection_latency_ms": ((lb.kv_compute_ms + lb.projection_ms) if lb else 0),
-                    "inference_latency_ms": ((lb.prefill_ms + lb.decode_ms) if lb else 0),
-                }
-                record_visualization(viz_data)
-                logger.debug(f"Recorded visualization data for request {request_id}")
-            except Exception as viz_error:
-                logger.warning(f"Failed to record visualization: {viz_error}")
-            
-            # 记录 DKI 统计数据 (v5.3: 使用 preference_alpha)
-            try:
-                record_dki_request(
-                    cache_tier=response.cache_tier or "L3",
-                    alpha=_display_alpha,
-                    injected=dki_metadata.injection_enabled,
+            else:
+                # ============ DKISystem 降级路径 ============
+                return await _handle_dki_system_chat(
+                    dki_instance, request, verified_user_id, session_id
                 )
-            except Exception as stats_error:
-                logger.warning(f"Failed to record stats: {stats_error}")
-            
-            return DKIChatResponse(
-                id=request_id,
-                text=response.text,
-                input_tokens=response.input_tokens,
-                output_tokens=response.output_tokens,
-                dki_metadata=dki_metadata,
-                choices=[{
-                    "index": 0,
-                    "message": {"role": "assistant", "content": response.text},
-                    "finish_reason": "stop",
-                }],
-                created=int(datetime.utcnow().timestamp()),
-            )
             
         except Exception as e:
             import traceback
@@ -309,23 +251,25 @@ def create_dki_router() -> APIRouter:
     )
     async def dki_info():
         """获取 DKI 插件信息"""
-        dki_system = get_dki_plugin()
+        dki_instance = get_dki_plugin()
         
-        if not dki_system:
+        if not dki_instance:
             return {
                 "status": "not_initialized",
                 "message": "DKI system not initialized",
             }
         
         try:
-            stats = dki_system.get_stats()
+            stats = dki_instance.get_stats()
+            is_plugin = _is_dki_plugin(dki_instance)
             return {
                 "status": "ready",
-                "version": "2.0.0",
+                "version": "8.2.0",
+                "type": "DKIPlugin" if is_plugin else "DKISystem",
                 "stats": stats,
                 "config": {
                     "hybrid_injection_enabled": True,
-                    "preference_kv_injection": True,
+                    "preference_prompt_prefix_injection": True,
                     "history_suffix_injection": True,
                 },
             }
@@ -337,3 +281,192 @@ def create_dki_router() -> APIRouter:
             }
     
     return router
+
+
+# ============ DKIPlugin 处理 (v8.2 主路径) ============
+
+async def _handle_dki_plugin_chat(
+    dki_plugin,
+    request: DKIChatRequest,
+    verified_user_id: str,
+    session_id: str,
+) -> DKIChatResponse:
+    """
+    处理 DKIPlugin.chat() 的异步响应
+    
+    DKIPlugin.chat() 返回 DKIPluginResponse:
+    - text: 生成文本
+    - input_tokens / output_tokens: Token 统计
+    - metadata: InjectionMetadata (结构化注入信息)
+    
+    注意: DKIPlugin 自身不负责消息持久化 (设计如此)
+    上层应用 (如 demo/api/chat.py) 负责消息的读写管理
+    """
+    # DKIPlugin.chat() 是 async 方法, 直接 await
+    response = await dki_plugin.chat(
+        query=request.query,
+        user_id=verified_user_id,
+        session_id=session_id,
+        force_alpha=request.force_alpha,
+        max_new_tokens=request.max_tokens,
+        temperature=request.temperature,
+    )
+    
+    # 从 InjectionMetadata 提取字段
+    meta = response.metadata
+    
+    dki_metadata = DKIMetadataResponse(
+        injection_enabled=meta.injection_enabled,
+        alpha=meta.alpha,
+        preference_tokens=meta.preference_tokens,
+        history_tokens=meta.history_tokens,
+        cache_hit=meta.preference_cache_hit,
+        cache_tier=meta.preference_cache_tier or "none",
+        latency_ms=meta.latency_ms,
+        retrieval_mode=meta.retrieval_mode,
+        preferences_count=meta.preferences_count,
+        relevant_history_count=meta.relevant_history_count,
+    )
+    
+    request_id = meta.request_id or f"dki-{uuid.uuid4().hex[:8]}"
+    
+    # DKIPlugin._record_injection_log() 已在 chat() 内部记录了完整的可视化数据
+    # (包含 preference_text, history_suffix_text, history_messages, final_input)
+    # 此处不再重复记录, 避免覆盖 DKIPlugin 记录的完整数据为空值
+    
+    # 记录统计数据
+    try:
+        record_dki_request(
+            cache_tier=meta.preference_cache_tier or "L3",
+            alpha=meta.alpha,
+            injected=meta.injection_enabled,
+        )
+    except Exception as stats_error:
+        logger.warning(f"Failed to record stats: {stats_error}")
+    
+    return DKIChatResponse(
+        id=request_id,
+        text=response.text,
+        input_tokens=response.input_tokens,
+        output_tokens=response.output_tokens,
+        dki_metadata=dki_metadata,
+        choices=[{
+            "index": 0,
+            "message": {"role": "assistant", "content": response.text},
+            "finish_reason": "stop",
+        }],
+        created=int(datetime.utcnow().timestamp()),
+    )
+
+
+# ============ DKISystem 降级处理 ============
+
+async def _handle_dki_system_chat(
+    dki_system,
+    request: DKIChatRequest,
+    verified_user_id: str,
+    session_id: str,
+) -> DKIChatResponse:
+    """
+    处理 DKISystem.chat() 的同步响应 (降级路径)
+    
+    DKISystem.chat() 返回 DKIResponse:
+    - text, memories_used, gating_decision, latency_ms, ...
+    - metadata["hybrid_injection"] 包含注入详情
+    """
+    loop = asyncio.get_event_loop()
+    response = await loop.run_in_executor(
+        _executor,
+        lambda: dki_system.chat(
+            query=request.query,
+            session_id=session_id,
+            user_id=verified_user_id,
+            force_alpha=request.force_alpha,
+            use_hybrid=request.use_hybrid,
+            max_new_tokens=request.max_tokens,
+            temperature=request.temperature,
+        )
+    )
+    
+    # 从 DKIResponse 中提取元数据
+    hybrid_info = response.metadata.get("hybrid_injection", {})
+    preference_tokens = hybrid_info.get("preference_tokens", 0)
+    history_tokens = hybrid_info.get("history_tokens", 0)
+    
+    _gating_alpha = response.gating_decision.alpha if response.gating_decision else 0.0
+    _pref_alpha = hybrid_info.get("preference_alpha", 0.0)
+    _display_alpha = max(_pref_alpha, _gating_alpha)
+    
+    dki_metadata = DKIMetadataResponse(
+        injection_enabled=(
+            (response.gating_decision.should_inject if response.gating_decision else False)
+            or bool(preference_tokens)
+            or bool(history_tokens)
+        ),
+        alpha=_display_alpha,
+        preference_tokens=preference_tokens,
+        history_tokens=history_tokens,
+        cache_hit=response.cache_hit,
+        cache_tier=response.cache_tier or "none",
+        latency_ms=response.latency_ms,
+    )
+    
+    request_id = f"dki-{uuid.uuid4().hex[:8]}"
+    
+    # 记录可视化数据
+    try:
+        lb = response.latency_breakdown
+        viz_data = {
+            "request_id": request_id,
+            "timestamp": datetime.utcnow().isoformat(),
+            "mode": "dki",
+            "query": request.query,
+            "user_id": verified_user_id,
+            "session_id": session_id,
+            "injection_enabled": dki_metadata.injection_enabled,
+            "alpha": _display_alpha,
+            "preference_tokens": preference_tokens,
+            "history_tokens": history_tokens,
+            "query_tokens": max(0, response.input_tokens - preference_tokens - history_tokens),
+            "total_tokens": response.input_tokens,
+            "cache_hit": response.cache_hit,
+            "cache_tier": response.cache_tier or "none",
+            "latency_ms": response.latency_ms,
+            "preference_text": hybrid_info.get("preference_text", ""),
+            "history_suffix_text": hybrid_info.get("history_suffix_text", ""),
+            "history_messages": hybrid_info.get("history_messages", []),
+            "final_input": hybrid_info.get("final_input", request.query),
+            "rag_prompt_text": "",
+            "rag_context_text": "",
+            "adapter_latency_ms": (lb.router_ms if lb else 0),
+            "injection_latency_ms": ((lb.kv_compute_ms + lb.projection_ms) if lb else 0),
+            "inference_latency_ms": ((lb.prefill_ms + lb.decode_ms) if lb else 0),
+        }
+        record_visualization(viz_data)
+        logger.debug(f"[DKISystem fallback] Recorded visualization for {request_id}")
+    except Exception as viz_error:
+        logger.warning(f"Failed to record visualization: {viz_error}")
+    
+    # 记录统计数据
+    try:
+        record_dki_request(
+            cache_tier=response.cache_tier or "L3",
+            alpha=_display_alpha,
+            injected=dki_metadata.injection_enabled,
+        )
+    except Exception as stats_error:
+        logger.warning(f"Failed to record stats: {stats_error}")
+    
+    return DKIChatResponse(
+        id=request_id,
+        text=response.text,
+        input_tokens=response.input_tokens,
+        output_tokens=response.output_tokens,
+        dki_metadata=dki_metadata,
+        choices=[{
+            "index": 0,
+            "message": {"role": "assistant", "content": response.text},
+            "finish_reason": "stop",
+        }],
+        created=int(datetime.utcnow().timestamp()),
+    )

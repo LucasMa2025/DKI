@@ -48,8 +48,16 @@ class PromptFormatter(ABC):
         """格式化原文消息条目"""
 
     @abstractmethod
-    def format_constraint_instruction(self, trace_ids: List[str]) -> str:
-        """生成可信+推理限定提示"""
+    def format_constraint_instruction(self, trace_ids: List[str], position: str = "above") -> str:
+        """
+        生成可信+推理限定提示
+        
+        Args:
+            trace_ids: 可用的 trace_id 列表
+            position: [SUMMARY] 相对于本段文字的位置
+                      "above" — [SUMMARY] 在本段之上 (suffix 内联场景)
+                      "below" — [SUMMARY] 在本段之下 (system prompt 场景)
+        """
 
     @abstractmethod
     def format_fact_segment(self, response: FactResponse) -> str:
@@ -159,19 +167,29 @@ class GenericFormatter(PromptFormatter):
         role_label = self._role_label(item.role)
         return f"{role_label}: {item.content}"
 
-    def format_constraint_instruction(self, trace_ids: List[str]) -> str:
+    def format_constraint_instruction(self, trace_ids: List[str], position: str = "above") -> str:
         """
         可信+推理限定提示
         
         补充建议集成:
         - 强约束: 未调用 retrieve_fact 即基于 summary 给出数值/时间/原话 → 回答无效
+        
+        Args:
+            trace_ids: 可用的 trace_id 列表
+            position: "above" — [SUMMARY] 在本段之上; "below" — [SUMMARY] 在本段之下
         """
         trace_list = ", ".join(f'"{tid}"' for tid in trace_ids)
+
+        # 根据 position 选择方位词
+        if self.language == "cn":
+            pos_word = "以上" if position == "above" else "下方"
+        else:
+            pos_word = "above" if position == "above" else "below"
 
         if self.language == "cn":
             return (
                 "[可信+推理限定]\n"
-                "以上标记为 [SUMMARY] 的内容为摘要，非完整事实记录。\n"
+                f"{pos_word}标记为 [SUMMARY] 的内容为摘要，非完整事实记录。\n"
                 "若回答需要精确原话、具体数值、时间、因果关系，\n"
                 "且摘要中未明确包含，\n"
                 f"请调用 retrieve_fact(trace_id=\"...\", offset=0, limit=5) 获取原始记录。\n"
@@ -187,7 +205,7 @@ class GenericFormatter(PromptFormatter):
         else:
             return (
                 "[Trustworthy + Reasoning Constraint]\n"
-                "Sections marked [SUMMARY] above are summaries, not complete factual records.\n"
+                f"Sections marked [SUMMARY] {pos_word} are summaries, not complete factual records.\n"
                 "If your answer requires exact quotes, specific numbers, dates, or causal relationships,\n"
                 "and the summary does not explicitly contain them,\n"
                 f"call retrieve_fact(trace_id=\"...\", offset=0, limit=5) to get original records.\n"
@@ -267,9 +285,9 @@ class DeepSeekFormatter(GenericFormatter):
         re.DOTALL,
     )
 
-    def format_constraint_instruction(self, trace_ids: List[str]) -> str:
+    def format_constraint_instruction(self, trace_ids: List[str], position: str = "above") -> str:
         """DeepSeek 版本: 在 system prompt 中注册工具定义"""
-        base = super().format_constraint_instruction(trace_ids)
+        base = super().format_constraint_instruction(trace_ids, position=position)
 
         tool_def = (
             "\n\n[TOOL_DEFINITION]\n"

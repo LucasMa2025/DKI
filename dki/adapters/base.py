@@ -434,6 +434,27 @@ class IUserDataAdapter(ABC):
     
     # ============ 可选方法 (带默认实现) ============
     
+    async def get_recent_messages(
+        self,
+        user_id: str,
+        limit: int = 10,
+    ) -> List[ChatMessage]:
+        """
+        获取用户最近的消息 (跨会话, 按时间降序)
+        
+        用于补充近轮对话上下文, 确保模型能看到最近的对话内容,
+        而不仅仅依赖 BM25 语义召回。
+        
+        Args:
+            user_id: 用户标识
+            limit: 最大消息数 (建议 10-20, 即 5-10 轮对话)
+            
+        Returns:
+            消息列表 (按时间正序, 最旧在前)
+        """
+        logger.warning(f"{self.__class__.__name__} 未实现 get_recent_messages, 返回空列表")
+        return []
+    
     async def get_user_sessions(
         self,
         user_id: str,

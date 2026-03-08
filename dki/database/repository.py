@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from sqlalchemy.orm import Session as SQLSession
-from sqlalchemy import desc
+from sqlalchemy import desc, func
 from loguru import logger
 
 from dki.database.models import (
@@ -264,6 +264,19 @@ class ConversationRepository(BaseRepository):
             .limit(limit)
             .all()
         )
+    
+    def count_by_session(self, session_id: str) -> int:
+        """
+        Get the exact message count for a session using SQL COUNT(*).
+        
+        More efficient and accurate than len(get_by_session(limit=N)),
+        which loads all rows into memory and can be capped by the limit.
+        """
+        return (
+            self.db.query(func.count(Conversation.id))
+            .filter(Conversation.session_id == session_id)
+            .scalar()
+        ) or 0
     
     def get_recent(
         self,

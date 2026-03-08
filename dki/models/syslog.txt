@@ -1,0 +1,128 @@
+==========================================
+Starting DKI with built-in model: qianwen_27b
+==========================================
+Model path: /opt/ai-demo/models/qwen3.5-27b-awq-int4
+Engine: sglang
+Mode: demo
+
+Config: config/config_env.yaml
+
+Launching Demo App (independent upper-layer application)...
+
+2026-03-07 03:23:44.340 | INFO     | demo.config:load_demo_config:190 - Loading demo config from environment variables
+2026-03-07 03:23:44.381 | INFO     | demo.app:_mount_static_files:271 - Vue3 frontend dist not found (API-only mode)
+INFO:     Started server process [63866]
+INFO:     Waiting for application startup.
+2026-03-07 03:23:44.390 | INFO     | demo.app:startup:85 - ============================================================
+2026-03-07 03:23:44.390 | INFO     | demo.app:startup:86 - DKI Demo App starting...
+2026-03-07 03:23:44.390 | INFO     | demo.app:startup:87 - ============================================================
+2026-03-07 03:23:44.408 | INFO     | demo.store.connection:init_database:229 - Demo database initialized (backend=sqlite, url=sqlite:///./data/demo.db)
+2026-03-07 03:23:44.408 | INFO     | demo.store.sqlite_store:connect:31 - SQLiteChatStore connected: ./data/demo.db
+2026-03-07 03:23:44.408 | INFO     | demo.store.factory:create_chat_store:86 - Chat store created: SQLiteChatStore (backend=sqlite)
+2026-03-07 03:23:44.408 | INFO     | demo.app:startup:102 - ✅ Demo store initialized (backend=sqlite)
+2026-03-07 03:23:44.408 | INFO     | demo.dki_bridge:build_adapter_config:135 - Built ConfigDrivenAdapter config for Demo (backend=sqlite, pgvector=enabled)
+2026-03-07 03:23:46.129 | INFO     | dki.config.config_loader:_load_config:396 - Configuration loaded from config/config_env.yaml
+2026-03-07 03:23:46.129 | INFO     | dki.models.base:__init__:432 - Initializing SGLangAdapter with /opt/ai-demo/models/qwen3.5-27b-awq-int4, quantization=awq
+2026-03-07 03:23:46.129 | INFO     | dki.models.factory:create:140 - Created sglang adapter: /opt/ai-demo/models/qwen3.5-27b-awq-int4
+2026-03-07 03:23:47.826 | DEBUG    | dki.models.sglang_adapter:load:324 - AutoProcessor 预加载成功 (SGLang 兼容性)
+2026-03-07 03:23:47.826 | INFO     | dki.models.sglang_adapter:load:360 - Loading SGLang engine (RadixAttention KV injection): /opt/ai-demo/models/qwen3.5-27b-awq-int4 (quantization=awq)
+2026-03-07 03:23:47.826 | INFO     | dki.models.sglang_adapter:load:401 - SGLang quantization: awq_marlin
+2026-03-07 03:23:47.827 | INFO     | dki.models.sglang_adapter:load:449 - Quantization (awq_marlin) detected — forcing dtype=bfloat16, mamba_ssm_dtype=bfloat16 (bfloat16 range ±3.4e38 prevents Mamba SSM NaN overflow; causal_conv1d.py dtype alignment ensures consistency)
+2026-03-07 03:23:48.201 | DEBUG    | dki.models.sglang_adapter:_filter_engine_kwargs:259 - 所有参数均被 ServerArgs (sglang.srt.server_args) 接受
+<frozen importlib._bootstrap_external>:1184: FutureWarning: The cuda.cudart module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.runtime module instead.
+<frozen importlib._bootstrap_external>:1184: FutureWarning: The cuda.nvrtc module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.nvrtc module instead.
+[2026-03-07 03:23:49] WARNING model_config.py:1235: Casting torch.float16 to torch.bfloat16.
+[2026-03-07 03:23:49] INFO awq.py:291: The model is convertible to awq_marlin during runtime. Using awq_marlin kernel.
+[2026-03-07 03:23:49] WARNING model_config.py:1082: Transformers version 5.3.0 is used for model type qwen3_5. If you experience issues related to RoPE parameters, they may be due to incompatibilities between Transformers >=5.0.0 and some models. You can try downgrading to transformers==4.57.1 as a workaround.
+[2026-03-07 03:23:49] WARNING server_args.py:1958: Disabling overlap schedule since mamba no_buffer is not compatible with overlap schedule, try to use --disable-radix-cache if overlap schedule is necessary
+[2026-03-07 03:23:49] INFO server_args.py:2048: Attention backend not specified. Use flashinfer backend by default.
+[2026-03-07 03:23:49] INFO engine.py:177: server_args=ServerArgs(model_path='/opt/ai-demo/models/qwen3.5-27b-awq-int4', tokenizer_path='/opt/ai-demo/models/qwen3.5-27b-awq-int4', tokenizer_mode='auto', tokenizer_worker_num=1, skip_tokenizer_init=False, load_format='auto', model_loader_extra_config='{}', trust_remote_code=True, context_length=8192, is_embedding=False, enable_multimodal=None, revision=None, model_impl='auto', host='127.0.0.1', port=30000, fastapi_root_path='', grpc_mode=False, skip_server_warmup=False, warmups=None, nccl_port=None, checkpoint_engine_wait_weights_before_ready=False, ssl_keyfile=None, ssl_certfile=None, ssl_ca_certs=None, ssl_keyfile_password=None, enable_ssl_refresh=False, dtype='bfloat16', quantization='awq_marlin', quantization_param_path=None, kv_cache_dtype='auto', enable_fp32_lm_head=False, modelopt_quant=None, modelopt_checkpoint_restore_path=None, modelopt_checkpoint_save_path=None, modelopt_export_path=None, quantize_and_serve=False, rl_quant_profile=None, mem_fraction_static=0.85, max_running_requests=None, max_queued_requests=None, max_total_tokens=None, chunked_prefill_size=8192, enable_dynamic_chunking=False, max_prefill_tokens=16384, prefill_max_requests=None, schedule_policy='lpm', enable_priority_scheduling=False, disable_priority_preemption=False, default_priority_value=None, abort_on_priority_when_disabled=False, schedule_low_priority_values_first=False, priority_scheduling_preemption_threshold=10, schedule_conservativeness=1.0, page_size=1, swa_full_tokens_ratio=0.8, disable_hybrid_swa_memory=False, radix_eviction_policy='lru', enable_prefill_delayer=False, prefill_delayer_max_delay_passes=30, prefill_delayer_token_usage_low_watermark=None, prefill_delayer_forward_passes_buckets=None, prefill_delayer_wait_seconds_buckets=None, device='cuda', tp_size=1, pp_size=1, pp_max_micro_batch_size=None, pp_async_batch_depth=0, stream_interval=1, stream_output=False, enable_streaming_session=False, random_seed=741523347, constrained_json_whitespace_pattern=None, constrained_json_disable_any_whitespace=False, watchdog_timeout=300, soft_watchdog_timeout=None, dist_timeout=None, download_dir=None, model_checksum=None, base_gpu_id=0, gpu_id_step=1, sleep_on_idle=False, use_ray=False, custom_sigquit_handler=None, log_level='error', log_level_http=None, log_requests=False, log_requests_level=2, log_requests_format='text', log_requests_target=None, uvicorn_access_log_exclude_prefixes=[], crash_dump_folder=None, show_time_cost=False, enable_metrics=False, enable_metrics_for_all_schedulers=False, tokenizer_metrics_custom_labels_header='x-custom-labels', tokenizer_metrics_allowed_custom_labels=None, extra_metric_labels=None, bucket_time_to_first_token=None, bucket_inter_token_latency=None, bucket_e2e_request_latency=None, collect_tokens_histogram=False, prompt_tokens_buckets=None, generation_tokens_buckets=None, gc_warning_threshold_secs=0.0, decode_log_interval=40, enable_request_time_stats_logging=False, kv_events_config=None, enable_trace=False, otlp_traces_endpoint='localhost:4317', export_metrics_to_file=False, export_metrics_to_file_dir=None, api_key=None, admin_api_key=None, served_model_name='/opt/ai-demo/models/qwen3.5-27b-awq-int4', weight_version='default', chat_template=None, hf_chat_template_name=None, completion_template=None, file_storage_path='sglang_storage', enable_cache_report=False, reasoning_parser=None, tool_call_parser=None, tool_server=None, sampling_defaults='model', dp_size=1, load_balance_method='round_robin', attn_cp_size=1, moe_dp_size=1, dist_init_addr=None, nnodes=1, node_rank=0, json_model_override_args='{}', preferred_sampling_params=None, enable_lora=None, enable_lora_overlap_loading=None, max_lora_rank=None, lora_target_modules=None, lora_paths=None, max_loaded_loras=None, max_loras_per_batch=8, lora_eviction_policy='lru', lora_backend='csgmv', max_lora_chunk_size=16, attention_backend='flashinfer', decode_attention_backend=None, prefill_attention_backend=None, sampling_backend='flashinfer', grammar_backend='xgrammar', mm_attention_backend=None, fp8_gemm_runner_backend='auto', fp4_gemm_runner_backend='flashinfer_cutlass', nsa_prefill_backend=None, nsa_decode_backend=None, disable_flashinfer_autotune=False, mamba_backend='triton', speculative_algorithm=None, speculative_draft_model_path=None, speculative_draft_model_revision=None, speculative_draft_load_format=None, speculative_num_steps=None, speculative_eagle_topk=None, speculative_num_draft_tokens=None, speculative_accept_threshold_single=1.0, speculative_accept_threshold_acc=1.0, speculative_token_map=None, speculative_attention_mode='prefill', speculative_draft_attention_backend=None, speculative_moe_runner_backend='auto', speculative_moe_a2a_backend=None, speculative_draft_model_quantization='awq_marlin', speculative_ngram_min_match_window_size=1, speculative_ngram_max_match_window_size=12, speculative_ngram_min_bfs_breadth=1, speculative_ngram_max_bfs_breadth=10, speculative_ngram_match_type='BFS', speculative_ngram_branch_length=18, speculative_ngram_capacity=10000000, enable_multi_layer_eagle=False, ep_size=1, moe_a2a_backend='none', moe_runner_backend='auto', flashinfer_mxfp4_moe_precision='default', enable_flashinfer_allreduce_fusion=False, enable_aiter_allreduce_fusion=False, deepep_mode='auto', ep_num_redundant_experts=0, ep_dispatch_algorithm=None, init_expert_location='trivial', enable_eplb=False, eplb_algorithm='auto', eplb_rebalance_num_iterations=1000, eplb_rebalance_layers_per_chunk=None, eplb_min_rebalancing_utilization_threshold=1.0, expert_distribution_recorder_mode=None, expert_distribution_recorder_buffer_size=1000, enable_expert_distribution_metrics=False, deepep_config=None, moe_dense_tp_size=None, elastic_ep_backend=None, enable_elastic_expert_backup=False, mooncake_ib_device=None, max_mamba_cache_size=None, mamba_ssm_dtype='bfloat16', mamba_full_memory_ratio=0.9, mamba_scheduler_strategy='no_buffer', mamba_track_interval=256, linear_attn_backend='triton', linear_attn_decode_backend=None, linear_attn_prefill_backend=None, enable_hierarchical_cache=False, hicache_ratio=2.0, hicache_size=0, hicache_write_policy='write_through', hicache_io_backend='kernel', hicache_mem_layout='layer_first', disable_hicache_numa_detect=False, hicache_storage_backend=None, hicache_storage_prefetch_policy='best_effort', hicache_storage_backend_extra_config=None, hierarchical_sparse_attention_extra_config=None, enable_lmcache=False, kt_weight_path=None, kt_method=None, kt_cpuinfer=None, kt_threadpool_count=None, kt_num_gpu_experts=None, kt_max_deferred_experts_per_token=None, dllm_algorithm=None, dllm_algorithm_config=None, enable_double_sparsity=False, ds_channel_config_path=None, ds_heavy_channel_num=32, ds_heavy_token_num=256, ds_heavy_channel_type='qk', ds_sparse_decode_threshold=4096, cpu_offload_gb=0, offload_group_size=-1, offload_num_in_group=1, offload_prefetch_step=1, offload_mode='cpu', multi_item_scoring_delimiter=None, disable_radix_cache=False, cuda_graph_max_bs=4, cuda_graph_bs=[1, 2, 4], disable_cuda_graph=False, disable_cuda_graph_padding=False, enable_profile_cuda_graph=False, enable_cudagraph_gc=False, enable_layerwise_nvtx_marker=False, enable_nccl_nvls=False, enable_symm_mem=False, disable_flashinfer_cutlass_moe_fp4_allgather=False, enable_tokenizer_batch_encode=False, disable_tokenizer_batch_decode=False, disable_outlines_disk_cache=False, disable_custom_all_reduce=False, enable_mscclpp=False, enable_torch_symm_mem=False, disable_overlap_schedule=True, enable_mixed_chunk=False, enable_dp_attention=False, enable_dp_lm_head=False, enable_two_batch_overlap=False, enable_single_batch_overlap=False, tbo_token_distribution_threshold=0.48, enable_torch_compile=False, disable_piecewise_cuda_graph=True, enforce_piecewise_cuda_graph=False, enable_torch_compile_debug_mode=False, torch_compile_max_bs=32, piecewise_cuda_graph_max_tokens=8192, piecewise_cuda_graph_tokens=[4, 8, 12, 16, 20, 24, 28, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 256, 288, 320, 352, 384, 416, 448, 480, 512, 576, 640, 704, 768, 832, 896, 960, 1024, 1280, 1536, 1792, 2048, 2304, 2560, 2816, 3072, 3328, 3584, 3840, 4096, 4608, 5120, 5632, 6144, 6656, 7168, 7680, 8192], piecewise_cuda_graph_compiler='eager', torchao_config='', enable_nan_detection=False, enable_p2p_check=False, triton_attention_reduce_in_fp32=False, triton_attention_num_kv_splits=8, triton_attention_split_tile_size=None, num_continuous_decode_steps=1, delete_ckpt_after_loading=False, enable_memory_saver=False, enable_weights_cpu_backup=False, enable_draft_weights_cpu_backup=False, allow_auto_truncate=False, enable_custom_logit_processor=False, flashinfer_mla_disable_ragged=False, disable_shared_experts_fusion=False, disable_chunked_prefix_cache=False, disable_fast_image_processor=False, keep_mm_feature_on_device=False, enable_return_hidden_states=False, enable_return_routed_experts=False, scheduler_recv_interval=1, numa_node=None, enable_deterministic_inference=False, rl_on_policy_target=None, enable_attn_tp_input_scattered=False, enable_nsa_prefill_context_parallel=False, nsa_prefill_cp_mode='round-robin-split', enable_fused_qk_norm_rope=False, enable_precise_embedding_interpolation=False, enable_fused_moe_sum_all_reduce=False, enable_dynamic_batch_tokenizer=False, dynamic_batch_tokenizer_batch_size=32, dynamic_batch_tokenizer_batch_timeout=0.002, debug_tensor_dump_output_folder=None, debug_tensor_dump_layers=None, debug_tensor_dump_input_file=None, debug_tensor_dump_inject=False, disaggregation_mode='null', disaggregation_transfer_backend='mooncake', disaggregation_bootstrap_port=8998, disaggregation_ib_device=None, disaggregation_decode_enable_offload_kvcache=False, num_reserved_decode_tokens=512, disaggregation_decode_polling_interval=1, encoder_only=False, language_only=False, encoder_transfer_backend='zmq_to_scheduler', encoder_urls=[], enable_adaptive_dispatch_to_encoder=False, custom_weight_loader=[], weight_loader_disable_mmap=False, remote_instance_weight_loader_seed_instance_ip=None, remote_instance_weight_loader_seed_instance_service_port=None, remote_instance_weight_loader_send_weights_group_ports=None, remote_instance_weight_loader_backend='nccl', remote_instance_weight_loader_start_seed_via_transfer_engine=False, enable_pdmux=False, pdmux_config_path=None, sm_group_num=8, mm_max_concurrent_calls=32, mm_per_request_timeout=10.0, enable_broadcast_mm_inputs_process=False, enable_prefix_mm_cache=False, mm_enable_dp_encoder=False, mm_process_config={}, limit_mm_data_per_request=None, enable_mm_global_cache=False, decrypted_config_file=None, decrypted_draft_config_file=None, forward_hooks=None)
+============================================================
+  DKI Demo App — Independent Upper-Layer Application
+============================================================
+
+  Server: http://0.0.0.0:8000
+  Docs:   http://0.0.0.0:8000/docs
+
+  Features:
+    - Independent persistence (SQLite / PostgreSQL / pgvector)
+    - Async PostgreSQL support (asyncpg)
+    - DKI Plugin integration via ConfigDrivenAdapter
+    - Redis caching support
+
+============================================================
+  DKI Config: config/config_env.yaml (via DKI_CONFIG_PATH)
+
+<frozen importlib._bootstrap_external>:1184: FutureWarning: The cuda.cudart module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.runtime module instead.
+<frozen importlib._bootstrap_external>:1184: FutureWarning: The cuda.nvrtc module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.nvrtc module instead.
+<frozen importlib._bootstrap_external>:1184: FutureWarning: The cuda.cudart module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.runtime module instead.
+<frozen importlib._bootstrap_external>:1184: FutureWarning: The cuda.nvrtc module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.nvrtc module instead.
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+`torch_dtype` is deprecated! Use `dtype` instead!
+Loading safetensors checkpoint shards:   0% Completed | 0/7 [00:00<?, ?it/s]
+Loading safetensors checkpoint shards:  14% Completed | 1/7 [00:00<00:02,  2.77it/s]
+Loading safetensors checkpoint shards:  29% Completed | 2/7 [00:00<00:01,  2.90it/s]
+Loading safetensors checkpoint shards:  43% Completed | 3/7 [00:00<00:01,  3.11it/s]
+Loading safetensors checkpoint shards:  57% Completed | 4/7 [00:01<00:01,  2.92it/s]
+Loading safetensors checkpoint shards:  71% Completed | 5/7 [00:01<00:00,  2.78it/s]
+Loading safetensors checkpoint shards:  86% Completed | 6/7 [00:01<00:00,  3.48it/s]
+Loading safetensors checkpoint shards: 100% Completed | 7/7 [00:02<00:00,  3.33it/s]
+Loading safetensors checkpoint shards: 100% Completed | 7/7 [00:02<00:00,  3.14it/s]
+
+Capturing batches (bs=1 avail_mem=6.01 GB): 100%|██████████| 3/3 [00:01<00:00,  2.92it/s]
+2026-03-07T03:24:03.489907+0800 | load | INFO - SGLang adapter loaded: /opt/ai-demo/models/qwen3.5-27b-awq-int4 — SGLang RadixAttention KV Injection (schedule=lpm, 无 HF 模型)
+2026-03-07T03:24:03.490165+0800 | __init__ | INFO - ConfigDrivenAdapter initialized (db_type=sqlite)
+2026-03-07T03:24:03.505550+0800 | _init_vector_handler | INFO - No vector_index_config provided and no pgvector embedding_field, falling back to BM25-only retrieval
+2026-03-07T03:24:03.505630+0800 | _init_vector_handler | INFO - BM25-only mode enabled for DYNAMIC type (no vector_index_config)
+2026-03-07T03:24:03.505660+0800 | connect | INFO - ConfigDrivenAdapter connected to database
+2026-03-07T03:24:03.505693+0800 | _create_dki_plugin | WARNING - Redis connection failed: RedisConfig.__init__() got an unexpected keyword argument 'url', continuing without Redis
+2026-03-07T03:24:03.505825+0800 | __init__ | INFO - Recall v4 components initialized (SuffixBuilder + FactRetriever)
+2026-03-07T03:24:03.505861+0800 | _resolve_context_window | INFO - DKI Plugin context_window resolved: 8192
+2026-03-07T03:24:03.509636+0800 | __init__ | INFO - MemoryTrigger initialized (language=auto)
+2026-03-07T03:24:03.509710+0800 | __init__ | INFO - ReferenceResolver initialized (last_few_turns=3, recent_turns=10)
+2026-03-07T03:24:03.510053+0800 | __init__ | INFO - FunctionCallLogger initialized (db=no, text_log_dir=logs/function_calls)
+2026-03-07T03:24:03.510134+0800 | __init__ | INFO - PreferenceCacheManager initialized (L1 max=1000, L2 disabled)
+2026-03-07T03:24:03.510164+0800 | __init__ | INFO - DKI Plugin initialized (strategy=recall_v4, language=cn, cache=L1 only, architecture=planner+executor)
+2026-03-07T03:24:03.510196+0800 | startup | INFO - ✅ DKI Plugin initialized
+2026-03-07T03:24:03.521871+0800 | _mount_visualization_routes | INFO - ✅ DKI Visualization routes mounted
+2026-03-07T03:24:03.521938+0800 | startup | INFO - ============================================================
+2026-03-07T03:24:03.521985+0800 | startup | INFO - DKI Demo App ready at http://0.0.0.0:8000
+2026-03-07T03:24:03.522010+0800 | startup | INFO - ============================================================
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+INFO:     39.130.113.42:24907 - "OPTIONS /api/sessions HTTP/1.1" 200 OK
+INFO:     39.130.113.42:24907 - "GET /api/sessions HTTP/1.1" 401 Unauthorized
+INFO:     39.130.113.42:24915 - "OPTIONS /api/auth/login HTTP/1.1" 200 OK
+2026-03-07T03:24:37.967215+0800 | login | INFO - Demo user logged in: user01 (id=fe53e0e7-06c1-45fc-80f3-479857aa61f6)
+INFO:     39.130.113.42:24915 - "POST /api/auth/login HTTP/1.1" 200 OK
+INFO:     39.130.113.42:24915 - "GET /api/sessions HTTP/1.1" 200 OK
+INFO:     39.130.113.42:24915 - "OPTIONS /api/sessions/e45294f9-ada9-4a81-a871-35bbf4c1dc6a/messages HTTP/1.1" 200 OK
+INFO:     39.130.113.42:24915 - "GET /api/sessions/e45294f9-ada9-4a81-a871-35bbf4c1dc6a/messages HTTP/1.1" 200 OK
+INFO:     39.130.113.42:24915 - "OPTIONS /api/sessions/e45294f9-ada9-4a81-a871-35bbf4c1dc6a HTTP/1.1" 200 OK
+2026-03-07T03:24:43.634852+0800 | delete_session | INFO - Deleted session: e45294f9-ada9-4a81-a871-35bbf4c1dc6a
+INFO:     39.130.113.42:24915 - "DELETE /api/sessions/e45294f9-ada9-4a81-a871-35bbf4c1dc6a HTTP/1.1" 200 OK
+INFO:     39.130.113.42:24915 - "OPTIONS /api/sessions/4580399a-b425-42f3-8a16-0113474b6ab3 HTTP/1.1" 200 OK
+2026-03-07T03:24:47.180511+0800 | delete_session | INFO - Deleted session: 4580399a-b425-42f3-8a16-0113474b6ab3
+INFO:     39.130.113.42:24915 - "DELETE /api/sessions/4580399a-b425-42f3-8a16-0113474b6ab3 HTTP/1.1" 200 OK
+INFO:     39.130.113.42:24915 - "OPTIONS /api/sessions HTTP/1.1" 200 OK
+2026-03-07T03:24:50.132593+0800 | create_session | INFO - Created session: 26c41520-745b-48c6-b55a-a76ef9f927a0 for user: fe53e0e7-06c1-45fc-80f3-479857aa61f6
+INFO:     39.130.113.42:24915 - "POST /api/sessions HTTP/1.1" 200 OK
+INFO:     39.130.113.42:24915 - "OPTIONS /api/sessions/26c41520-745b-48c6-b55a-a76ef9f927a0/messages HTTP/1.1" 200 OK
+INFO:     39.130.113.42:24915 - "GET /api/sessions/26c41520-745b-48c6-b55a-a76ef9f927a0/messages HTTP/1.1" 200 OK
+INFO:     39.130.113.42:24943 - "OPTIONS /v1/dki/chat HTTP/1.1" 200 OK
+Building prefix dict from the default dictionary ...
+[2026-03-07 03:24:57] Building prefix dict from the default dictionary ...
+Loading model from cache /tmp/jieba.cache
+[2026-03-07 03:24:57] Loading model from cache /tmp/jieba.cache
+Loading model cost 0.302 seconds.
+[2026-03-07 03:24:57] Loading model cost 0.302 seconds.
+Prefix dict has been built successfully.
+[2026-03-07 03:24:57] Prefix dict has been built successfully.
+2026-03-07T03:25:50.086375+0800 | _parse_engine_output | ERROR - [SGLang NaN detected] Model produced NaN during inference! finish_reason={'type': 'stop', 'matched': 'NaN happened'}, prompt_tokens=128, completion_tokens=1. This is typically caused by numerical overflow in quantized models. Solutions: 1) Use dtype=bfloat16 instead of float16 (bfloat16 range ±3.4e38 vs float16 ±65504, prevents Mamba SSM overflow); 2) Ensure causal_conv1d.py dtype alignment is deployed; 3) Try reducing prompt length.
+2026-03-07T03:25:50.086549+0800 | async_forward_with_kv_injection | INFO - [async_forward_with_kv_injection] latency=52731ms, output_len=0, prompt_len=361, alpha=0.5, output_type=dict
+2026-03-07T03:25:50.086614+0800 | async_forward_with_kv_injection | WARNING - [async_forward_with_kv_injection] Empty output! raw_output_type=dict, raw_output_repr={'text': '', 'output_ids': [248044], 'meta_info': {'id': 'cf2f7d7f9d4940aa959d3b77b10b01f1', 'finish_reason': {'type': 'stop', 'matched': 'NaN happened'}, 'prompt_tokens': 128, 'weight_version': 'default', 'total_retractions': 0, 'completion_tokens': 1, 'cached_tokens': 0, 'cached_tokens_details': None, 'dp_rank': None, 'e2e_latency': 52.73091622300126, 'response_sent_to_client_ts': 1772825150.086318}}
+2026-03-07T03:25:50.086680+0800 | _execute_with_kv_injection | INFO - [KV injection result] output_len=0, input_tokens=128, output_tokens=1, latency=52732ms
+2026-03-07T03:25:50.086735+0800 | _execute_with_kv_injection | WARNING - [KV injection] Empty output from model! raw_output=ModelOutput(text='', tokens=[], logits=None, hidden_states=None, attentions=None, kv_cache=None, latency_ms=52731.282181994175, input_tokens=128, output_tokens=1, metadata={'alpha': 0.5, 'injection_mode': 'sglang_native_radix_attention'})
+INFO:     39.130.113.42:24943 - "POST /v1/dki/chat HTTP/1.1" 200 OK

@@ -28,13 +28,27 @@ Author: AGI Demo Project
 Version: 3.0.0
 """
 
+import asyncio
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, AsyncIterator, Dict, List, Optional, Tuple, Union
 from datetime import datetime
 
 from loguru import logger
+
+from dki.core.exceptions import (
+    DKIError,
+    AdapterConnectionError,
+    AdapterSchemaError,
+    AdapterTimeoutError,
+    KVComputeError,
+    KVOOMError,
+    ModelError,
+    ModelOOMError,
+    RecallError,
+    BM25InitError,
+)
 
 from dki.core.text_utils import (
     strip_think_content,
@@ -129,6 +143,9 @@ class InjectionMetadata:
     reference_type: Optional[str] = None
     reference_scope: Optional[str] = None
     
+    # v7.0: 向量检索能力信息
+    retrieval_mode: str = "unknown"  # bm25_only | bm25_embedding | keyword | unknown
+    
     # Alpha Profile (v3.0)
     alpha_profile: Optional[Dict[str, Any]] = None
     
@@ -178,6 +195,7 @@ class InjectionMetadata:
                 "type": self.reference_type,
                 "scope": self.reference_scope,
             },
+            "retrieval_mode": self.retrieval_mode,
             "safety_violations": self.safety_violations or [],
         }
 
@@ -395,6 +413,9 @@ class DKIPlugin:
         self._preference_text_cache: Dict[str, Tuple[List, float]] = {}
         self._preference_cache_ttl: float = 300.0  # 5 分钟 TTL (秒)
         
+        # P0-4: AsyncSingleFlight 防止偏好缓存 thundering herd
+        self._preference_single_flight: Dict[str, asyncio.Future] = {}
+        
         # 工作日志 (用于监控 API)
         self._injection_logs: List[InjectionMetadata] = []
         self._max_logs = 1000
@@ -424,6 +445,100 @@ class DKIPlugin:
     # ================================================================
     # 内部方法
     # ================================================================
+    
+    def _detect_retrieval_mode(self) -> str:
+        """
+        v7.0: 检测适配器的检索模式
+        
+        根据 ConfigDrivenAdapter 的状态判断当前使用的检索策略:
+        - bm25_embedding: 有 vector_index_config → BM25 + Embedding 混合检索
+        - bm25_only: 无 vector_index_config → 仅 BM25 召回
+        - pgvector: 使用 PostgreSQL 预计算向量
+        - keyword: 简单关键词匹配
+        - unknown: 非 ConfigDrivenAdapter 或无法判断
+        """
+        try:
+            from dki.adapters.config_driven_adapter import ConfigDrivenAdapter
+            
+            if not isinstance(self.data_adapter, ConfigDrivenAdapter):
+                return "unknown"
+            
+            adapter = self.data_adapter
+            vs_config = adapter.adapter_config.vector_search
+            
+            if not vs_config.enabled:
+                return "keyword"
+            
+            # 检查是否有向量能力
+            if vs_config.has_vector_capability:
+                if vs_config.type.value == "pgvector":
+                    return "pgvector"
+                return "bm25_embedding"
+            
+            # 无向量能力但 type=dynamic → BM25-only
+            if getattr(adapter, '_bm25_only_mode', False):
+                return "bm25_only"
+            
+            return "bm25_only"
+            
+        except Exception:
+            return "unknown"
+    
+    def _get_max_recent_turns(self) -> int:
+        """
+        v7.2: 获取近轮对话的最大轮次数
+        
+        从配置 dki.recall.budget.max_recent_turns 读取, 默认 5
+        """
+        try:
+            if self._recall_config and hasattr(self._recall_config, 'budget'):
+                return getattr(self._recall_config.budget, 'max_recent_turns', 5)
+        except Exception:
+            pass
+        return 5
+    
+    def _merge_recent_and_recalled(
+        self,
+        recent_messages: List[AdapterChatMessage],
+        recalled_messages: List[AdapterChatMessage],
+    ) -> List[AdapterChatMessage]:
+        """
+        v7.2: 合并近轮对话与 BM25 召回结果
+        
+        策略: 近轮优先, 去重, 按时间排序
+        - recent_messages: 按时间正序 (最旧在前), 确保多轮连贯
+        - recalled_messages: 按 BM25 相关性排序, 可能来自任意会话
+        
+        合并后: 近轮消息在前 (保持时间序), BM25 补充在后 (去重)
+        """
+        seen_ids = set()
+        merged = []
+        
+        # 1. 近轮消息优先 (保持时间序)
+        for msg in recent_messages:
+            msg_id = getattr(msg, 'message_id', None) or id(msg)
+            msg_id = str(msg_id)
+            if msg_id not in seen_ids:
+                seen_ids.add(msg_id)
+                merged.append(msg)
+        
+        # 2. BM25 召回补充 (去重)
+        bm25_added = 0
+        for msg in recalled_messages:
+            msg_id = getattr(msg, 'message_id', None) or id(msg)
+            msg_id = str(msg_id)
+            if msg_id not in seen_ids:
+                seen_ids.add(msg_id)
+                merged.append(msg)
+                bm25_added += 1
+        
+        if bm25_added > 0:
+            logger.debug(
+                f"Merged history: {len(recent_messages)} recent + "
+                f"{bm25_added} BM25 recalled = {len(merged)} total"
+            )
+        
+        return merged
     
     def _resolve_context_window(self) -> int:
         """
@@ -501,10 +616,14 @@ class DKIPlugin:
         self, user_id: str
     ) -> List[AdapterUserPreference]:
         """
-        带 TTL 的偏好文本缓存 (P1-3)
+        带 TTL 的偏好文本缓存 (P1-3) + AsyncSingleFlight (P0-4)
         
         偏好是低频变更数据 (通常数天不变)，但每次 chat 都查 DB。
         5 分钟 TTL 可显著降低 P95 延迟，偏好更新后最多 5 分钟生效。
+        
+        P0-4: 使用 single-flight 模式防止 thundering herd:
+        当 100 个并发请求同时缓存未命中时, 只有第一个请求查 DB,
+        其余请求等待第一个请求的结果。
         
         Args:
             user_id: 用户 ID
@@ -514,17 +633,42 @@ class DKIPlugin:
         """
         now = time.time()
         
+        # 1. 检查 TTL 缓存
         if user_id in self._preference_text_cache:
             cached_prefs, cached_at = self._preference_text_cache[user_id]
             if now - cached_at < self._preference_cache_ttl:
                 logger.debug(f"Preference text cache hit for user {user_id}")
                 return cached_prefs
         
-        # 缓存未命中，查询 DB
-        preferences = await self.data_adapter.get_user_preferences(user_id)
-        self._preference_text_cache[user_id] = (preferences, now)
+        # 2. P0-4: Single-flight — 合并并发请求
+        flight_key = f"pref:{user_id}"
+        if flight_key in self._preference_single_flight:
+            # 已有 in-flight 请求, 等待其结果
+            logger.debug(f"Preference single-flight join for user {user_id}")
+            return await self._preference_single_flight[flight_key]
         
-        return preferences
+        # 创建 future, 标记 in-flight
+        loop = asyncio.get_event_loop()
+        future: asyncio.Future = loop.create_future()
+        self._preference_single_flight[flight_key] = future
+        
+        try:
+            # 缓存未命中，查询 DB
+            preferences = await self.data_adapter.get_user_preferences(user_id)
+            self._preference_text_cache[user_id] = (preferences, time.time())
+            
+            # 通知所有等待者
+            if not future.done():
+                future.set_result(preferences)
+            return preferences
+        except Exception as e:
+            # 通知所有等待者异常
+            if not future.done():
+                future.set_exception(e)
+            raise
+        finally:
+            # 清理 in-flight 标记
+            self._preference_single_flight.pop(flight_key, None)
     
     def invalidate_preference_text_cache(
         self, user_id: Optional[str] = None
@@ -703,7 +847,7 @@ class DKIPlugin:
         user_id: str,
         session_id: str,
         force_alpha: Optional[float] = None,
-        max_new_tokens: int = 512,
+        max_new_tokens: Optional[int] = None,
         temperature: float = 0.7,
         **kwargs,
     ) -> DKIPluginResponse:
@@ -728,6 +872,12 @@ class DKIPlugin:
         Returns:
             DKIPluginResponse 包含生成结果和注入元数据
         """
+        # 从配置读取 max_new_tokens 默认值 (config.yaml → model.max_new_tokens)
+        if max_new_tokens is None:
+            max_new_tokens = getattr(
+                getattr(self.config, 'model', None), 'max_new_tokens', 2048
+            )
+        
         start_time = time.time()
         metadata = InjectionMetadata()
         
@@ -748,6 +898,12 @@ class DKIPlugin:
             preferences = await self._get_cached_preferences(user_id)
             metadata.preferences_count = len(preferences)
             
+            # v7.0: 检测适配器的向量检索能力
+            # ConfigDrivenAdapter 会根据 vector_index_config 的有无
+            # 自动选择 BM25+Embedding 或 BM25-only
+            retrieval_mode = self._detect_retrieval_mode()
+            metadata.retrieval_mode = retrieval_mode
+            
             # v6.1: 不限制 session_id, 支持跨会话记忆检索
             # 适配器会在所有该用户的会话中检索相关历史
             relevant_history = await self.data_adapter.search_relevant_history(
@@ -756,13 +912,40 @@ class DKIPlugin:
                 session_id=None,  # 跨会话检索
                 limit=context.recall_limit,
             )
+            
+            # v7.2: 获取近轮对话 (跨会话, 按时间近度)
+            # BM25 只做语义相关性召回, 可能遗漏最近的对话内容
+            # 近轮对话确保模型能看到最近的上下文, 维持多轮连贯性
+            recent_messages = []
+            try:
+                max_recent = self._get_max_recent_turns()
+                recent_messages = await self.data_adapter.get_recent_messages(
+                    user_id=user_id,
+                    limit=max_recent * 2,  # 每轮 user+assistant
+                )
+                if recent_messages:
+                    logger.debug(
+                        f"Recent messages loaded: {len(recent_messages)} "
+                        f"(max_recent_turns={max_recent})"
+                    )
+            except Exception as e:
+                logger.warning(f"Failed to get recent messages (non-critical): {e}")
+            
+            # v7.2: 合并近轮对话 + BM25 召回 (近轮优先, 去重)
+            if recent_messages:
+                relevant_history = self._merge_recent_and_recalled(
+                    recent_messages=recent_messages,
+                    recalled_messages=relevant_history,
+                )
+            
             metadata.relevant_history_count = len(relevant_history)
             
             metadata.adapter_latency_ms = (time.time() - adapter_start) * 1000
             
             logger.debug(
                 f"Adapter data loaded: {len(preferences)} preferences, "
-                f"{len(relevant_history)} relevant history messages"
+                f"{len(relevant_history)} relevant history messages "
+                f"(recent={len(recent_messages)}, retrieval_mode={retrieval_mode})"
             )
             
             # ============ Step 3: 构建注入计划 (Planner Phase 2) ============
@@ -847,83 +1030,469 @@ class DKIPlugin:
                 raw_output=result.raw_output,
             )
             
+        except AdapterConnectionError as e:
+            # P0-1 方案A: 暂时性适配器连接错误 → 重试 1 次后降级
+            logger.warning(
+                f"Adapter connection failed (retryable): {e} "
+                f"[code={e.error_code}]"
+            )
+            metadata.latency_ms = (time.time() - start_time) * 1000
+            metadata.injection_strategy = "adapter_retry_fallback"
+            
+            # 重试 1 次
+            try:
+                await asyncio.sleep(0.5)
+                return await self._fallback_without_adapter(
+                    query=query,
+                    user_id=user_id,
+                    metadata=metadata,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    start_time=start_time,
+                    **kwargs,
+                )
+            except Exception as retry_err:
+                logger.error(f"Adapter retry fallback failed: {retry_err}")
+                return await self._fallback_no_injection(
+                    query=query,
+                    metadata=metadata,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    start_time=start_time,
+                    **kwargs,
+                )
+        
+        except AdapterSchemaError as e:
+            # P0-1 方案A: 永久性 Schema 错误 → 直接降级 + 告警
+            logger.error(
+                f"Adapter schema error (permanent): {e} "
+                f"[code={e.error_code}]"
+            )
+            metadata.latency_ms = (time.time() - start_time) * 1000
+            metadata.injection_strategy = "schema_error_fallback"
+            return await self._fallback_no_injection(
+                query=query,
+                metadata=metadata,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                start_time=start_time,
+                **kwargs,
+            )
+        
+        except (KVOOMError, ModelOOMError) as e:
+            # P0-1 方案A: GPU OOM → 清理缓存后降级
+            logger.critical(
+                f"GPU OOM during DKI: {e} [code={e.error_code}]"
+            )
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    logger.info("GPU cache cleared after OOM")
+            except Exception:
+                pass
+            
+            metadata.latency_ms = (time.time() - start_time) * 1000
+            metadata.injection_strategy = "oom_fallback"
+            return await self._fallback_no_injection(
+                query=query,
+                metadata=metadata,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                start_time=start_time,
+                **kwargs,
+            )
+        
+        except DKIError as e:
+            # P0-1 方案A: 其他 DKI 结构化异常
+            logger.error(
+                f"DKI error: {e} [code={e.error_code}, "
+                f"retryable={e.retryable}]"
+            )
+            metadata.latency_ms = (time.time() - start_time) * 1000
+            metadata.injection_strategy = "dki_error_fallback"
+            return await self._fallback_stable_then_none(
+                query=query,
+                user_id=user_id,
+                metadata=metadata,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                start_time=start_time,
+                **kwargs,
+            )
+        
         except Exception as e:
-            logger.error(f"DKI Plugin error: {e}")
+            # 未分类异常: 保持原有三级降级逻辑
+            logger.error(f"DKI Plugin unexpected error: {e}")
             metadata.latency_ms = (time.time() - start_time) * 1000
             metadata.injection_strategy = "stable_fallback"
+            return await self._fallback_stable_then_none(
+                query=query,
+                user_id=user_id,
+                metadata=metadata,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                start_time=start_time,
+                **kwargs,
+            )
+    
+    # ================================================================
+    # P0-1: 分级降级辅助方法
+    # ================================================================
+    
+    async def _fallback_without_adapter(
+        self,
+        query: str,
+        user_id: str,
+        metadata: InjectionMetadata,
+        max_new_tokens: int,
+        temperature: float,
+        start_time: float,
+        **kwargs,
+    ) -> DKIPluginResponse:
+        """
+        降级: 不使用适配器数据, 仅偏好 K/V + 原始查询
+        
+        适用于适配器暂时性故障 (连接超时等)
+        """
+        try:
+            stable_plan = InjectionPlan(
+                strategy="stable",
+                original_query=query,
+                final_input=query,
+                user_id=user_id,
+                injection_enabled=False,
+            )
             
-            # 第一级降级: 尝试 stable 策略 (偏好 K/V + 原始查询)
-            try:
-                logger.info("Falling back to stable strategy in DKI Plugin")
-                # 构建 stable plan
-                stable_plan = InjectionPlan(
-                    strategy="stable",
-                    original_query=query,
-                    final_input=query,
-                    user_id=user_id,
-                    injection_enabled=False,
-                )
-                
-                # 尝试加载偏好并构建 stable 注入
-                try:
-                    preferences = await self.data_adapter.get_user_preferences(user_id)
-                    if preferences:
-                        pref_text = "\n".join(
-                            f"- {p.preference_type}: {p.preference_text}"
-                            for p in sorted(preferences, key=lambda x: x.priority, reverse=True)
-                            if not p.is_expired()
-                        )
-                        stable_plan.preference_text = pref_text
-                        stable_plan.preferences_count = len(preferences)
-                        stable_plan.injection_enabled = True
-                        stable_plan.alpha_profile = AlphaProfile(
-                            preference_alpha=0.4, history_alpha=1.0
-                        )
-                except Exception:
-                    pass  # 偏好加载失败, 继续无注入推理
-                
-                result = await self._executor.execute(
-                    plan=stable_plan,
+            result = await self._executor.execute(
+                plan=stable_plan,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                **kwargs,
+            )
+            
+            clean_text, _ = strip_think_content(result.text)
+            metadata.latency_ms = (time.time() - start_time) * 1000
+            
+            return DKIPluginResponse(
+                text=clean_text,
+                input_tokens=result.input_tokens,
+                output_tokens=result.output_tokens,
+                metadata=metadata,
+                raw_output=result.raw_output,
+            )
+        except Exception as e:
+            logger.error(f"Fallback without adapter failed: {e}")
+            return await self._fallback_no_injection(
+                query=query,
+                metadata=metadata,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                start_time=start_time,
+                **kwargs,
+            )
+    
+    async def _fallback_no_injection(
+        self,
+        query: str,
+        metadata: InjectionMetadata,
+        max_new_tokens: int,
+        temperature: float,
+        start_time: float,
+        **kwargs,
+    ) -> DKIPluginResponse:
+        """
+        最终降级: 直接调用 LLM, 无任何注入
+        
+        适用于所有其他降级失败的情况
+        """
+        try:
+            if hasattr(self.model, 'async_generate'):
+                output = await self.model.async_generate(
+                    prompt=query,
                     max_new_tokens=max_new_tokens,
                     temperature=temperature,
                     **kwargs,
                 )
-                
-                # v5.7: 移除 <think> 推理内容
-                clean_text, _ = strip_think_content(result.text)
-                
-                metadata.latency_ms = (time.time() - start_time) * 1000
-                return DKIPluginResponse(
-                    text=clean_text,
-                    input_tokens=result.input_tokens,
-                    output_tokens=result.output_tokens,
-                    metadata=metadata,
-                    raw_output=result.raw_output,
-                )
-            except Exception as stable_error:
-                logger.error(f"Stable fallback failed: {stable_error}")
-            
-            # 第二级降级: 直接调用 LLM (无注入)
-            try:
+            else:
                 output = self.model.generate(
                     prompt=query,
                     max_new_tokens=max_new_tokens,
                     temperature=temperature,
                     **kwargs,
                 )
-                # v5.7: 移除 <think> 推理内容
-                clean_text, _ = strip_think_content(output.text)
-                
-                metadata.injection_strategy = "none_fallback"
-                return DKIPluginResponse(
-                    text=clean_text,
-                    input_tokens=output.input_tokens,
-                    output_tokens=output.output_tokens,
-                    metadata=metadata,
+            
+            clean_text, _ = strip_think_content(output.text)
+            metadata.injection_strategy = "none_fallback"
+            metadata.latency_ms = (time.time() - start_time) * 1000
+            
+            return DKIPluginResponse(
+                text=clean_text,
+                input_tokens=output.input_tokens,
+                output_tokens=output.output_tokens,
+                metadata=metadata,
+            )
+        except Exception as fallback_error:
+            logger.error(f"Final fallback generation failed: {fallback_error}")
+            raise
+    
+    async def _fallback_stable_then_none(
+        self,
+        query: str,
+        user_id: str,
+        metadata: InjectionMetadata,
+        max_new_tokens: int,
+        temperature: float,
+        start_time: float,
+        **kwargs,
+    ) -> DKIPluginResponse:
+        """
+        两级降级: stable → 无注入
+        
+        1. 尝试 stable 策略 (偏好 K/V + 原始查询)
+        2. 失败则直接调用 LLM (无注入)
+        """
+        # 第一级: stable 策略
+        try:
+            logger.info("Falling back to stable strategy in DKI Plugin")
+            stable_plan = InjectionPlan(
+                strategy="stable",
+                original_query=query,
+                final_input=query,
+                user_id=user_id,
+                injection_enabled=False,
+            )
+            
+            try:
+                preferences = await self.data_adapter.get_user_preferences(user_id)
+                if preferences:
+                    pref_text = "\n".join(
+                        f"- {p.preference_type}: {p.preference_text}"
+                        for p in sorted(
+                            preferences, key=lambda x: x.priority, reverse=True
+                        )
+                        if not p.is_expired()
+                    )
+                    stable_plan.preference_text = pref_text
+                    stable_plan.preferences_count = len(preferences)
+                    stable_plan.injection_enabled = True
+                    stable_plan.alpha_profile = AlphaProfile(
+                        preference_alpha=0.4, history_alpha=1.0
+                    )
+            except Exception:
+                pass  # 偏好加载失败, 继续无注入推理
+            
+            result = await self._executor.execute(
+                plan=stable_plan,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                **kwargs,
+            )
+            
+            clean_text, _ = strip_think_content(result.text)
+            metadata.latency_ms = (time.time() - start_time) * 1000
+            
+            return DKIPluginResponse(
+                text=clean_text,
+                input_tokens=result.input_tokens,
+                output_tokens=result.output_tokens,
+                metadata=metadata,
+                raw_output=result.raw_output,
+            )
+        except Exception as stable_error:
+            logger.error(f"Stable fallback failed: {stable_error}")
+        
+        # 第二级: 无注入
+        return await self._fallback_no_injection(
+            query=query,
+            metadata=metadata,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            start_time=start_time,
+            **kwargs,
+        )
+    
+    # ================================================================
+    # 流式生成 (Streaming)
+    # ================================================================
+    
+    async def chat_stream(
+        self,
+        query: str,
+        user_id: str,
+        session_id: str,
+        force_alpha: Optional[float] = None,
+        max_new_tokens: Optional[int] = None,
+        temperature: float = 0.7,
+        **kwargs,
+    ) -> AsyncIterator[Dict[str, Any]]:
+        """
+        DKI 增强的流式聊天
+        
+        与 chat() 相同的 Planner → Adapter → Executor 流程,
+        但在推理阶段使用流式生成, 逐 token 返回。
+        
+        Yields:
+            字典, 包含:
+            - type: "token" | "metadata" | "done" | "error"
+            - content: token 文本 (type=token 时)
+            - metadata: InjectionMetadata (type=metadata 时)
+            - text: 完整文本 (type=done 时)
+        """
+        if max_new_tokens is None:
+            max_new_tokens = getattr(
+                getattr(self.config, 'model', None), 'max_new_tokens', 2048
+            )
+        
+        start_time = time.time()
+        metadata = InjectionMetadata()
+        
+        try:
+            # ============ Step 1-3: 与 chat() 相同的 Planner 流程 ============
+            context = self._planner.analyze_query(query)
+            metadata.memory_triggered = context.memory_triggered
+            metadata.trigger_type = context.trigger_type
+            metadata.reference_resolved = context.reference_resolved
+            metadata.reference_type = context.reference_type
+            metadata.reference_scope = context.reference_scope
+            
+            adapter_start = time.time()
+            preferences = await self._get_cached_preferences(user_id)
+            metadata.preferences_count = len(preferences)
+            
+            retrieval_mode = self._detect_retrieval_mode()
+            metadata.retrieval_mode = retrieval_mode
+            
+            relevant_history = await self.data_adapter.search_relevant_history(
+                user_id=user_id,
+                query=query,
+                session_id=None,
+                limit=context.recall_limit,
+            )
+            
+            recent_messages = []
+            try:
+                max_recent = self._get_max_recent_turns()
+                recent_messages = await self.data_adapter.get_recent_messages(
+                    user_id=user_id,
+                    limit=max_recent * 2,
                 )
-            except Exception as fallback_error:
-                logger.error(f"Final fallback generation failed: {fallback_error}")
-                raise
+            except Exception:
+                pass
+            
+            if recent_messages:
+                relevant_history = self._merge_recent_and_recalled(
+                    recent_messages=recent_messages,
+                    recalled_messages=relevant_history,
+                )
+            
+            metadata.relevant_history_count = len(relevant_history)
+            metadata.adapter_latency_ms = (time.time() - adapter_start) * 1000
+            
+            plan = self._planner.build_plan(
+                query=query,
+                user_id=user_id,
+                preferences=preferences,
+                relevant_history=relevant_history,
+                context=context,
+                force_alpha=force_alpha,
+                session_id=session_id,
+                context_window=self._context_window,
+            )
+            
+            metadata.injection_strategy = plan.strategy
+            metadata.injection_enabled = plan.injection_enabled
+            metadata.alpha = plan.alpha_profile.effective_preference_alpha
+            metadata.alpha_profile = plan.alpha_profile.to_dict()
+            metadata.preference_tokens = plan.preference_tokens
+            metadata.history_tokens = plan.history_tokens
+            metadata.query_tokens = plan.query_tokens
+            metadata.total_tokens = plan.total_tokens
+            
+            # 先发送 metadata
+            yield {
+                "type": "metadata",
+                "metadata": metadata.to_dict(),
+            }
+            
+            # ============ Step 4: 流式执行 ============
+            # 检查模型是否支持流式生成
+            has_stream = (
+                hasattr(self.model, 'stream_generate')
+                or hasattr(self.model, 'async_stream_generate')
+            )
+            
+            if has_stream:
+                # 使用模型的流式生成
+                full_text = ""
+                input_tokens = 0
+                output_tokens = 0
+                
+                prompt = plan.final_input
+                if not prompt:
+                    prompt = query
+                
+                if hasattr(self.model, 'async_stream_generate'):
+                    stream = self.model.async_stream_generate(
+                        prompt=prompt,
+                        max_new_tokens=max_new_tokens,
+                        temperature=temperature,
+                        **kwargs,
+                    )
+                    async for chunk in stream:
+                        token_text = chunk if isinstance(chunk, str) else getattr(chunk, 'text', str(chunk))
+                        full_text += token_text
+                        yield {"type": "token", "content": token_text}
+                elif hasattr(self.model, 'stream_generate'):
+                    for chunk in self.model.stream_generate(
+                        prompt=prompt,
+                        max_new_tokens=max_new_tokens,
+                        temperature=temperature,
+                        **kwargs,
+                    ):
+                        token_text = chunk if isinstance(chunk, str) else getattr(chunk, 'text', str(chunk))
+                        full_text += token_text
+                        yield {"type": "token", "content": token_text}
+                
+                clean_text, _ = strip_think_content(full_text)
+                metadata.latency_ms = (time.time() - start_time) * 1000
+                
+                yield {
+                    "type": "done",
+                    "text": clean_text,
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "metadata": metadata.to_dict(),
+                }
+            else:
+                # 模型不支持流式: 回退到非流式, 一次性返回
+                result = await self._executor.execute(
+                    plan=plan,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    **kwargs,
+                )
+                
+                clean_text, _ = strip_think_content(result.text)
+                metadata.latency_ms = (time.time() - start_time) * 1000
+                
+                # 模拟流式: 逐句发送
+                yield {"type": "token", "content": clean_text}
+                yield {
+                    "type": "done",
+                    "text": clean_text,
+                    "input_tokens": result.input_tokens,
+                    "output_tokens": result.output_tokens,
+                    "metadata": metadata.to_dict(),
+                }
+        
+        except Exception as e:
+            logger.error(f"DKI stream error: {e}")
+            yield {
+                "type": "error",
+                "error": str(e),
+                "error_code": getattr(e, 'error_code', 'UNKNOWN'),
+            }
     
     # ================================================================
     # 日志与监控

@@ -2,7 +2,10 @@
 RAG System for DKI
 Retrieval-Augmented Generation implementation as baseline
 
-v5.7 更新:
+v6.0 更新:
+- 增加异步 chat (async_chat) 和流式 chat (chat_stream)
+- 增加偏好缓存 (AsyncSingleFlight + TTL)
+- 细化异常处理 (使用 DKI 结构化异常)
 - 从提示词构造中移除 <think> 推理内容
 - 使用新的 token 预算分配 (30% 生成预留)
 - 历史轮次从外置配置读取 (与 DKI 一致)
@@ -10,9 +13,10 @@ v5.7 更新:
 - 存储响应前移除 think 内容
 """
 
+import asyncio
 import time
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass, field
+from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 from loguru import logger
 
@@ -22,6 +26,16 @@ from dki.core.text_utils import (
 )
 from dki.core.memory_router import MemoryRouter, MemorySearchResult
 from dki.core.embedding_service import EmbeddingService
+from dki.core.exceptions import (
+    DKIError,
+    AdapterConnectionError,
+    AdapterTimeoutError,
+    ModelError,
+    ModelConnectionError,
+    ModelTimeoutError,
+    ModelOOMError,
+    VectorSearchError,
+)
 from dki.models.factory import ModelFactory
 from dki.models.base import BaseModelAdapter, ModelOutput
 from dki.database.connection import DatabaseManager
@@ -30,6 +44,56 @@ from dki.database.repository import (
     UserPreferenceRepository,
 )
 from dki.config.config_loader import ConfigLoader
+
+
+# ============================================================
+# RAG 专用异常
+# ============================================================
+
+class RAGError(DKIError):
+    """RAG 系统基础异常"""
+    def __init__(self, message: str, cause: Optional[Exception] = None):
+        super().__init__(message, error_code="RAG_ERROR", retryable=False, cause=cause)
+
+
+class RAGMemorySearchError(RAGError):
+    """RAG 记忆检索失败"""
+    def __init__(self, message: str, cause: Optional[Exception] = None):
+        super().__init__(message, cause=cause)
+        self.error_code = "RAG_MEMORY_SEARCH"
+        self.retryable = True
+
+
+class RAGHistoryError(RAGError):
+    """RAG 历史加载失败 (非致命, 可降级)"""
+    def __init__(self, message: str, cause: Optional[Exception] = None):
+        super().__init__(message, cause=cause)
+        self.error_code = "RAG_HISTORY"
+        self.retryable = False
+
+
+class RAGPreferenceError(RAGError):
+    """RAG 偏好加载失败 (非致命, 可降级)"""
+    def __init__(self, message: str, cause: Optional[Exception] = None):
+        super().__init__(message, cause=cause)
+        self.error_code = "RAG_PREFERENCE"
+        self.retryable = False
+
+
+class RAGPromptBuildError(RAGError):
+    """RAG 提示词构造失败"""
+    def __init__(self, message: str, cause: Optional[Exception] = None):
+        super().__init__(message, cause=cause)
+        self.error_code = "RAG_PROMPT_BUILD"
+        self.retryable = False
+
+
+class RAGGenerationError(RAGError):
+    """RAG 生成失败"""
+    def __init__(self, message: str, retryable: bool = False, cause: Optional[Exception] = None):
+        super().__init__(message, cause=cause)
+        self.error_code = "RAG_GENERATION"
+        self.retryable = retryable
 
 
 @dataclass
@@ -89,7 +153,16 @@ class RAGSystem:
     1. Retrieve relevant memories
     2. Concatenate to prompt
     3. Generate response
+    
+    v6.0 新增:
+    - async_chat(): 异步版本的 chat
+    - chat_stream(): 流式生成 (SSE 兼容)
+    - 偏好缓存 (TTL + AsyncSingleFlight 防惊群)
+    - 细化异常处理 (RAGError 层次)
     """
+    
+    # 偏好缓存 TTL (秒)
+    _PREFERENCE_CACHE_TTL: float = 300.0  # 5 分钟
     
     def __init__(
         self,
@@ -97,6 +170,7 @@ class RAGSystem:
         memory_router: Optional[MemoryRouter] = None,
         embedding_service: Optional[EmbeddingService] = None,
         engine: Optional[str] = None,
+        preference_cache_ttl: Optional[float] = None,
     ):
         self.config = ConfigLoader().config
         
@@ -114,7 +188,22 @@ class RAGSystem:
             echo=self.config.database.echo,
         )
         
-        logger.info("RAG System initialized")
+        # v6.0: 偏好缓存 (TTL + SingleFlight)
+        self._preference_cache: Dict[str, Tuple[Optional[str], float]] = {}
+        self._preference_cache_ttl = preference_cache_ttl or self._PREFERENCE_CACHE_TTL
+        self._preference_single_flight: Dict[str, asyncio.Future] = {}
+        
+        # 统计
+        self._stats: Dict[str, Any] = {
+            "total_requests": 0,
+            "async_requests": 0,
+            "stream_requests": 0,
+            "preference_cache_hits": 0,
+            "preference_cache_misses": 0,
+            "errors": 0,
+        }
+        
+        logger.info("RAG System initialized (v6.0: async + streaming + preference cache)")
     
     @property
     def model(self) -> BaseModelAdapter:
@@ -465,7 +554,69 @@ class RAGSystem:
     
     def _load_user_preferences(self, user_id: str) -> Optional[str]:
         """
-        从数据库加载用户偏好文本 (v5.3: 为 RAG 增加偏好注入, 确保对比公平)
+        从数据库加载用户偏好文本 (同步版本)
+        
+        Args:
+            user_id: 用户标识
+            
+        Returns:
+            偏好文本 (多条偏好合并), 无偏好时返回 None
+            
+        Raises:
+            RAGPreferenceError: 偏好加载失败 (非致命)
+        """
+        if not user_id:
+            return None
+        
+        # v6.0: 检查缓存
+        cached = self._preference_cache.get(user_id)
+        if cached:
+            pref_text, cached_time = cached
+            if (time.time() - cached_time) < self._preference_cache_ttl:
+                self._stats["preference_cache_hits"] += 1
+                logger.debug(f"RAG preference cache hit for user {user_id}")
+                return pref_text
+        
+        self._stats["preference_cache_misses"] += 1
+        
+        try:
+            with self.db_manager.session_scope() as db:
+                pref_repo = UserPreferenceRepository(db)
+                preferences = pref_repo.get_by_user(user_id, active_only=True)
+                
+                if not preferences:
+                    self._preference_cache[user_id] = (None, time.time())
+                    return None
+                
+                # 按优先级合并偏好文本
+                pref_texts = []
+                for p in preferences:
+                    text = getattr(p, 'preference_text', '') or ''
+                    if text.strip():
+                        pref_texts.append(text.strip())
+                
+                if pref_texts:
+                    combined = "\n".join(pref_texts)
+                    self._preference_cache[user_id] = (combined, time.time())
+                    logger.debug(
+                        f"RAG loaded {len(pref_texts)} preferences for user {user_id}: "
+                        f"{len(combined)} chars"
+                    )
+                    return combined
+                
+                self._preference_cache[user_id] = (None, time.time())
+        except Exception as e:
+            logger.warning(f"RAG failed to load preferences for user {user_id}: {e}")
+            raise RAGPreferenceError(
+                f"Failed to load preferences for user {user_id}: {e}",
+                cause=e,
+            )
+        
+        return None
+    
+    async def _load_user_preferences_async(self, user_id: str) -> Optional[str]:
+        """
+        异步加载用户偏好文本 (带 SingleFlight 防惊群)
         
         Args:
             user_id: 用户标识
@@ -476,6 +627,41 @@ class RAGSystem:
         if not user_id:
             return None
         
+        # v6.0: 检查缓存
+        cached = self._preference_cache.get(user_id)
+        if cached:
+            pref_text, cached_time = cached
+            if (time.time() - cached_time) < self._preference_cache_ttl:
+                self._stats["preference_cache_hits"] += 1
+                logger.debug(f"RAG preference cache hit for user {user_id}")
+                return pref_text
+        
+        # SingleFlight: 防止并发请求同一用户偏好
+        if user_id in self._preference_single_flight:
+            logger.debug(f"RAG preference single-flight hit for user {user_id}")
+            return await self._preference_single_flight[user_id]
+        
+        future: asyncio.Future = asyncio.get_event_loop().create_future()
+        self._preference_single_flight[user_id] = future
+        
+        self._stats["preference_cache_misses"] += 1
+        
+        try:
+            # 在线程池中执行同步 DB 操作
+            result = await asyncio.get_event_loop().run_in_executor(
+                None, self._load_user_preferences_sync, user_id
+            )
+            self._preference_cache[user_id] = (result, time.time())
+            future.set_result(result)
+            return result
+        except Exception as e:
+            future.set_exception(e)
+            raise
+        finally:
+            self._preference_single_flight.pop(user_id, None)
+    
+    def _load_user_preferences_sync(self, user_id: str) -> Optional[str]:
+        """同步加载偏好 (供 run_in_executor 调用)"""
         try:
             with self.db_manager.session_scope() as db:
                 pref_repo = UserPreferenceRepository(db)
@@ -484,7 +670,6 @@ class RAGSystem:
                 if not preferences:
                     return None
                 
-                # 按优先级合并偏好文本
                 pref_texts = []
                 for p in preferences:
                     text = getattr(p, 'preference_text', '') or ''
@@ -500,8 +685,21 @@ class RAGSystem:
                     return combined
         except Exception as e:
             logger.warning(f"RAG failed to load preferences for user {user_id}: {e}")
-        
         return None
+    
+    def invalidate_preference_cache(self, user_id: Optional[str] = None):
+        """
+        使偏好缓存失效
+        
+        Args:
+            user_id: 指定用户 ID, None 则清除所有
+        """
+        if user_id:
+            self._preference_cache.pop(user_id, None)
+            logger.debug(f"RAG preference cache invalidated for user {user_id}")
+        else:
+            self._preference_cache.clear()
+            logger.debug("RAG preference cache fully cleared")
     
     def _get_max_history_turns(self) -> int:
         """
@@ -520,50 +718,33 @@ class RAGSystem:
             pass
         return 5
     
-    def chat(
+    def _prepare_chat_context(
         self,
         query: str,
         session_id: str,
-        user_id: Optional[str] = None,
-        top_k: Optional[int] = None,
-        system_prompt: Optional[str] = None,
-        max_new_tokens: int = 512,
-        temperature: float = 0.7,
-        include_history: bool = True,
-        max_history_turns: Optional[int] = None,
-        **kwargs
-    ) -> RAGResponse:
+        user_id: Optional[str],
+        top_k: Optional[int],
+        system_prompt: Optional[str],
+        max_history_turns: Optional[int],
+        include_history: bool,
+        preference_text: Optional[str] = None,
+    ) -> Tuple[str, RAGPromptInfo, List[MemorySearchResult], Optional[List[Dict[str, str]]], Optional[str]]:
         """
-        Generate response using RAG with conversation history.
+        准备 chat 上下文 (共享逻辑, 供 chat / async_chat / chat_stream 使用)
         
-        v5.7: 增强偏好注入和历史轮次配置
-        - 偏好通过 system prompt 注入 (与 DKI 一致)
-        - 历史轮次从外置配置读取 (dki.recall.budget.max_recent_turns)
-        - 移除 <think> 推理内容 (存储和召回时双重过滤)
-        - 使用 30% 上下文生成预留 (与 DKI 一致)
-        
-        Args:
-            query: User query
-            session_id: Session identifier
-            user_id: User identifier (optional, used for preference loading)
-            top_k: Number of memories to retrieve
-            system_prompt: Optional system prompt
-            max_new_tokens: Maximum tokens to generate
-            temperature: Sampling temperature
-            include_history: Whether to include conversation history
-            max_history_turns: Maximum history turns (None = 从配置读取)
-            
         Returns:
-            RAGResponse with generated text and metadata
+            (prompt, prompt_info, memories, history, preference_text)
         """
-        start_time = time.perf_counter()
-        
-        # v5.7: 历史轮次从外置配置读取 (与 DKI 一致)
         if max_history_turns is None:
             max_history_turns = self._get_max_history_turns()
         
-        # v5.3: 加载用户偏好 (与 DKI 公平对比)
-        preference_text = self._load_user_preferences(user_id)
+        # 加载偏好 (如果未提供)
+        if preference_text is None:
+            try:
+                preference_text = self._load_user_preferences(user_id)
+            except RAGPreferenceError as e:
+                logger.warning(f"Preference loading failed, degrading: {e}")
+                preference_text = None
         
         # 构造 system prompt: 用户偏好 + 自定义 system prompt
         effective_system_prompt = system_prompt or ""
@@ -575,21 +756,30 @@ class RAGSystem:
                 effective_system_prompt = pref_section
             logger.debug(f"RAG injected preference into system prompt: {len(preference_text)} chars")
         
-        # Retrieve relevant memories
+        # 检索相关记忆
         top_k = top_k or self.config.rag.top_k
-        memories = self.memory_router.search(query, top_k=top_k)
+        try:
+            memories = self.memory_router.search(query, top_k=top_k)
+        except Exception as e:
+            logger.warning(f"Memory search failed, degrading to no-context: {e}")
+            memories = []
         
-        # Get conversation history if enabled
+        # 获取对话历史
         history = None
         if include_history:
             try:
-                history = self._get_conversation_history(session_id, max_turns=max_history_turns, user_id=user_id)
-                logger.debug(f"Retrieved {len(history)} history messages for session {session_id} (user={user_id})")
+                history = self._get_conversation_history(
+                    session_id, max_turns=max_history_turns, user_id=user_id
+                )
+                logger.debug(
+                    f"Retrieved {len(history)} history messages for session "
+                    f"{session_id} (user={user_id})"
+                )
             except Exception as e:
                 logger.warning(f"Failed to get conversation history: {e}")
                 history = None
         
-        # ============ v6.5: 模糊指代澄清 ============
+        # 模糊指代澄清
         _vague_ref = detect_vague_reference(query)
         if _vague_ref.is_vague:
             history_count = len(history) if history else 0
@@ -607,50 +797,101 @@ class RAGSystem:
                     f"history_count={history_count}"
                 )
         
-        # Build prompt with history (now returns tuple)
-        prompt, prompt_info = self._build_prompt(
-            query, memories,
-            effective_system_prompt if effective_system_prompt else None,
-            history,
-        )
+        # 构建提示词
+        try:
+            prompt, prompt_info = self._build_prompt(
+                query, memories,
+                effective_system_prompt if effective_system_prompt else None,
+                history,
+            )
+        except Exception as e:
+            raise RAGPromptBuildError(
+                f"Failed to build RAG prompt: {e}", cause=e
+            )
         
-        # Generate response
-        output = self.model.generate(
-            prompt=prompt,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            **kwargs
-        )
+        return prompt, prompt_info, memories, history, preference_text
+    
+    def _generate_and_process(
+        self,
+        prompt: str,
+        max_new_tokens: int,
+        temperature: float,
+        **kwargs,
+    ) -> Tuple[str, bool, ModelOutput]:
+        """
+        调用模型生成并后处理 (共享逻辑)
         
-        end_time = time.perf_counter()
-        total_latency = (end_time - start_time) * 1000
+        Returns:
+            (clean_response, think_stripped, raw_output)
+            
+        Raises:
+            RAGGenerationError: 生成失败
+        """
+        try:
+            output = self.model.generate(
+                prompt=prompt,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                **kwargs,
+            )
+        except Exception as e:
+            # 区分不同的模型错误
+            err_msg = str(e).lower()
+            if "oom" in err_msg or "out of memory" in err_msg:
+                raise RAGGenerationError(
+                    f"Model OOM during RAG generation: {e}",
+                    retryable=True, cause=e,
+                )
+            elif "timeout" in err_msg:
+                raise RAGGenerationError(
+                    f"Model timeout during RAG generation: {e}",
+                    retryable=True, cause=e,
+                )
+            elif "connection" in err_msg or "connect" in err_msg:
+                raise RAGGenerationError(
+                    f"Model connection error during RAG generation: {e}",
+                    retryable=True, cause=e,
+                )
+            else:
+                raise RAGGenerationError(
+                    f"RAG generation failed: {e}",
+                    retryable=False, cause=e,
+                )
         
-        # v5.7: 存储前移除 <think> 推理内容
+        # 移除 <think> 推理内容
         clean_response, think_stripped = strip_think_content(output.text)
         if think_stripped:
             logger.debug(
-                f"RAG: Think content stripped before DB storage: "
+                f"RAG: Think content stripped: "
                 f"{len(output.text)} -> {len(clean_response)} chars"
             )
         
-        # Log to database
+        return clean_response, think_stripped, output
+    
+    def _log_conversation(
+        self,
+        session_id: str,
+        user_id: Optional[str],
+        query: str,
+        clean_response: str,
+        memories: List[MemorySearchResult],
+        total_latency: float,
+    ):
+        """记录对话到数据库 (非致命, 失败不影响返回)"""
         try:
             with self.db_manager.session_scope() as db:
-                # Ensure session exists before inserting conversation
                 session_repo = SessionRepository(db)
                 session_repo.get_or_create(session_id=session_id, user_id=user_id)
                 
                 conv_repo = ConversationRepository(db)
                 audit_repo = AuditLogRepository(db)
                 
-                # Store user message
                 conv_repo.create(
                     session_id=session_id,
                     role='user',
                     content=query,
                 )
                 
-                # Store assistant response (存储清理后的内容)
                 conv_repo.create(
                     session_id=session_id,
                     role='assistant',
@@ -660,7 +901,6 @@ class RAGSystem:
                     latency_ms=total_latency,
                 )
                 
-                # Audit log
                 audit_repo.log(
                     action='rag_generate',
                     session_id=session_id,
@@ -669,25 +909,377 @@ class RAGSystem:
                 )
         except Exception as e:
             logger.error(f"Failed to log conversation: {e}")
+    
+    def chat(
+        self,
+        query: str,
+        session_id: str,
+        user_id: Optional[str] = None,
+        top_k: Optional[int] = None,
+        system_prompt: Optional[str] = None,
+        max_new_tokens: int = 2048,
+        temperature: float = 0.7,
+        include_history: bool = True,
+        max_history_turns: Optional[int] = None,
+        **kwargs
+    ) -> RAGResponse:
+        """
+        Generate response using RAG with conversation history (同步版本).
         
-        return RAGResponse(
-            text=clean_response,  # v5.7: 返回清理后的响应 (无 think 内容)
-            memories_used=memories,
-            latency_ms=total_latency,
-            input_tokens=output.input_tokens,
-            output_tokens=output.output_tokens,
-            metadata={
-                'prompt_length': len(prompt),
-                'model': self.model.model_name,
-                'history_turns': len(history) if history else 0,
-                # v5.3: 偏好注入信息 (与 DKI 对比公平)
-                'preference_injected': bool(preference_text),
-                'preference_text': preference_text or "",
-                # v5.7: think 内容过滤信息
-                'think_content_stripped': think_stripped,
-            },
-            prompt_info=prompt_info,
-        )
+        v6.0: 细化异常处理
+        - RAGPreferenceError → 降级 (无偏好注入)
+        - RAGMemorySearchError → 降级 (无上下文)
+        - RAGGenerationError → 向上抛出 (可重试标记)
+        
+        Args:
+            query: User query
+            session_id: Session identifier
+            user_id: User identifier (optional, used for preference loading)
+            top_k: Number of memories to retrieve
+            system_prompt: Optional system prompt
+            max_new_tokens: Maximum tokens to generate
+            temperature: Sampling temperature
+            include_history: Whether to include conversation history
+            max_history_turns: Maximum history turns (None = 从配置读取)
+            
+        Returns:
+            RAGResponse with generated text and metadata
+            
+        Raises:
+            RAGGenerationError: 模型生成失败
+            RAGPromptBuildError: 提示词构造失败
+        """
+        start_time = time.perf_counter()
+        self._stats["total_requests"] += 1
+        
+        try:
+            prompt, prompt_info, memories, history, preference_text = self._prepare_chat_context(
+                query=query,
+                session_id=session_id,
+                user_id=user_id,
+                top_k=top_k,
+                system_prompt=system_prompt,
+                max_history_turns=max_history_turns,
+                include_history=include_history,
+            )
+            
+            clean_response, think_stripped, output = self._generate_and_process(
+                prompt=prompt,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                **kwargs,
+            )
+            
+            end_time = time.perf_counter()
+            total_latency = (end_time - start_time) * 1000
+            
+            # 记录对话
+            self._log_conversation(
+                session_id=session_id,
+                user_id=user_id,
+                query=query,
+                clean_response=clean_response,
+                memories=memories,
+                total_latency=total_latency,
+            )
+            
+            return RAGResponse(
+                text=clean_response,
+                memories_used=memories,
+                latency_ms=total_latency,
+                input_tokens=output.input_tokens,
+                output_tokens=output.output_tokens,
+                metadata={
+                    'prompt_length': len(prompt),
+                    'model': self.model.model_name,
+                    'history_turns': len(history) if history else 0,
+                    'preference_injected': bool(preference_text),
+                    'preference_text': preference_text or "",
+                    'think_content_stripped': think_stripped,
+                },
+                prompt_info=prompt_info,
+            )
+        
+        except (RAGGenerationError, RAGPromptBuildError):
+            self._stats["errors"] += 1
+            raise
+        except Exception as e:
+            self._stats["errors"] += 1
+            raise RAGError(f"Unexpected RAG error: {e}", cause=e)
+    
+    async def async_chat(
+        self,
+        query: str,
+        session_id: str,
+        user_id: Optional[str] = None,
+        top_k: Optional[int] = None,
+        system_prompt: Optional[str] = None,
+        max_new_tokens: int = 2048,
+        temperature: float = 0.7,
+        include_history: bool = True,
+        max_history_turns: Optional[int] = None,
+        **kwargs
+    ) -> RAGResponse:
+        """
+        异步版本的 RAG chat.
+        
+        与 chat() 相同的逻辑, 但:
+        - 偏好加载使用 AsyncSingleFlight 防惊群
+        - 模型推理在线程池中执行 (避免阻塞事件循环)
+        - 数据库操作在线程池中执行
+        
+        Args:
+            同 chat()
+            
+        Returns:
+            RAGResponse
+            
+        Raises:
+            RAGGenerationError: 模型生成失败
+            RAGPromptBuildError: 提示词构造失败
+        """
+        start_time = time.perf_counter()
+        self._stats["total_requests"] += 1
+        self._stats["async_requests"] += 1
+        
+        try:
+            # 异步加载偏好
+            preference_text = None
+            try:
+                preference_text = await self._load_user_preferences_async(user_id)
+            except Exception as e:
+                logger.warning(f"Async preference loading failed, degrading: {e}")
+                preference_text = None
+            
+            # 准备上下文 (在线程池中执行同步 DB 操作)
+            loop = asyncio.get_event_loop()
+            prompt, prompt_info, memories, history, preference_text = await loop.run_in_executor(
+                None,
+                lambda: self._prepare_chat_context(
+                    query=query,
+                    session_id=session_id,
+                    user_id=user_id,
+                    top_k=top_k,
+                    system_prompt=system_prompt,
+                    max_history_turns=max_history_turns,
+                    include_history=include_history,
+                    preference_text=preference_text,
+                ),
+            )
+            
+            # 模型推理 (在线程池中执行)
+            clean_response, think_stripped, output = await loop.run_in_executor(
+                None,
+                lambda: self._generate_and_process(
+                    prompt=prompt,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    **kwargs,
+                ),
+            )
+            
+            end_time = time.perf_counter()
+            total_latency = (end_time - start_time) * 1000
+            
+            # 记录对话 (在线程池中执行, 不阻塞返回)
+            loop.run_in_executor(
+                None,
+                lambda: self._log_conversation(
+                    session_id=session_id,
+                    user_id=user_id,
+                    query=query,
+                    clean_response=clean_response,
+                    memories=memories,
+                    total_latency=total_latency,
+                ),
+            )
+            
+            return RAGResponse(
+                text=clean_response,
+                memories_used=memories,
+                latency_ms=total_latency,
+                input_tokens=output.input_tokens,
+                output_tokens=output.output_tokens,
+                metadata={
+                    'prompt_length': len(prompt),
+                    'model': self.model.model_name,
+                    'history_turns': len(history) if history else 0,
+                    'preference_injected': bool(preference_text),
+                    'preference_text': preference_text or "",
+                    'think_content_stripped': think_stripped,
+                    'async': True,
+                },
+                prompt_info=prompt_info,
+            )
+        
+        except (RAGGenerationError, RAGPromptBuildError):
+            self._stats["errors"] += 1
+            raise
+        except Exception as e:
+            self._stats["errors"] += 1
+            raise RAGError(f"Unexpected async RAG error: {e}", cause=e)
+    
+    async def chat_stream(
+        self,
+        query: str,
+        session_id: str,
+        user_id: Optional[str] = None,
+        top_k: Optional[int] = None,
+        system_prompt: Optional[str] = None,
+        max_new_tokens: int = 2048,
+        temperature: float = 0.7,
+        include_history: bool = True,
+        max_history_turns: Optional[int] = None,
+        **kwargs,
+    ) -> AsyncIterator[Dict[str, Any]]:
+        """
+        RAG 流式聊天 (SSE 兼容)
+        
+        Yields:
+            字典, 包含:
+            - type: "token" | "metadata" | "done" | "error"
+            - content: token 文本 (type=token 时)
+            - text: 完整文本 (type=done 时)
+            - error: 错误信息 (type=error 时)
+        """
+        start_time = time.perf_counter()
+        self._stats["total_requests"] += 1
+        self._stats["stream_requests"] += 1
+        
+        try:
+            # 异步加载偏好
+            preference_text = None
+            try:
+                preference_text = await self._load_user_preferences_async(user_id)
+            except Exception:
+                preference_text = None
+            
+            # 准备上下文
+            loop = asyncio.get_event_loop()
+            prompt, prompt_info, memories, history, preference_text = await loop.run_in_executor(
+                None,
+                lambda: self._prepare_chat_context(
+                    query=query,
+                    session_id=session_id,
+                    user_id=user_id,
+                    top_k=top_k,
+                    system_prompt=system_prompt,
+                    max_history_turns=max_history_turns,
+                    include_history=include_history,
+                    preference_text=preference_text,
+                ),
+            )
+            
+            # 发送 metadata
+            yield {
+                "type": "metadata",
+                "memories_count": len(memories),
+                "history_turns": len(history) if history else 0,
+                "preference_injected": bool(preference_text),
+            }
+            
+            # 检查模型是否支持流式生成
+            has_stream = (
+                hasattr(self.model, 'stream_generate')
+                or hasattr(self.model, 'async_stream_generate')
+            )
+            
+            if has_stream:
+                full_text = ""
+                input_tokens = 0
+                output_tokens = 0
+                
+                if hasattr(self.model, 'async_stream_generate'):
+                    stream = self.model.async_stream_generate(
+                        prompt=prompt,
+                        max_new_tokens=max_new_tokens,
+                        temperature=temperature,
+                        **kwargs,
+                    )
+                    async for chunk in stream:
+                        token_text = chunk if isinstance(chunk, str) else getattr(chunk, 'text', str(chunk))
+                        full_text += token_text
+                        yield {"type": "token", "content": token_text}
+                elif hasattr(self.model, 'stream_generate'):
+                    for chunk in self.model.stream_generate(
+                        prompt=prompt,
+                        max_new_tokens=max_new_tokens,
+                        temperature=temperature,
+                        **kwargs,
+                    ):
+                        token_text = chunk if isinstance(chunk, str) else getattr(chunk, 'text', str(chunk))
+                        full_text += token_text
+                        yield {"type": "token", "content": token_text}
+                
+                clean_text, _ = strip_think_content(full_text)
+                total_latency = (time.perf_counter() - start_time) * 1000
+                
+                # 记录对话
+                loop.run_in_executor(
+                    None,
+                    lambda: self._log_conversation(
+                        session_id=session_id,
+                        user_id=user_id,
+                        query=query,
+                        clean_response=clean_text,
+                        memories=memories,
+                        total_latency=total_latency,
+                    ),
+                )
+                
+                yield {
+                    "type": "done",
+                    "text": clean_text,
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "latency_ms": total_latency,
+                }
+            else:
+                # 模型不支持流式: 回退到非流式, 一次性返回
+                clean_response, think_stripped, output = await loop.run_in_executor(
+                    None,
+                    lambda: self._generate_and_process(
+                        prompt=prompt,
+                        max_new_tokens=max_new_tokens,
+                        temperature=temperature,
+                        **kwargs,
+                    ),
+                )
+                
+                total_latency = (time.perf_counter() - start_time) * 1000
+                
+                # 记录对话
+                loop.run_in_executor(
+                    None,
+                    lambda: self._log_conversation(
+                        session_id=session_id,
+                        user_id=user_id,
+                        query=query,
+                        clean_response=clean_response,
+                        memories=memories,
+                        total_latency=total_latency,
+                    ),
+                )
+                
+                # 模拟流式: 一次性返回全部
+                yield {"type": "token", "content": clean_response}
+                yield {
+                    "type": "done",
+                    "text": clean_response,
+                    "input_tokens": output.input_tokens,
+                    "output_tokens": output.output_tokens,
+                    "latency_ms": total_latency,
+                }
+        
+        except Exception as e:
+            self._stats["errors"] += 1
+            logger.error(f"RAG stream error: {e}")
+            yield {
+                "type": "error",
+                "error": str(e),
+                "error_code": getattr(e, 'error_code', 'RAG_UNKNOWN'),
+                "retryable": getattr(e, 'retryable', False),
+            }
     
     def search_memories(
         self,
@@ -708,11 +1300,32 @@ class RAGSystem:
     
     def get_stats(self) -> Dict[str, Any]:
         """Get system statistics."""
+        pref_cache_total = (
+            self._stats["preference_cache_hits"]
+            + self._stats["preference_cache_misses"]
+        )
         return {
             'router_stats': self.memory_router.get_stats(),
             'model_info': self.model.get_model_info() if self._model_adapter else None,
             'config': {
                 'top_k': self.config.rag.top_k,
                 'similarity_threshold': self.config.rag.similarity_threshold,
+            },
+            # v6.0: 新增统计
+            'requests': {
+                'total': self._stats["total_requests"],
+                'async': self._stats["async_requests"],
+                'stream': self._stats["stream_requests"],
+                'errors': self._stats["errors"],
+            },
+            'preference_cache': {
+                'size': len(self._preference_cache),
+                'ttl': self._preference_cache_ttl,
+                'hits': self._stats["preference_cache_hits"],
+                'misses': self._stats["preference_cache_misses"],
+                'hit_rate': (
+                    self._stats["preference_cache_hits"] / pref_cache_total
+                    if pref_cache_total > 0 else 0
+                ),
             },
         }

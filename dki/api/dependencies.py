@@ -2,10 +2,11 @@
 API Dependencies
 FastAPI dependency injection for DKI API
 
+v8.2: 增加 DKIPlugin 全局实例支持
 安全 (v3.1): 增加用户隔离组件的依赖注入
 
 Author: AGI Demo Project
-Version: 3.1.0
+Version: 8.2.0
 """
 
 from typing import Any, Optional
@@ -14,6 +15,7 @@ from loguru import logger
 
 # Global instances (initialized on startup)
 _dki_system: Optional[Any] = None
+_dki_plugin_instance: Optional[Any] = None  # v8.2: DKIPlugin 实例
 _user_adapter: Optional[Any] = None
 _preference_cache: Optional[Any] = None
 _non_vectorized_handler: Optional[Any] = None
@@ -27,19 +29,22 @@ def init_dependencies(
     preference_cache: Any = None,
     non_vectorized_handler: Any = None,
     isolated_preference_cache: Any = None,
+    dki_plugin: Any = None,
 ) -> None:
     """
     Initialize global dependencies.
     
     Called during application startup.
     
+    v8.2: 支持 dki_plugin 参数, 用于 /v1/dki/chat 端点
     安全 (v3.1): 支持 IsolatedPreferenceCacheManager 注入
     """
     import time
-    global _dki_system, _user_adapter, _preference_cache, _non_vectorized_handler
-    global _isolated_preference_cache, _startup_time
+    global _dki_system, _dki_plugin_instance, _user_adapter, _preference_cache
+    global _non_vectorized_handler, _isolated_preference_cache, _startup_time
     
     _dki_system = dki_system
+    _dki_plugin_instance = dki_plugin
     _user_adapter = user_adapter
     _preference_cache = preference_cache
     _non_vectorized_handler = non_vectorized_handler
@@ -48,7 +53,8 @@ def init_dependencies(
     
     logger.info(
         f"API dependencies initialized "
-        f"(isolated_cache={'yes' if isolated_preference_cache else 'no'})"
+        f"(dki_plugin={'yes' if dki_plugin else 'no'}, "
+        f"isolated_cache={'yes' if isolated_preference_cache else 'no'})"
     )
 
 
@@ -57,6 +63,7 @@ def get_dki_system():
     Get DKI system instance.
     
     FastAPI dependency for DKI system access.
+    仅用于 /api/chat (legacy web demo endpoint).
     """
     global _dki_system
     if _dki_system is None:
@@ -67,19 +74,37 @@ def get_dki_system():
     return _dki_system
 
 
+def get_dki_plugin_dep():
+    """
+    Get DKI plugin instance (v8.2).
+    
+    FastAPI dependency for /v1/dki/* endpoints.
+    优先返回 DKIPlugin, 降级返回 DKISystem.
+    """
+    global _dki_plugin_instance, _dki_system
+    if _dki_plugin_instance is not None:
+        return _dki_plugin_instance
+    # 降级: 返回 DKISystem
+    return get_dki_system()
+
+
 def get_user_adapter():
     """
     Get user data adapter instance.
     
     FastAPI dependency for user data access.
+    Note: Demo UI 已独立为 demo/app.py, 此处仅用于实验系统 web 接口。
     """
     global _user_adapter
     if _user_adapter is None:
-        # Lazy initialization with example adapter (in-memory)
+        # Lazy initialization - 无外部配置时使用 ExampleAdapter (仅开发/实验)
         from dki.adapters import ExampleAdapter
 
         _user_adapter = ExampleAdapter()
-        logger.warning("Using ExampleAdapter (no external adapter configured)")
+        logger.warning(
+            "Using ExampleAdapter (no external adapter configured). "
+            "Demo UI should use demo/app.py with its own persistence."
+        )
     
     return _user_adapter
 
@@ -149,8 +174,8 @@ async def cleanup_dependencies() -> None:
     
     Called during application shutdown.
     """
-    global _dki_system, _user_adapter, _preference_cache, _non_vectorized_handler
-    global _isolated_preference_cache
+    global _dki_system, _dki_plugin_instance, _user_adapter, _preference_cache
+    global _non_vectorized_handler, _isolated_preference_cache
     
     # Disconnect user adapter
     if _user_adapter is not None:
@@ -184,6 +209,7 @@ async def cleanup_dependencies() -> None:
             logger.error(f"Error clearing non-vectorized handler cache: {e}")
     
     _dki_system = None
+    _dki_plugin_instance = None
     _user_adapter = None
     _preference_cache = None
     _non_vectorized_handler = None
