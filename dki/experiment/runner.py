@@ -20,7 +20,6 @@ from dataclasses import dataclass, field
 from loguru import logger
 from tqdm import tqdm
 
-from dki.core.dki_system import DKISystem, DKIResponse
 from dki.core.rag_system import RAGSystem, RAGResponse
 from dki.experiment.metrics import MetricsCalculator
 from dki.database.connection import DatabaseManager
@@ -28,6 +27,11 @@ from dki.database.repository import (
     ExperimentRepository, DemoUserRepository, UserPreferenceRepository, SessionRepository
 )
 from dki.config.config_loader import ConfigLoader
+
+# DKI Plugin (替代 DKISystem)
+import asyncio
+from dki.core.dki_plugin import DKIPlugin, DKIPluginResponse, InjectionMetadata
+from dki.experiment.sqlite_adapter import SQLiteDataAdapter
 
 # 用户隔离上下文 (可选导入, 用于实验缓存操作)
 try:
@@ -217,23 +221,42 @@ class ExperimentRunner:
     
     def __init__(
         self,
-        dki_system: Optional[DKISystem] = None,
+        dki_plugin: Optional[DKIPlugin] = None,
         rag_system: Optional[RAGSystem] = None,
+        model_adapter: Optional[Any] = None,
         output_dir: str = "./experiment_results",
     ):
+        """
+        初始化实验运行器。
+        
+        v7.0 重构: DKI 模式使用 DKIPlugin (替代 DKISystem)
+        - DKIPlugin 通过 SQLiteDataAdapter 访问实验数据库
+        - 原生支持跨会话召回
+        - 统一实验环境与生产环境的 Recall v4 行为
+        
+        Args:
+            dki_plugin: DKI 插件实例 (可选，默认自动创建)
+            rag_system: RAG 系统实例 (可选，默认自动创建)
+            model_adapter: LLM 模型适配器 (用于创建 DKIPlugin 和 baseline)
+            output_dir: 实验结果输出目录
+        """
         self.config = ConfigLoader().config
         
-        self.dki_system = dki_system
+        self._dki_plugin = dki_plugin
         self.rag_system = rag_system
+        self._model_adapter = model_adapter
         self.metrics = MetricsCalculator()
         
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
-        # Database
+        # Database (实验专用，不影响 chat demo 的数据库)
         self.db_manager = DatabaseManager(
             db_path=self.config.database.path,
         )
+        
+        # SQLite 适配器 (IUserDataAdapter 实现，供 DKIPlugin 使用)
+        self._sqlite_adapter: Optional[SQLiteDataAdapter] = None
         
         # 用户隔离: 实验系统使用 CacheKeySigner 以确保与生产缓存路径一致
         self._cache_key_signer: Optional[Any] = None
@@ -244,11 +267,61 @@ class ExperimentRunner:
             logger.debug("ExperimentRunner: user isolation context available")
     
     def _ensure_systems(self):
-        """Ensure DKI and RAG systems are initialized."""
-        if self.dki_system is None:
-            self.dki_system = DKISystem()
+        """Ensure DKI Plugin and RAG system are initialized."""
+        if self._sqlite_adapter is None:
+            self._sqlite_adapter = SQLiteDataAdapter(db_manager=self.db_manager)
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    import concurrent.futures
+                    with concurrent.futures.ThreadPoolExecutor() as pool:
+                        pool.submit(asyncio.run, self._sqlite_adapter.connect()).result()
+                else:
+                    loop.run_until_complete(self._sqlite_adapter.connect())
+            except RuntimeError:
+                asyncio.run(self._sqlite_adapter.connect())
+        
+        if self._dki_plugin is None:
+            if self._model_adapter is None:
+                # v8.1: 使用 get_or_create (单例) 而非 create (每次新建)
+                # 避免在 GPU 上重复加载 vLLM 引擎导致显存不足
+                # ModelFactory.get_or_create 会复用已加载的模型实例
+                from dki.models.factory import ModelFactory
+                self._model_adapter = ModelFactory.get_or_create()
+            
+            self._dki_plugin = DKIPlugin(
+                model_adapter=self._model_adapter,
+                user_data_adapter=self._sqlite_adapter,
+                config=self.config,
+                language="cn",
+            )
+        
         if self.rag_system is None:
-            self.rag_system = RAGSystem()
+            # v8.1: 共享同一个 model_adapter, 避免 RAG 和 DKI 各自加载模型
+            self.rag_system = RAGSystem(model_adapter=self._model_adapter)
+    
+    def _run_plugin_chat(self, **kwargs) -> DKIPluginResponse:
+        """同步包装 DKIPlugin.chat() 异步调用。"""
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as pool:
+                    future = pool.submit(asyncio.run, self._dki_plugin.chat(**kwargs))
+                    return future.result()
+            else:
+                return loop.run_until_complete(self._dki_plugin.chat(**kwargs))
+        except RuntimeError:
+            return asyncio.run(self._dki_plugin.chat(**kwargs))
+    
+    @property
+    def model(self):
+        """获取模型适配器 (用于 baseline 模式)。"""
+        if self._model_adapter:
+            return self._model_adapter
+        if self._dki_plugin:
+            return self._dki_plugin.model
+        raise RuntimeError("No model adapter available. Call _ensure_systems() first.")
     
     def _get_first_experiment_user_id(self) -> str:
         """
@@ -274,7 +347,7 @@ class ExperimentRunner:
         为实验创建用户并写入偏好到数据库。
         
         这是保证偏好注入可靠性的关键步骤:
-        - DKISystem.chat() 会通过 _load_user_preferences_from_db(user_id) 加载偏好
+        - DKIPlugin 通过 SQLiteDataAdapter.get_user_preferences(user_id) 加载偏好
         - 偏好必须存在于 user_preferences 表中才能被加载
         - 之前实验只通过 add_memory 写入 memories 表，偏好表为空
         
@@ -510,9 +583,13 @@ class ExperimentRunner:
                         priority=10 - idx,  # 越靠前优先级越高
                     )
                 
-                # 清除 DKI 系统的内存缓存，强制下次从数据库重新加载 (v3.1: 使用公开 API)
-                if self.dki_system:
-                    self.dki_system.clear_preference_cache(user_id)
+            # 关键: 清除 DKIPlugin 的偏好文本缓存
+            # DKIPlugin._get_cached_preferences() 使用 TTL=300s 的内存缓存,
+            # 如果不清除, 同一 user_id 的后续样本会读到旧偏好 (来自前一个样本),
+            # 导致提示词前缀中包含错误的偏好信息, 严重影响召回。
+            if self._dki_plugin is not None:
+                self._dki_plugin.invalidate_preference_text_cache(user_id)
+                logger.debug(f"Invalidated preference cache for user {user_id}")
                     
         except Exception as e:
             logger.warning(f"Failed to write session preferences for {user_id}: {e}")
@@ -660,7 +737,8 @@ class ExperimentRunner:
             
             for mem in memories:
                 if mode == 'dki':
-                    self.dki_system.add_memory(session_id, mem)
+                    # v7.0: 通过 SQLiteDataAdapter 写入记忆 (替代 DKISystem.add_memory)
+                    self._sqlite_adapter.add_memory(session_id, mem, user_id=user_id)
                 elif mode == 'rag':
                     self.rag_system.add_memory(session_id, mem)
             
@@ -727,13 +805,10 @@ class ExperimentRunner:
         user_id = user_id or self._get_first_experiment_user_id()
         try:
             if mode == 'dki':
-                # Determine force_alpha: use experiment config if provided,
-                # otherwise default to 0.4 to ensure injection actually fires.
-                # Without force_alpha, DualFactorGating often yields alpha<0.1
-                # and the chat() method skips injection entirely.
+                # v7.0: 使用 DKIPlugin 替代 DKISystem
                 exp_force_alpha = getattr(config, 'force_alpha', 0.4)
                 
-                response = self.dki_system.chat(
+                response = self._run_plugin_chat(
                     query=query,
                     session_id=session_id,
                     user_id=user_id,
@@ -742,26 +817,28 @@ class ExperimentRunner:
                     force_alpha=exp_force_alpha,
                 )
                 
-                # 构造 DKI 注入信息
-                hybrid_info = response.metadata.get('hybrid_injection', {})
-                # v5.1: 使用 preference_alpha 而非 gating_decision.alpha
-                # gating_decision.alpha 是记忆路由 (MemoryRouter) 的 alpha,
-                # preference_alpha 是偏好注入的实际 alpha (来自配置)
-                pref_alpha = hybrid_info.get(
-                    'preference_alpha',
-                    response.gating_decision.alpha if response.gating_decision else 0.0,
-                )
+                # 从 DKIPluginResponse.metadata 提取注入信息
+                meta = response.metadata
+                pref_alpha = meta.alpha
+                
                 injection_info = InjectionInfo(
                     mode='dki',
                     original_query=query,
-                    preference_text=hybrid_info.get('preference_text'),
-                    preference_tokens=hybrid_info.get('preference_tokens', 0),
-                    history_suffix=hybrid_info.get('history_suffix_text'),
-                    history_tokens=hybrid_info.get('history_tokens', 0),
-                    history_messages=hybrid_info.get('history_messages', []),
-                    final_input=hybrid_info.get('final_input', query),
+                    preference_text=None,  # 可从 plan 获取，metadata 中不直接暴露
+                    preference_tokens=meta.preference_tokens,
+                    history_suffix=None,
+                    history_tokens=meta.history_tokens,
+                    history_messages=[],
+                    final_input=query,
                     alpha=pref_alpha,
                 )
+                
+                # v7.0: memories_used 包含偏好和相关历史的完整统计
+                memories_used_ids = []
+                if meta.preferences_count > 0:
+                    memories_used_ids.append(f"prefs:{meta.preferences_count}")
+                if meta.relevant_history_count > 0:
+                    memories_used_ids.append(f"history:{meta.relevant_history_count}")
                 
                 return ExperimentResult(
                     mode=mode,
@@ -769,10 +846,10 @@ class ExperimentRunner:
                     sample_id=item.get('id', item.get('session_id', '')),
                     query=query,
                     response=response.text,
-                    latency_ms=response.latency_ms,
-                    memories_used=[m.memory_id for m in response.memories_used],
+                    latency_ms=meta.latency_ms,
+                    memories_used=memories_used_ids,
                     alpha=pref_alpha,
-                    cache_hit=response.cache_hit,
+                    cache_hit=meta.preference_cache_hit,
                     injection_info=injection_info,
                 )
                 
@@ -809,7 +886,7 @@ class ExperimentRunner:
                 
             else:  # baseline
                 # Baseline: no memory injection
-                output = self.dki_system.model.generate(
+                output = self.model.generate(
                     prompt=query,
                     max_new_tokens=config.max_new_tokens,
                     temperature=config.temperature,
@@ -1021,7 +1098,8 @@ class ExperimentRunner:
             # Add memories for this alpha session
             for item in data[:50]:
                 if 'memory' in item:
-                    self.dki_system.add_memory(session_id, item['memory'])
+                    # v7.0: 通过 SQLiteDataAdapter 写入记忆
+                    self._sqlite_adapter.add_memory(session_id, item['memory'], user_id=user_id)
             
             for item in tqdm(data[:50], desc=f"α={alpha}"):
                 query = item.get('query', '')
@@ -1029,7 +1107,8 @@ class ExperimentRunner:
                     continue
                 
                 try:
-                    response = self.dki_system.chat(
+                    # v7.0: 使用 DKIPlugin
+                    response = self._run_plugin_chat(
                         query=query,
                         session_id=session_id,
                         user_id=user_id,
@@ -1067,16 +1146,12 @@ class ExperimentRunner:
                         rouge_scores = self.metrics.compute_rouge(reference, response_text)
                         rouge_l = rouge_scores.get('rougeL', 0.0)
                     
-                    # v5.1: 从 hybrid_injection metadata 获取 preference_alpha
-                    _hi = response.metadata.get('hybrid_injection', {})
-                    _actual_alpha = _hi.get(
-                        'preference_alpha',
-                        response.gating_decision.alpha if response.gating_decision else 0.0,
-                    )
+                    # v7.0: 从 DKIPluginResponse.metadata 获取 alpha
+                    _actual_alpha = response.metadata.alpha
                     alpha_results.append({
                         'query': query,
                         'response': response_text[:300],
-                        'latency_ms': response.latency_ms,
+                        'latency_ms': response.metadata.latency_ms,
                         'actual_alpha': _actual_alpha,
                         'memory_recall': recall_score,
                         'fabricated_halluc': halluc['fabricated_rate'],
@@ -1169,7 +1244,8 @@ class ExperimentRunner:
             "User enjoys hiking.",
         ]
         for mem in memories:
-            self.dki_system.add_memory(session_id, mem)
+            # v7.0: 通过 SQLiteDataAdapter 写入记忆
+            self._sqlite_adapter.add_memory(session_id, mem, user_id=user_id)
         
         queries = [
             "What should I eat for dinner?",
@@ -1184,17 +1260,17 @@ class ExperimentRunner:
             'rag_latencies': [],
         }
         
-        # DKI turns
+        # DKI turns (v7.0: 使用 DKIPlugin)
         for i, query in enumerate(queries[:n_turns]):
-            response = self.dki_system.chat(
+            response = self._run_plugin_chat(
                 query=query,
                 session_id=session_id,
                 user_id=user_id,
             )
             results['dki_latencies'].append({
                 'turn': i + 1,
-                'latency_ms': response.latency_ms,
-                'cache_hit': response.cache_hit,
+                'latency_ms': response.metadata.latency_ms,
+                'cache_hit': response.metadata.preference_cache_hit,
             })
         
         # RAG turns
@@ -1281,8 +1357,6 @@ class ExperimentRunner:
         }
         
         for mode in ['dki', 'rag']:
-            system = self.dki_system if mode == 'dki' else self.rag_system
-            
             for session_data in tqdm(data[:20], desc=f"Coherence ({mode})"):
                 session_id = f"coherence_{mode}_{session_data['session_id']}"
                 
@@ -1292,9 +1366,17 @@ class ExperimentRunner:
                 # v5.3: 为 DKI 和 RAG 都写入偏好 (确保对比公平)
                 self._write_session_preferences(user_id, session_data.get('personas', []))
                 
-                # Add memories
+                # 添加 personas 到各系统的记忆存储
+                # DKI: personas 已通过 _write_session_preferences() 写入 user_preferences 表
+                #   → DKIPlugin.get_user_preferences() → preference_text → system message 前缀
+                #   (vLLM 下为显式提示词前缀, 非 past_key_value 注入)
+                #   memories 表写入仅为数据完整性, search_relevant_history 不搜索 memories
+                # RAG: personas → FAISS 索引 → memory_router.search() 语义检索
                 for mem in session_data['personas']:
-                    system.add_memory(session_id, mem)
+                    if mode == 'dki':
+                        self._sqlite_adapter.add_memory(session_id, mem, user_id=user_id)
+                    else:
+                        self.rag_system.add_memory(session_id, mem)
                 
                 session_results = []
                 
@@ -1302,7 +1384,8 @@ class ExperimentRunner:
                     query = turn['query']
                     
                     if mode == 'dki':
-                        response = self.dki_system.chat(
+                        # v7.0: 使用 DKIPlugin
+                        response = self._run_plugin_chat(
                             query=query,
                             session_id=session_id,
                             user_id=user_id,
@@ -1395,7 +1478,7 @@ class ExperimentRunner:
         - 长会话累积的历史使 multi-signal recall 优势更明显
         
         对话持久化:
-        - DKISystem.chat() 内部调用 _log_conversation() 自动持久化到 conversations 表
+        - DKIPlugin.chat() 通过 SQLiteDataAdapter 持久化对话到 conversations 表
         - 每个 session 的对话可通过 ConversationRepository.get_by_session() 查询
         - 实验结果中包含 session_id, 可关联查询完整对话历史
         """
@@ -1521,7 +1604,7 @@ class ExperimentRunner:
         6. 收集注入信息和召回分数
         
         对话持久化:
-        - DKISystem.chat() 自动将对话写入 conversations 表
+        - DKIPlugin.chat() 通过 SQLiteDataAdapter 自动将对话写入 conversations 表
         - session_id 可用于后续查询完整对话历史
         """
         session_id = f"exp_{mode}_{session_type}_{session_data.get('session_id', int(time.time()))}"
@@ -1530,10 +1613,17 @@ class ExperimentRunner:
         # v5.3: 为 DKI 和 RAG 都写入偏好 (确保对比公平)
         self._write_session_preferences(user_id, session_data.get('personas', []))
         
-        # 添加 memories
-        system = self.dki_system if mode == 'dki' else self.rag_system
+        # 添加 personas 到各系统的记忆存储
+        # DKI: personas 已通过 _write_session_preferences() 写入 user_preferences 表
+        #   → DKIPlugin.get_user_preferences() → preference_text → system message 前缀
+        #   (vLLM 下为显式提示词前缀, 非 past_key_value 注入)
+        #   memories 表写入仅为数据完整性, search_relevant_history 不搜索 memories
+        # RAG: personas → FAISS 索引 → memory_router.search() 语义检索
         for mem in session_data.get('personas', []):
-            system.add_memory(session_id, mem)
+            if mode == 'dki':
+                self._sqlite_adapter.add_memory(session_id, mem, user_id=user_id)
+            else:
+                self.rag_system.add_memory(session_id, mem)
         
         turn_results = []
         
@@ -1546,30 +1636,27 @@ class ExperimentRunner:
                 start_time = time.time()
                 
                 if mode == 'dki':
-                    response = self.dki_system.chat(
+                    # v7.0: 使用 DKIPlugin
+                    response = self._run_plugin_chat(
                         query=query,
                         session_id=session_id,
                         user_id=user_id,
                     )
                     response_text = response.text
-                    latency = response.latency_ms
+                    latency = response.metadata.latency_ms
                     
-                    # 构造注入信息
-                    hybrid_info = response.metadata.get('hybrid_injection', {})
-                    # v5.1: 使用 preference_alpha
-                    turn_pref_alpha = hybrid_info.get(
-                        'preference_alpha',
-                        response.gating_decision.alpha if response.gating_decision else 0.0,
-                    )
+                    # 从 DKIPluginResponse.metadata 构造注入信息
+                    meta = response.metadata
+                    turn_pref_alpha = meta.alpha
                     injection_info = InjectionInfo(
                         mode='dki',
                         original_query=query,
-                        preference_text=hybrid_info.get('preference_text'),
-                        preference_tokens=hybrid_info.get('preference_tokens', 0),
-                        history_suffix=hybrid_info.get('history_suffix_text'),
-                        history_tokens=hybrid_info.get('history_tokens', 0),
-                        history_messages=hybrid_info.get('history_messages', []),
-                        final_input=hybrid_info.get('final_input', query),
+                        preference_text=None,
+                        preference_tokens=meta.preference_tokens,
+                        history_suffix=None,
+                        history_tokens=meta.history_tokens,
+                        history_messages=[],
+                        final_input=query,
                         alpha=turn_pref_alpha,
                     )
                 else:
@@ -1721,7 +1808,7 @@ class ExperimentRunner:
             
             session_id = f"ablation_{ablation_mode}_{int(time.time())}"
             
-            # Add memories for applicable modes
+            # Add memories for applicable modes (v7.0: DKI 使用 SQLiteDataAdapter)
             if config['use_memory']:
                 if config['system'] == 'rag':
                     for item in data[:30]:
@@ -1730,7 +1817,7 @@ class ExperimentRunner:
                 elif config['system'] == 'dki':
                     for item in data[:30]:
                         if 'memory' in item:
-                            self.dki_system.add_memory(session_id, item['memory'])
+                            self._sqlite_adapter.add_memory(session_id, item['memory'], user_id=user_id)
             
             for item in tqdm(data[:30], desc=f"Ablation ({ablation_mode})"):
                 query = item.get('query', '')
@@ -1742,7 +1829,7 @@ class ExperimentRunner:
                     latency = 0.0
                     
                     if config['system'] == 'dki':
-                        # 构造 DKI 请求参数
+                        # v7.0: 使用 DKIPlugin (消融控制通过 force_alpha 实现)
                         dki_kwargs = {
                             'query': query,
                             'session_id': session_id,
@@ -1752,18 +1839,10 @@ class ExperimentRunner:
                         # 消融控制参数
                         if not config.get('use_kv_injection'):
                             dki_kwargs['force_alpha'] = 0.0  # 禁用 KV 注入
-                        if not config.get('use_memory'):
-                            dki_kwargs['allow_injection'] = False
-                        if config.get('recall_mode') == 'stable':
-                            dki_kwargs['force_strategy'] = 'stable'
-                        elif config.get('recall_mode') == 'vector_only':
-                            dki_kwargs['force_strategy'] = 'vector_only'
-                        if not config.get('allow_fact_call'):
-                            dki_kwargs['disable_fact_call'] = True
                         
-                        response = self.dki_system.chat(**dki_kwargs)
+                        response = self._run_plugin_chat(**dki_kwargs)
                         response_text = response.text
-                        latency = response.latency_ms
+                        latency = response.metadata.latency_ms
                         
                     elif config['system'] == 'rag':
                         response = self.rag_system.chat(
@@ -1775,9 +1854,9 @@ class ExperimentRunner:
                         latency = response.latency_ms
                         
                     else:  # baseline / vanilla
-                        output = self.dki_system.model.generate(
+                        output = self.model.generate(
                             prompt=query,
-                            max_new_tokens=2048,  # v6.4: 从 256 提升
+                            max_new_tokens=2048,
                             temperature=0.7,
                         )
                         response_text = output.text
@@ -2032,16 +2111,30 @@ class ExperimentRunner:
             session_id = f"longmem_{mode}_{base_ts}_{idx}"
             user_id = self._get_experiment_user_id(item)
             
-            # 写入偏好
+            # 写入偏好 (会自动清除 DKIPlugin 偏好缓存)
             personas = item.get('personas', [])
             if personas:
                 self._write_session_preferences(user_id, personas)
             
-            # 添加 personas 作为 memories
-            system = self.dki_system if mode == 'dki' else self.rag_system
-            if mode != 'baseline':
+            # 添加 personas 到各系统的记忆存储
+            # -------------------------------------------------------
+            # DKI 两步提示词构造:
+            #   Step 1 (偏好注入 — 提示词前缀): 已通过 _write_session_preferences() 写入
+            #         user_preferences 表 → DKIPlugin.get_user_preferences()
+            #         → InjectionPlanner → preference_text → system message 前缀
+            #         (vLLM 环境下为显式文本前缀, 非 past_key_value 注入)
+            #   Step 2 (历史召回): search_relevant_history() 仅搜索
+            #         conversations 表, 不搜索 memories 表
+            #
+            # DKI 模式下写入 memories 表是为了数据完整性 (未来扩展),
+            # 当前 search_relevant_history 不会使用这些数据。
+            # -------------------------------------------------------
+            if mode == 'dki':
                 for mem in personas:
-                    system.add_memory(session_id, mem)
+                    self._sqlite_adapter.add_memory(session_id, mem, user_id=user_id)
+            elif mode == 'rag':
+                for mem in personas:
+                    self.rag_system.add_memory(session_id, mem)
             
             turns = item.get('turns', [])
             eval_turn = None
@@ -2057,7 +2150,9 @@ class ExperimentRunner:
                 logger.warning(f"Sample {idx} has no eval query, skipping")
                 continue
             
-            # 播放历史: 将历史对话写入 DB (模拟真实多轮对话)
+            # v7.0 改进: 直接将历史对话写入 DB，避免不必要的 LLM 调用
+            # 之前通过 chat(max_new_tokens=32) 播放历史，浪费推理资源且历史质量差
+            # 现在直接写入 expected_response 作为 assistant 回复，提高历史数据质量
             history_injected = 0
             for h_turn in history_turns:
                 query = h_turn.get('query', '')
@@ -2067,15 +2162,20 @@ class ExperimentRunner:
                 
                 try:
                     if mode == 'dki':
-                        # 真实调用 chat() 让 DKI 系统记录对话
-                        resp = self.dki_system.chat(
-                            query=query,
+                        # 直接写入对话记录到 DB (无需 LLM 调用)
+                        self._sqlite_adapter.add_conversation(
                             session_id=session_id,
+                            role='user',
+                            content=query,
                             user_id=user_id,
-                            max_new_tokens=32,  # 最小生成, 仅为建立历史
-                            temperature=0.1,
-                            force_alpha=force_alpha,
                         )
+                        if expected_resp:
+                            self._sqlite_adapter.add_conversation(
+                                session_id=session_id,
+                                role='assistant',
+                                content=expected_resp,
+                                user_id=user_id,
+                            )
                         history_injected += 1
                     elif mode == 'rag':
                         resp = self.rag_system.chat(
@@ -2098,8 +2198,12 @@ class ExperimentRunner:
             try:
                 start_time = time.time()
                 
+                # 用于记录注入元数据 (调试用)
+                injection_info = {}
+                
                 if mode == 'dki':
-                    response = self.dki_system.chat(
+                    # v7.0: 使用 DKIPlugin
+                    response = self._run_plugin_chat(
                         query=eval_query,
                         session_id=session_id,
                         user_id=user_id,
@@ -2108,13 +2212,26 @@ class ExperimentRunner:
                         force_alpha=force_alpha,
                     )
                     response_text = response.text
-                    latency = response.latency_ms
+                    latency = response.metadata.latency_ms
+                    pref_alpha = response.metadata.alpha
                     
-                    hybrid_info = response.metadata.get('hybrid_injection', {})
-                    pref_alpha = hybrid_info.get(
-                        'preference_alpha',
-                        response.gating_decision.alpha if response.gating_decision else 0.0,
-                    )
+                    # 记录完整注入元数据 (之前缺失, 导致无法调试偏好注入问题)
+                    meta = response.metadata
+                    injection_info = {
+                        'injection_enabled': meta.injection_enabled,
+                        'injection_strategy': meta.injection_strategy,
+                        'preferences_count': meta.preferences_count,
+                        'preference_tokens': meta.preference_tokens,
+                        'relevant_history_count': meta.relevant_history_count,
+                        'history_tokens': meta.history_tokens,
+                        'total_tokens': meta.total_tokens,
+                        'retrieval_mode': meta.retrieval_mode,
+                        'alpha': meta.alpha,
+                        'preference_cache_hit': meta.preference_cache_hit,
+                        'preference_cache_tier': meta.preference_cache_tier,
+                        'adapter_latency_ms': meta.adapter_latency_ms,
+                        'inference_latency_ms': meta.inference_latency_ms,
+                    }
                     
                 elif mode == 'rag':
                     response = self.rag_system.chat(
@@ -2129,7 +2246,7 @@ class ExperimentRunner:
                     pref_alpha = 0.0
                     
                 else:  # baseline
-                    output = self.dki_system.model.generate(
+                    output = self.model.generate(
                         prompt=eval_query,
                         max_new_tokens=max_new_tokens,
                         temperature=0.7,
@@ -2176,6 +2293,7 @@ class ExperimentRunner:
                     'alpha': pref_alpha,
                     'history_turns_played': history_injected,
                     'total_turns': len(turns),
+                    'injection_info': injection_info,  # v8.1: 记录完整注入元数据
                 })
                 
             except Exception as e:
@@ -2347,17 +2465,20 @@ class ExperimentRunner:
             length_results = {'dki': [], 'rag': []}
             
             for mode in ['dki', 'rag']:
-                system = self.dki_system if mode == 'dki' else self.rag_system
-                
                 for sample in tqdm(
                     length_samples[:30],
                     desc=f"Ctx-{mem_length} ({mode})",
                 ):
                     session_id = f"ctx_{mode}_{mem_length}_{sample['id']}_{int(time.time())}"
                     
-                    # Add memory fragments
+                    # 添加 memory fragments 到各系统的记忆存储
+                    # DKI: 同时写入 user_preferences (K/V注入) + memories (数据完整性)
+                    # RAG: → FAISS 索引 → memory_router.search() 语义检索
                     for frag in sample.get('memory_fragments', []):
-                        system.add_memory(session_id, frag)
+                        if mode == 'dki':
+                            self._sqlite_adapter.add_memory(session_id, frag, user_id=user_id)
+                        else:
+                            self.rag_system.add_memory(session_id, frag)
                     
                     # v5.3: 为 DKI 和 RAG 都写入偏好 (确保对比公平)
                     prefs = sample.get('memory_fragments', [])[:5]
@@ -2368,15 +2489,16 @@ class ExperimentRunner:
                     
                     try:
                         if mode == 'dki':
-                            response = self.dki_system.chat(
+                            # v7.0: 使用 DKIPlugin
+                            response = self._run_plugin_chat(
                                 query=query,
                                 session_id=session_id,
                                 user_id=user_id,
                                 force_alpha=0.5,
-                                max_new_tokens=1024,  # v6.4: 从 256 提升, 防止 thinking 模型截断
+                                max_new_tokens=1024,
                             )
                             response_text = response.text
-                            latency = response.latency_ms
+                            latency = response.metadata.latency_ms
                         else:
                             response = self.rag_system.chat(
                                 query=query,

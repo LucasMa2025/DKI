@@ -25,6 +25,7 @@ from loguru import logger
 
 from dki.core.dki_system import DKISystem
 from dki.core.rag_system import RAGSystem
+from dki.core.dki_plugin import DKIPlugin
 from dki.database.connection import get_db, DatabaseManager
 from dki.database.repository import (
     SessionRepository, MemoryRepository, ExperimentRepository,
@@ -43,7 +44,6 @@ from dki.api.dki_routes import create_dki_router, set_dki_plugin
 from dki.api.dependencies import init_dependencies, cleanup_dependencies
 from dki.api.visualization_routes import record_visualization, get_visualization_history
 from dki.api.stats_routes import record_dki_request
-from dki.adapters import ExampleAdapter
 from dki.cache import (
     PreferenceCacheManager,
     CacheConfig,
@@ -159,20 +159,26 @@ def create_app() -> FastAPI:
             _systems['router'] = ConversationRouter(config=router_config)
         return _systems['router']
     
-    # Initialize user data adapter (ExampleAdapter for demo/dev, ConfigDrivenAdapter for production)
+    # Initialize user data adapter (ConfigDrivenAdapter for production)
+    # Note: Demo UI 已独立为 demo/app.py, 使用自己的持久化层
+    # 此处仅保留 ConfigDrivenAdapter 用于实验系统的 web 接口
     def get_user_adapter():
         if 'user_adapter' not in _systems:
             adapter_config = getattr(config, 'user_adapter', None)
-            if adapter_config and getattr(adapter_config, 'type', 'memory') != 'memory':
-                # Production: use ConfigDrivenAdapter
+            if adapter_config:
                 from dki.adapters import ConfigDrivenAdapter, ConfigDrivenAdapterConfig
                 cda_config = ConfigDrivenAdapterConfig.from_dict(
                     adapter_config.__dict__ if hasattr(adapter_config, '__dict__') else {}
                 )
                 _systems['user_adapter'] = ConfigDrivenAdapter(cda_config)
             else:
-                # Demo/dev: use ExampleAdapter (in-memory)
+                # 无适配器配置时, 使用 ExampleAdapter 作为 fallback (实验/开发)
+                from dki.adapters import ExampleAdapter
                 _systems['user_adapter'] = ExampleAdapter()
+                logger.warning(
+                    "No user_adapter config found, using ExampleAdapter (in-memory). "
+                    "Demo UI should use demo/app.py instead."
+                )
         return _systems['user_adapter']
     
     def get_preference_cache() -> Optional[PreferenceCacheManager]:
@@ -259,8 +265,27 @@ def create_app() -> FastAPI:
             user_adapter=adapter,
         )
         
-        # Set up DKI plugin (for /v1/dki/chat endpoint)
-        set_dki_plugin(dki)
+        # ============ v8.2: 创建 DKIPlugin 实例 (for /v1/dki/chat endpoint) ============
+        # 复用 DKISystem 的 model_adapter, 避免重复加载 vLLM 引擎
+        # 这使得 web demo 前端 (/v1/dki/chat) 与实验系统使用相同的 DKIPlugin 路径
+        # 便于调试和保持行为一致性
+        try:
+            dki_plugin = DKIPlugin(
+                model_adapter=dki.model,        # 复用已加载的 vLLM 模型
+                user_data_adapter=adapter,       # 使用相同的 user data adapter
+                config=config,
+                language="cn",
+                redis_client=_redis_client,
+                cache_config=CacheConfig.from_dict(cache_config_data) if cache_config_data else None,
+            )
+            _systems['dki_plugin'] = dki_plugin
+            set_dki_plugin(dki_plugin)
+            logger.info("✅ DKIPlugin created and set for /v1/dki/chat endpoint")
+        except Exception as plugin_err:
+            logger.warning(
+                f"⚠️ Failed to create DKIPlugin, falling back to DKISystem: {plugin_err}"
+            )
+            set_dki_plugin(dki)  # 降级: 使用 DKISystem
         
         logger.info("DKI System started")
     
@@ -347,6 +372,18 @@ def create_app() -> FastAPI:
         resolved_user_id = _resolve_user_id(request)
         routing_decision_dict = None  # v6.0: 路由决策 (auto 模式)
         
+        # v7.0: 确保用户在数据库中存在 (跨会话检索依赖 Session.user_id)
+        try:
+            _db_manager = DatabaseManager(db_path=config.database.path, echo=False)
+            with _db_manager.session_scope() as db:
+                user_repo = DemoUserRepository(db)
+                user_repo.get_or_create(
+                    username=resolved_user_id,
+                    display_name=resolved_user_id,
+                )
+        except Exception as _user_err:
+            logger.debug(f"Auto-create user failed (non-critical): {_user_err}")
+        
         # ---- v6.0: Auto-routing ----
         actual_mode = request.mode
         if request.mode == "auto":
@@ -403,15 +440,82 @@ def create_app() -> FastAPI:
         
         try:
             if actual_mode == "dki":
-                dki = get_dki_system()
-                response = dki.chat(
-                    query=request.query,
-                    session_id=session_id,
-                    user_id=resolved_user_id,
-                    force_alpha=request.force_alpha,
-                    max_new_tokens=request.max_new_tokens,
-                    temperature=request.temperature,
+                # ============ SGLang 兼容性: 优先使用 DKIPlugin (async) ============
+                # DKISystem.chat() 是同步方法, 内部调用 model.forward_with_kv_injection().
+                # SGLang 的同步 generate() 内部使用 loop.run_until_complete(),
+                # 在 uvicorn async 上下文中调用会导致 "event loop is already running" 错误.
+                #
+                # 解决方案: 如果 DKIPlugin 已初始化, 优先使用 DKIPlugin.chat() (async),
+                # 它内部使用 async_forward_with_kv_injection() 绕过事件循环冲突.
+                # 仅在 DKIPlugin 不可用时才回退到 DKISystem + run_in_executor.
+                import asyncio
+                from concurrent.futures import ThreadPoolExecutor
+                
+                _dki_plugin_instance = _systems.get('dki_plugin')
+                _is_plugin = (
+                    _dki_plugin_instance is not None
+                    and hasattr(_dki_plugin_instance, 'chat')
+                    and asyncio.iscoroutinefunction(_dki_plugin_instance.chat)
                 )
+                
+                if _is_plugin:
+                    # DKIPlugin 路径 (async, SGLang 安全)
+                    _plugin_response = await _dki_plugin_instance.chat(
+                        query=request.query,
+                        user_id=resolved_user_id,
+                        session_id=session_id,
+                        force_alpha=request.force_alpha,
+                        max_new_tokens=request.max_new_tokens,
+                        temperature=request.temperature,
+                    )
+                    # 转换 DKIPluginResponse → DKIResponse 兼容格式
+                    # DKIPluginResponse 有 .text, .input_tokens, .output_tokens, .metadata
+                    from dki.core.dki_system import DKIResponse
+                    from dki.core.components.dual_factor_gating import GatingDecision
+                    _meta = _plugin_response.metadata
+                    response = DKIResponse(
+                        text=_plugin_response.text,
+                        memories_used=[],
+                        gating_decision=GatingDecision(
+                            should_inject=_meta.injection_enabled,
+                            alpha=_meta.alpha,
+                            memories=[],
+                        ),
+                        latency_ms=_meta.latency_ms,
+                        input_tokens=_plugin_response.input_tokens,
+                        output_tokens=_plugin_response.output_tokens,
+                        cache_hit=_meta.preference_cache_hit,
+                        cache_tier=_meta.preference_cache_tier or "none",
+                        metadata={
+                            "hybrid_injection": {
+                                "enabled": _meta.injection_enabled,
+                                "preference_alpha": _meta.alpha,
+                                "preference_tokens": _meta.preference_tokens,
+                                "history_tokens": _meta.history_tokens,
+                                "preference_text": getattr(_meta, 'preference_text', ''),
+                                "history_suffix_text": getattr(_meta, 'history_suffix_text', ''),
+                                "history_messages": getattr(_meta, 'history_messages', []),
+                                "final_input": getattr(_meta, 'final_input', request.query),
+                            },
+                        },
+                    )
+                else:
+                    # DKISystem 降级路径 (sync, 通过线程池执行)
+                    # 注意: SGLang 引擎在此路径下可能仍有事件循环问题
+                    dki = get_dki_system()
+                    _loop = asyncio.get_running_loop()
+                    _dki_executor = ThreadPoolExecutor(max_workers=2)
+                    response = await _loop.run_in_executor(
+                        _dki_executor,
+                        lambda: dki.chat(
+                            query=request.query,
+                            session_id=session_id,
+                            user_id=resolved_user_id,
+                            force_alpha=request.force_alpha,
+                            max_new_tokens=request.max_new_tokens,
+                            temperature=request.temperature,
+                        )
+                    )
                 
                 # Record visualization data
                 try:
@@ -502,7 +606,7 @@ def create_app() -> FastAPI:
                     routing=routing_decision_dict,
                 )
                 
-            elif request.mode == "rag":
+            elif actual_mode == "rag":
                 rag = get_rag_system()
                 response = rag.chat(
                     query=request.query,
@@ -1039,11 +1143,12 @@ def create_app() -> FastAPI:
     async def run_experiment(request: ExperimentRequest):
         """Run an experiment."""
         try:
-            dki = get_dki_system()
             rag = get_rag_system()
+            # v8.2: 传递 dki_plugin + model_adapter 避免重复加载
             runner = ExperimentRunner(
-                dki_system=dki,
+                dki_plugin=_systems.get('dki_plugin'),
                 rag_system=rag,
+                model_adapter=rag.model,
             )
             config = ExperimentConfig(
                 name=request.name,
@@ -1070,11 +1175,12 @@ def create_app() -> FastAPI:
         4. Conversations are automatically persisted to conversations table
         """
         try:
-            dki = get_dki_system()
             rag = get_rag_system()
+            # v8.2: 传递 dki_plugin + model_adapter 避免重复加载 vLLM 引擎
             runner = ExperimentRunner(
-                dki_system=dki,
+                dki_plugin=_systems.get('dki_plugin'),
                 rag_system=rag,
+                model_adapter=rag.model,
             )
             results = runner.run_persona_chat_experiment(
                 include_long_sessions=True,
@@ -1126,11 +1232,12 @@ def create_app() -> FastAPI:
         - 50 samples × 3 modes: ~2 hours
         """
         try:
-            dki = get_dki_system()
             rag = get_rag_system()
+            # v8.2: 传递 dki_plugin + model_adapter 避免重复加载 vLLM 引擎
             runner = ExperimentRunner(
-                dki_system=dki,
+                dki_plugin=_systems.get('dki_plugin'),
                 rag_system=rag,
+                model_adapter=rag.model,
             )
             results = runner.run_longmemeval(
                 modes=request.modes,
@@ -1171,11 +1278,12 @@ def create_app() -> FastAPI:
         - 50 samples × 3 modes: ~3.5 hours
         """
         try:
-            dki = get_dki_system()
             rag = get_rag_system()
+            # v8.2: 传递 dki_plugin + model_adapter 避免重复加载 vLLM 引擎
             runner = ExperimentRunner(
-                dki_system=dki,
+                dki_plugin=_systems.get('dki_plugin'),
                 rag_system=rag,
+                model_adapter=rag.model,
             )
             results = runner.run_longmemeval(
                 modes=request.modes,
