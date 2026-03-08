@@ -9,13 +9,31 @@ SQLite Data Adapter for Experiment System
 - 实现 IUserDataAdapter 接口的所有抽象方法
 - 支持跨会话检索 (session_id=None)
 - 同步操作包装为 async (SQLite 不需要真正的异步)
+
+v7.2 更新:
+- 实现 get_recent_messages() — 恢复近轮对话注入
+- search_relevant_history() 升级到 jieba + BM25 — 提升检索质量
 """
 
+import math
 import re
+from collections import Counter
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
+
+# jieba 分词 (可选依赖, 降级到 bigram)
+try:
+    import jieba
+    import jieba.analyse
+    JIEBA_AVAILABLE = True
+except ImportError:
+    JIEBA_AVAILABLE = False
+    logger.warning(
+        "jieba not installed, falling back to bigram tokenization. "
+        "Install with: pip install jieba"
+    )
 
 from dki.adapters.base import (
     IUserDataAdapter,
@@ -176,6 +194,74 @@ class SQLiteDataAdapter(IUserDataAdapter):
             logger.error(f"SQLiteDataAdapter.get_session_history failed: {e}")
             return []
 
+    # ============ 近轮对话获取 (v7.2: 恢复近轮对话注入) ============
+
+    async def get_recent_messages(
+        self,
+        user_id: str,
+        limit: int = 10,
+    ) -> List[ChatMessage]:
+        """
+        获取用户最近的消息 (跨会话, 按时间正序)
+
+        v7.2 修复: DKIPlugin.chat() 在 Step 2 中调用此方法获取近轮对话,
+        与 BM25 召回结果合并后注入到提示词后缀。
+
+        之前 SQLiteDataAdapter 未实现此方法, 导致 DKIPlugin 始终拿到空列表,
+        近轮对话注入被跳过, 严重低估了 DKI 的历史召回能力。
+
+        实现策略:
+        - 查询该 user_id 关联的所有 session 的 conversations
+        - 按 created_at DESC 取最近 limit 条
+        - 反转为时间正序 (最旧在前), 与 _merge_recent_and_recalled 的预期一致
+
+        Args:
+            user_id: 用户标识
+            limit: 最大消息数 (建议 10-20, 即 5-10 轮对话)
+
+        Returns:
+            List[ChatMessage]: 按时间正序排列的近轮消息
+        """
+        try:
+            with self._db_manager.session_scope() as db_session:
+                from dki.database.models import Session as SessionModel, Conversation
+                from sqlalchemy import desc
+
+                # 跨会话: 先找该用户的所有 session_id
+                user_sessions = (
+                    db_session.query(SessionModel.id)
+                    .filter(SessionModel.user_id == user_id)
+                    .all()
+                )
+                session_ids = [s.id for s in user_sessions]
+
+                if not session_ids:
+                    return []
+
+                # 获取这些 session 中最近的 limit 条消息 (时间降序)
+                conversations = (
+                    db_session.query(Conversation)
+                    .filter(Conversation.session_id.in_(session_ids))
+                    .order_by(desc(Conversation.created_at), desc(Conversation.id))
+                    .limit(limit)
+                    .all()
+                )
+
+                if not conversations:
+                    return []
+
+                # 反转为时间正序 (最旧在前)
+                conversations = list(reversed(conversations))
+
+                return self._conversations_to_chat_messages(
+                    conversations,
+                    session_id="cross_session",
+                    user_id=user_id,
+                )
+        except Exception as e:
+            logger.error(f"SQLiteDataAdapter.get_recent_messages failed: {e}")
+            return []
+
     # ============ 相关历史检索 (核心: 仅搜索 conversations 表) ============
 
     async def search_relevant_history(
@@ -186,7 +272,7 @@ class SQLiteDataAdapter(IUserDataAdapter):
         session_id: Optional[str] = None,
     ) -> List[ChatMessage]:
         """
-        检索与查询相关的历史对话消息。
+        检索与查询相关的历史对话消息 (v7.2: jieba + BM25)。
 
         当 session_id=None 时，执行跨会话检索 (跨该 user_id 的所有会话)。
         当 session_id 有值时，仅在该会话内检索。
@@ -200,7 +286,6 @@ class SQLiteDataAdapter(IUserDataAdapter):
         Step 1 — 用户偏好 (提示词前缀注入):
             DKIPlugin.chat() → get_user_preferences() → preference_text
             → InjectionExecutor 放入 system message (显式文本前缀)
-            (vLLM 环境下为 prompt prefix, 非 past_key_value 注入)
             偏好数据来源: user_preferences 表
         
         Step 2 — 历史召回 (多路融合):
@@ -208,18 +293,11 @@ class SQLiteDataAdapter(IUserDataAdapter):
             → InjectionPlanner._build_suffix_only_plan() → history items
             历史数据来源: conversations 表
         
-        persona/记忆信息存储在 memories 表中，但在实验系统中，
-        这些信息已通过 _write_session_preferences() 同步写入
-        user_preferences 表，由 get_user_preferences() 路径处理。
-        
-        如果将 memories 表数据混入此方法，会导致 persona 同时出现在
-        preferences (system message) 和 history (suffix) 两个通道中，
-        这违反了 DKI 的两步分离原则。
-        
-        检索策略: 关键词匹配 (SQLite 不支持向量检索)
-        - 从 query 中提取关键词
-        - 在 conversations 表中搜索包含这些关键词的消息
-        - 按匹配度排序，返回 top-k
+        v7.2 检索策略升级: jieba 分词 + BM25 评分
+        - 使用 jieba 进行中文分词 (降级: bigram 滑窗)
+        - 使用 BM25 (Okapi BM25) 算法替代简单关键词计数
+        - BM25 考虑了词频 (TF)、逆文档频率 (IDF) 和文档长度归一化
+        - 显著提升中文语义检索质量
         """
         try:
             with self._db_manager.session_scope() as db_session:
@@ -227,14 +305,12 @@ class SQLiteDataAdapter(IUserDataAdapter):
 
                 # ============ 1. 获取候选对话消息 ============
                 if session_id is None:
-                    # 跨会话检索: 获取该用户所有会话的历史
                     conversations = conv_repo.get_by_user_cross_session(
                         user_id=user_id,
                         current_session_id=None,
-                        limit=200,  # 获取较多消息用于过滤
+                        limit=200,
                     )
                 else:
-                    # 单会话检索
                     conversations = conv_repo.get_by_session(
                         session_id=session_id,
                         limit=100,
@@ -243,10 +319,9 @@ class SQLiteDataAdapter(IUserDataAdapter):
                 if not conversations:
                     return []
 
-                # ============ 2. 关键词提取 ============
-                keywords = self._extract_keywords(query)
-                if not keywords:
-                    # 无法提取关键词时，返回最近的消息 (近轮兜底)
+                # ============ 2. 分词 ============
+                query_tokens = self._tokenize(query)
+                if not query_tokens:
                     recent = conversations[-limit:]
                     return self._conversations_to_chat_messages(
                         recent,
@@ -254,21 +329,27 @@ class SQLiteDataAdapter(IUserDataAdapter):
                         user_id=user_id,
                     )
 
-                # ============ 3. 关键词匹配评分 ============
-                scored = []
+                # ============ 3. 构建文档语料库并计算 BM25 ============
+                doc_tokens_list: List[List[str]] = []
                 for conv in conversations:
-                    content_lower = conv.content.lower()
-                    score = sum(1 for kw in keywords if kw in content_lower)
-                    if score > 0:
-                        scored.append((conv, score))
+                    doc_tokens_list.append(self._tokenize(conv.content))
+
+                scored = self._bm25_score(
+                    query_tokens=query_tokens,
+                    doc_tokens_list=doc_tokens_list,
+                )
 
                 # ============ 4. 排序 + 近轮兜底 ============
-                if scored:
-                    # 按匹配度降序排序
-                    scored.sort(key=lambda x: x[1], reverse=True)
-                    top_convs = [item[0] for item in scored[:limit]]
+                scored_with_conv = [
+                    (conversations[i], score)
+                    for i, score in enumerate(scored)
+                    if score > 0.0
+                ]
+
+                if scored_with_conv:
+                    scored_with_conv.sort(key=lambda x: x[1], reverse=True)
+                    top_convs = [item[0] for item in scored_with_conv[:limit]]
                 else:
-                    # 关键词匹配无结果时，返回最近消息 (近轮兜底)
                     top_convs = conversations[-limit:]
 
                 # ============ 5. 转换为 ChatMessage ============
@@ -337,42 +418,142 @@ class SQLiteDataAdapter(IUserDataAdapter):
 
     # ============ 辅助方法 ============
 
+    # ---- 停用词表 ----
+    _EN_STOPWORDS = frozenset({
+        'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been',
+        'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would',
+        'can', 'could', 'should', 'may', 'might', 'shall',
+        'i', 'you', 'he', 'she', 'it', 'we', 'they',
+        'my', 'your', 'his', 'her', 'its', 'our', 'their',
+        'what', 'which', 'who', 'whom', 'where', 'when', 'why', 'how',
+        'this', 'that', 'these', 'those',
+        'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'from',
+        'and', 'or', 'but', 'not', 'if', 'so', 'than', 'too', 'very',
+        'just', 'about', 'also', 'more', 'some', 'any', 'only',
+    })
+
+    _CN_STOPWORDS = frozenset({
+        '的', '了', '是', '在', '我', '你', '他', '她', '们', '有',
+        '这', '那', '个', '也', '就', '都', '不', '吗', '呢', '吧',
+        '啊', '啦', '呀', '请', '和', '与', '什么', '怎么', '哪',
+        '哪里', '为什么', '还', '又', '被', '把', '让', '给', '从',
+        '到', '对', '着', '过', '会', '能', '要', '想', '可以',
+        '一', '二', '三', '上', '下', '中', '大', '小',
+    })
+
+    def _tokenize(self, text: str) -> List[str]:
+        """
+        对文本进行分词 (jieba 优先, 降级到 bigram)。
+
+        返回去停用词后的 token 列表 (小写)。
+        """
+        tokens: List[str] = []
+
+        if JIEBA_AVAILABLE:
+            # jieba 精确模式分词
+            words = jieba.lcut(text)
+            for w in words:
+                w_stripped = w.strip()
+                if not w_stripped:
+                    continue
+                w_lower = w_stripped.lower()
+                # 过滤停用词和单字符
+                if w_lower in self._CN_STOPWORDS or w_lower in self._EN_STOPWORDS:
+                    continue
+                if len(w_lower) < 2:
+                    continue
+                tokens.append(w_lower)
+        else:
+            # 降级: 英文按空格分词 + 中文 bigram
+            # 英文
+            en_words = re.findall(r'[a-zA-Z]{2,}', text.lower())
+            tokens.extend(
+                w for w in en_words
+                if w not in self._EN_STOPWORDS and len(w) > 1
+            )
+            # 中文 bigram
+            cn_segments = re.findall(r'[\u4e00-\u9fff]+', text)
+            for seg in cn_segments:
+                filtered = ''.join(
+                    c for c in seg if c not in self._CN_STOPWORDS
+                )
+                for i in range(len(filtered) - 1):
+                    bigram = filtered[i:i + 2]
+                    if len(bigram) == 2:
+                        tokens.append(bigram)
+
+        return tokens
+
+    @staticmethod
+    def _bm25_score(
+        query_tokens: List[str],
+        doc_tokens_list: List[List[str]],
+        k1: float = 1.5,
+        b: float = 0.75,
+    ) -> List[float]:
+        """
+        Okapi BM25 评分。
+
+        对每个文档计算 BM25 分数, 返回与 doc_tokens_list 等长的分数列表。
+
+        BM25(D, Q) = Σ_{q ∈ Q} IDF(q) · (tf(q,D) · (k1+1)) / (tf(q,D) + k1 · (1 - b + b · |D|/avgdl))
+
+        Args:
+            query_tokens: 查询分词结果
+            doc_tokens_list: 文档分词结果列表
+            k1: 词频饱和参数 (默认 1.5)
+            b: 文档长度归一化参数 (默认 0.75)
+
+        Returns:
+            List[float]: 每个文档的 BM25 分数
+        """
+        n_docs = len(doc_tokens_list)
+        if n_docs == 0:
+            return []
+
+        # 计算平均文档长度
+        doc_lengths = [len(dt) for dt in doc_tokens_list]
+        avgdl = sum(doc_lengths) / n_docs if n_docs > 0 else 1.0
+
+        # 计算每个 query token 的 IDF
+        # IDF(q) = log((N - n(q) + 0.5) / (n(q) + 0.5) + 1)
+        query_token_set = set(query_tokens)
+        df: Dict[str, int] = {}  # document frequency
+        for dt in doc_tokens_list:
+            seen_in_doc = set(dt)
+            for token in query_token_set:
+                if token in seen_in_doc:
+                    df[token] = df.get(token, 0) + 1
+
+        idf: Dict[str, float] = {}
+        for token in query_token_set:
+            n_q = df.get(token, 0)
+            idf[token] = math.log((n_docs - n_q + 0.5) / (n_q + 0.5) + 1.0)
+
+        # 计算每个文档的 BM25 分数
+        scores: List[float] = []
+        for i, doc_tokens in enumerate(doc_tokens_list):
+            dl = doc_lengths[i]
+            tf_counter = Counter(doc_tokens)
+            score = 0.0
+            for q_token in query_tokens:
+                tf_val = tf_counter.get(q_token, 0)
+                if tf_val == 0:
+                    continue
+                numerator = tf_val * (k1 + 1.0)
+                denominator = tf_val + k1 * (1.0 - b + b * dl / avgdl)
+                score += idf.get(q_token, 0.0) * numerator / denominator
+            scores.append(score)
+
+        return scores
+
     def _extract_keywords(self, text: str) -> List[str]:
-        """从文本中提取关键词 (支持中文 bigram 滑窗分词)。"""
-        # 英文: 按空格/标点分词
-        en_words = re.findall(r'[a-zA-Z]{2,}', text.lower())
-        en_stopwords = {
-            'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been',
-            'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would',
-            'can', 'could', 'should', 'may', 'might', 'shall',
-            'i', 'you', 'he', 'she', 'it', 'we', 'they',
-            'my', 'your', 'his', 'her', 'its', 'our', 'their',
-            'what', 'which', 'who', 'whom', 'where', 'when', 'why', 'how',
-            'this', 'that', 'these', 'those',
-            'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'from',
-            'and', 'or', 'but', 'not', 'if', 'so', 'than', 'too', 'very',
-        }
-        en_keywords = [w for w in en_words if w not in en_stopwords and len(w) > 1]
+        """
+        从文本中提取关键词 (向后兼容, 内部使用 _tokenize)。
 
-        # 中文: 提取连续中文段落, bigram 滑窗分词
-        cn_segments = re.findall(r'[\u4e00-\u9fff]+', text)
-        cn_stopchars = set('的了是在我你他她们有这那个也就都不吗呢吧啊啦呀请和与什么怎么哪哪里为什么')
-        cn_keywords = []
-        for seg in cn_segments:
-            filtered = ''.join(c for c in seg if c not in cn_stopchars)
-            for i in range(len(filtered) - 1):
-                bigram = filtered[i:i+2]
-                if len(bigram) == 2:
-                    cn_keywords.append(bigram)
-
-        # 去重保序
-        seen = set()
-        unique = []
-        for kw in en_keywords + cn_keywords:
-            if kw not in seen:
-                seen.add(kw)
-                unique.append(kw)
-        return unique
+        保留此方法以兼容可能的外部调用。
+        """
+        return self._tokenize(text)
 
     def _conversations_to_chat_messages(
         self,

@@ -93,16 +93,26 @@ class ExperimentDataGenerator:
         ]
         
         queries = [
-            ("Can you recommend a restaurant for me?", ["food", "vegetarian", "seafood"]),
-            ("What activities can I do this weekend?", ["hiking", "outdoor", "photography"]),
-            ("Help me plan my morning routine.", ["wake up", "yoga", "coffee"]),
-            ("What should I read next?", ["science fiction", "reading"]),
-            ("Suggest a gift for my pet.", ["dog", "golden retriever", "Max"]),
-            ("What music should I listen to while working?", ["classical music", "guitar"]),
-            ("Where should I travel for vacation?", ["Japan", "trip", "travel"]),
-            ("What skills should I learn?", ["guitar", "AI", "artificial intelligence"]),
-            ("Recommend a workout routine.", ["yoga", "morning", "outdoor"]),
-            ("What hobby should I pick up?", ["photography", "watches", "collecting"]),
+            ("Can you recommend a restaurant for me?", ["food", "vegetarian", "seafood"],
+             "Since you prefer vegetarian food and are allergic to seafood, I'd recommend a vegetarian restaurant that clearly labels all ingredients to avoid any seafood contamination."),
+            ("What activities can I do this weekend?", ["hiking", "outdoor", "photography"],
+             "Given your love for hiking and outdoor activities, and your photography hobby, you could go on a scenic hike and capture some beautiful landscape photos."),
+            ("Help me plan my morning routine.", ["wake up", "yoga", "coffee"],
+             "Since you usually wake up early around 6 AM and practice yoga every morning, I'd suggest starting with yoga at 6:15 AM, followed by a cup of coffee to energize your day."),
+            ("What should I read next?", ["science fiction", "reading"],
+             "Based on your interest in science fiction novels, you might enjoy exploring more works in the genre, perhaps some classic sci-fi or newer releases."),
+            ("Suggest a gift for my pet.", ["dog", "golden retriever", "Max"],
+             "For your golden retriever Max, a durable chew toy or an interactive puzzle feeder would be a great gift to keep him entertained."),
+            ("What music should I listen to while working?", ["classical music", "guitar"],
+             "As a fan of classical music who is learning guitar, you might enjoy listening to classical guitar pieces, such as works by Segovia or John Williams."),
+            ("Where should I travel for vacation?", ["Japan", "trip", "travel"],
+             "Since you're already planning a trip to Japan next year, you could start researching destinations like Kyoto for temples and Tokyo for modern culture."),
+            ("What skills should I learn?", ["guitar", "AI", "artificial intelligence"],
+             "Given your interest in AI and that you're learning guitar, you could deepen your guitar skills or explore AI/machine learning courses online."),
+            ("Recommend a workout routine.", ["yoga", "morning", "outdoor"],
+             "Since you practice yoga every morning and love outdoor activities, a routine combining morning yoga with weekend outdoor hiking would suit you well."),
+            ("What hobby should I pick up?", ["photography", "watches", "collecting"],
+             "Given your enjoyment of photography and watch collecting, you might explore macro photography of watch mechanisms as a creative intersection of both hobbies."),
         ]
         
         data = []
@@ -128,7 +138,7 @@ class ExperimentDataGenerator:
             turns = []
             used_queries = random.sample(queries, min(n_turns_per_session, len(queries)))
             
-            for turn_idx, (query, expected_keywords) in enumerate(used_queries):
+            for turn_idx, (query, expected_keywords, ref_answer) in enumerate(used_queries):
                 # Find relevant personas
                 relevant_memories = [
                     p for p in session_personas
@@ -140,6 +150,7 @@ class ExperimentDataGenerator:
                     'query': query,
                     'expected_keywords': expected_keywords,
                     'relevant_memories': relevant_memories,
+                    'reference_answer': ref_answer,
                 })
             
             data.append({
@@ -272,30 +283,35 @@ class ExperimentDataGenerator:
                 'query': "What color should I paint my room?",
                 'expected_use': True,
                 'vars': {'color': ['blue', 'green', 'red', 'yellow', 'purple']},
+                'reference_answer_template': "Since your favorite color is {color}, painting your room {color} would be a great choice that reflects your personal taste.",
             },
             {
                 'memory': "I'm allergic to {allergen}.",
                 'query': "Can you suggest what to eat?",
                 'expected_use': True,
                 'vars': {'allergen': ['peanuts', 'shellfish', 'dairy', 'gluten']},
+                'reference_answer_template': "Given your allergy to {allergen}, I'd recommend avoiding any dishes containing {allergen} and choosing meals with clearly labeled ingredients.",
             },
             {
                 'memory': "I live in {city}.",
                 'query': "What's the weather like today?",
                 'expected_use': True,
                 'vars': {'city': ['Beijing', 'Shanghai', 'Tokyo', 'London', 'Paris']},
+                'reference_answer_template': "Since you live in {city}, let me check the weather for {city} today. The weather in {city} varies by season.",
             },
             {
                 'memory': "My birthday is on {date}.",
                 'query': "What special events are coming up?",
                 'expected_use': True,
                 'vars': {'date': ['March 15', 'June 20', 'October 1', 'December 25']},
+                'reference_answer_template': "Your birthday on {date} is coming up! That's a special event you might want to plan for.",
             },
             {
                 'memory': "I prefer {preference} style.",
                 'query': "Help me pick an outfit.",
                 'expected_use': True,
                 'vars': {'preference': ['casual', 'formal', 'sporty', 'minimalist']},
+                'reference_answer_template': "Based on your preference for {preference} style, I'd suggest choosing {preference} pieces that are comfortable and versatile.",
             },
         ]
         
@@ -310,6 +326,9 @@ class ExperimentDataGenerator:
                 filled_vars[var_name] = random.choice(options)
             
             memory = template['memory'].format(**filled_vars)
+            reference_answer = template.get(
+                'reference_answer_template', ''
+            ).format(**filled_vars)
             
             data.append({
                 'id': f"memqa_{i:04d}",
@@ -317,6 +336,7 @@ class ExperimentDataGenerator:
                 'query': template['query'],
                 'expected_memory_use': template['expected_use'],
                 'filled_vars': filled_vars,
+                'reference_answer': reference_answer,
                 'metadata': {
                     'dataset': 'memory_qa',
                     'generated_at': datetime.now().isoformat(),
@@ -447,16 +467,26 @@ class ExperimentDataGenerator:
         ]
         
         queries = [
-            ("能给我推荐一家餐厅吗？", ["素食", "海鲜", "过敏"]),
-            ("这个周末我可以做什么活动？", ["徒步", "户外", "摄影"]),
-            ("帮我规划一下早晨的日程。", ["起床", "瑜伽", "咖啡"]),
-            ("我接下来应该读什么书？", ["科幻", "阅读"]),
-            ("给我的宠物推荐个礼物。", ["金毛", "小白", "宠物"]),
-            ("工作时应该听什么音乐？", ["古典音乐", "吉他"]),
-            ("假期应该去哪里旅行？", ["日本", "旅行"]),
-            ("我应该学习什么新技能？", ["吉他", "人工智能"]),
-            ("推荐一个健身方案。", ["瑜伽", "户外", "运动"]),
-            ("我应该培养什么新爱好？", ["摄影", "手表", "收藏"]),
+            ("能给我推荐一家餐厅吗？", ["素食", "海鲜", "过敏"],
+             "考虑到你是素食主义者且对海鲜过敏，我推荐你去一家纯素餐厅，确保所有菜品不含海鲜成分。"),
+            ("这个周末我可以做什么活动？", ["徒步", "户外", "摄影"],
+             "你喜欢徒步和户外运动，也爱好摄影，周末可以去郊外徒步，顺便拍些风景照。"),
+            ("帮我规划一下早晨的日程。", ["起床", "瑜伽", "咖啡"],
+             "你通常早上六点起床，每天早上练瑜伽，建议6:15开始瑜伽，之后来一杯咖啡开始新的一天。"),
+            ("我接下来应该读什么书？", ["科幻", "阅读"],
+             "你喜欢阅读科幻小说，可以尝试一些经典科幻作品或最新出版的科幻小说。"),
+            ("给我的宠物推荐个礼物。", ["金毛", "小白", "宠物"],
+             "给你的金毛犬小白买一个耐咬的玩具或者互动益智喂食器，既能锻炼它又能让它开心。"),
+            ("工作时应该听什么音乐？", ["古典音乐", "吉他"],
+             "你是古典音乐爱好者，正在学吉他，工作时可以听一些古典吉他曲目，既放松又有助于集中注意力。"),
+            ("假期应该去哪里旅行？", ["日本", "旅行"],
+             "你计划明年去日本旅行，可以提前研究京都的寺庙和东京的现代文化景点。"),
+            ("我应该学习什么新技能？", ["吉他", "人工智能"],
+             "你对人工智能感兴趣，也在学吉他，可以深入学习吉他技巧，或者探索AI和机器学习的在线课程。"),
+            ("推荐一个健身方案。", ["瑜伽", "户外", "运动"],
+             "你每天早上练瑜伽，也喜欢户外运动，建议工作日早晨瑜伽，周末安排户外徒步或骑行。"),
+            ("我应该培养什么新爱好？", ["摄影", "手表", "收藏"],
+             "你喜欢摄影和收藏手表，可以尝试微距摄影拍摄手表机芯，将两个爱好创意结合。"),
         ]
         
         data = []
@@ -481,7 +511,7 @@ class ExperimentDataGenerator:
             turns = []
             used_queries = random.sample(queries, min(n_turns_per_session, len(queries)))
             
-            for turn_idx, (query, expected_keywords) in enumerate(used_queries):
+            for turn_idx, (query, expected_keywords, ref_answer) in enumerate(used_queries):
                 relevant_memories = [
                     p for p in session_personas
                     if any(kw in p for kw in expected_keywords)
@@ -492,6 +522,7 @@ class ExperimentDataGenerator:
                     'query': query,
                     'expected_keywords': expected_keywords,
                     'relevant_memories': relevant_memories,
+                    'reference_answer': ref_answer,
                 })
             
             data.append({
@@ -534,11 +565,16 @@ class ExperimentDataGenerator:
                     "用户有一只叫小花的猫",
                 ],
                 'turns': [
-                    {'query': '你好，我想找个好吃的餐厅', 'tests_memory': False},
-                    {'query': '我之前说过我的饮食习惯，帮我推荐吧', 'tests_memory': True, 'expected_recall': ['素食']},
-                    {'query': '离我家近一点的', 'tests_memory': True, 'expected_recall': ['上海', '浦东']},
-                    {'query': '对了，我想给我的宠物买个玩具', 'tests_memory': True, 'expected_recall': ['猫', '小花']},
-                    {'query': '总结一下今天我们聊了什么', 'tests_memory': True, 'expected_recall': ['素食', '餐厅', '宠物']},
+                    {'query': '你好，我想找个好吃的餐厅', 'tests_memory': False,
+                     'reference_answer': '好的，请问你有什么饮食偏好或限制吗？这样我可以更好地推荐。'},
+                    {'query': '我之前说过我的饮食习惯，帮我推荐吧', 'tests_memory': True, 'expected_recall': ['素食'],
+                     'reference_answer': '你是素食主义者，我推荐你去一家纯素餐厅，菜品种类丰富且不含任何动物制品。'},
+                    {'query': '离我家近一点的', 'tests_memory': True, 'expected_recall': ['上海', '浦东'],
+                     'reference_answer': '你住在上海浦东，我帮你找浦东附近的素食餐厅，交通方便的那种。'},
+                    {'query': '对了，我想给我的宠物买个玩具', 'tests_memory': True, 'expected_recall': ['猫', '小花'],
+                     'reference_answer': '给你的猫小花买个逗猫棒或者猫抓板吧，猫咪通常很喜欢这类玩具。'},
+                    {'query': '总结一下今天我们聊了什么', 'tests_memory': True, 'expected_recall': ['素食', '餐厅', '宠物'],
+                     'reference_answer': '今天我们聊了：1）为你这位素食主义者推荐浦东附近的素食餐厅；2）给你的猫小花挑选玩具。'},
                 ],
             },
             {
@@ -548,11 +584,16 @@ class ExperimentDataGenerator:
                     "用户的生日是3月15日",
                 ],
                 'turns': [
-                    {'query': '推荐一个周末活动', 'tests_memory': True, 'expected_recall': ['跑步', '游泳']},
-                    {'query': '有什么技术书籍推荐吗', 'tests_memory': True, 'expected_recall': ['程序', 'Python']},
-                    {'query': '下个月有什么特别的日子', 'tests_memory': True, 'expected_recall': ['生日', '3月']},
-                    {'query': '帮我安排一个运动计划', 'tests_memory': True, 'expected_recall': ['跑步', '游泳']},
-                    {'query': '你还记得我的职业吗', 'tests_memory': True, 'expected_recall': ['程序']},
+                    {'query': '推荐一个周末活动', 'tests_memory': True, 'expected_recall': ['跑步', '游泳'],
+                     'reference_answer': '你喜欢跑步和游泳，周末可以去公园晨跑，下午去游泳馆游泳放松。'},
+                    {'query': '有什么技术书籍推荐吗', 'tests_memory': True, 'expected_recall': ['程序', 'Python'],
+                     'reference_answer': '你是熟悉Python的程序员，推荐《Fluent Python》或《Python Cookbook》深入提升技能。'},
+                    {'query': '下个月有什么特别的日子', 'tests_memory': True, 'expected_recall': ['生日', '3月'],
+                     'reference_answer': '你的生日是3月15日，下个月就是你的生日了，可以提前计划庆祝活动。'},
+                    {'query': '帮我安排一个运动计划', 'tests_memory': True, 'expected_recall': ['跑步', '游泳'],
+                     'reference_answer': '根据你喜欢跑步和游泳的习惯，建议周一三五跑步5公里，周二四六游泳1小时。'},
+                    {'query': '你还记得我的职业吗', 'tests_memory': True, 'expected_recall': ['程序'],
+                     'reference_answer': '当然记得，你是一名程序员，熟悉Python编程语言。'},
                 ],
             },
             {
@@ -562,11 +603,16 @@ class ExperimentDataGenerator:
                     "用户喜欢古典音乐",
                 ],
                 'turns': [
-                    {'query': '午饭吃什么好', 'tests_memory': True, 'expected_recall': ['辣椒', '过敏']},
-                    {'query': '推荐一个音乐会', 'tests_memory': True, 'expected_recall': ['古典音乐']},
-                    {'query': '下班后去哪里吃好', 'tests_memory': True, 'expected_recall': ['北京', '辣椒']},
-                    {'query': '你记得我不能吃什么吗', 'tests_memory': True, 'expected_recall': ['辣椒', '过敏']},
-                    {'query': '帮我规划今晚的安排', 'tests_memory': True, 'expected_recall': ['音乐', '北京']},
+                    {'query': '午饭吃什么好', 'tests_memory': True, 'expected_recall': ['辣椒', '过敏'],
+                     'reference_answer': '你对辣椒过敏，午饭建议选择不辣的菜品，比如清淡的粤菜或日料。'},
+                    {'query': '推荐一个音乐会', 'tests_memory': True, 'expected_recall': ['古典音乐'],
+                     'reference_answer': '你喜欢古典音乐，推荐去国家大剧院看最近的交响乐演出。'},
+                    {'query': '下班后去哪里吃好', 'tests_memory': True, 'expected_recall': ['北京', '辣椒'],
+                     'reference_answer': '你在北京工作且对辣椒过敏，推荐去国贸附近的粤菜馆或日料店，避免川菜和湘菜。'},
+                    {'query': '你记得我不能吃什么吗', 'tests_memory': True, 'expected_recall': ['辣椒', '过敏'],
+                     'reference_answer': '记得，你对辣椒过敏，不能吃任何含辣椒的食物。'},
+                    {'query': '帮我规划今晚的安排', 'tests_memory': True, 'expected_recall': ['音乐', '北京'],
+                     'reference_answer': '建议下班后先去北京的一家不辣的餐厅吃晚饭，然后去附近的音乐厅欣赏一场古典音乐会。'},
                 ],
             },
         ]
@@ -620,11 +666,16 @@ class ExperimentDataGenerator:
         ]
         
         queries_cn = [
-            {"query": "推荐一个适合我的午餐", "relevant_memory_idx": [0]},
-            {"query": "周末去哪里玩比较好", "relevant_memory_idx": [1, 2]},
-            {"query": "有什么新技术值得学习", "relevant_memory_idx": [3]},
-            {"query": "给我的宠物买点什么", "relevant_memory_idx": [4]},
-            {"query": "附近有什么好的运动场所", "relevant_memory_idx": [1, 2]},
+            {"query": "推荐一个适合我的午餐", "relevant_memory_idx": [0],
+             "reference_answer": "你是素食主义者，不吃肉类和海鲜，推荐你去一家素食餐厅，选择豆腐、蔬菜沙拉等营养均衡的素食午餐。"},
+            {"query": "周末去哪里玩比较好", "relevant_memory_idx": [1, 2],
+             "reference_answer": "你住在北京海淀区中关村附近，喜欢户外运动特别是徒步和骑行，周末可以去香山或百望山徒步。"},
+            {"query": "有什么新技术值得学习", "relevant_memory_idx": [3],
+             "reference_answer": "你是数据科学家，擅长机器学习，可以学习最新的大语言模型微调技术或强化学习方面的进展。"},
+            {"query": "给我的宠物买点什么", "relevant_memory_idx": [4],
+             "reference_answer": "你养了两只猫花花和豆豆，可以给它们买猫爬架、逗猫棒或者猫薄荷玩具。"},
+            {"query": "附近有什么好的运动场所", "relevant_memory_idx": [1, 2],
+             "reference_answer": "你住在海淀区中关村附近，喜欢徒步和骑行，附近有圆明园、颐和园适合骑行，百望山适合徒步。"},
         ]
         
         ablation_modes = [
@@ -650,6 +701,7 @@ class ExperimentDataGenerator:
                 'all_memories': memories_cn,
                 'query': query_item['query'],
                 'relevant_memories': relevant_memories,
+                'reference_answer': query_item.get('reference_answer', ''),
                 'ablation_modes': ablation_modes,
                 'metadata': {
                     'dataset': 'ablation',
