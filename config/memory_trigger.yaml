@@ -42,6 +42,10 @@ memory_trigger:
     - "其实我(想|觉得|认为)"
     - "我的(偏好|喜好|习惯)是"
     - "我(不再|不想|不要).*?了"
+    # v6.4: 纠正/否定模式 — 用户否定助手的回答
+    - "不是的.*(再想想|重新想|再想一下|再考虑)"
+    - "(不对|不是的|错了|你说错了|你搞错了|不是这样|你理解错了)"
+    - "(再想想|重新想|想错了|答错了)"
   
   state_change_patterns_en:
     - "I('ve| have)? (changed|updated) my (mind|opinion|view)"
@@ -49,6 +53,10 @@ memory_trigger:
     - "actually I (think|believe|want)"
     - "my (preference|habit) is"
     - "I (no longer|don't want to)"
+    # v6.4: correction/negation patterns — user corrects assistant's answer
+    - "(that's wrong|that's not right|you're wrong|that's incorrect)"
+    - "(think again|try again|reconsider)"
+    - "(not correct|you got it wrong|no,? that's not)"
   
   # ============ Long-Term Value Patterns (长期价值信号) ============
   # Triggers for preferences, habits, and persistent information

@@ -21,10 +21,62 @@ model:
     default_engine: "vllm"
 
     # Model configurations by engine
+    # ============ 推理输出配置 ============
+    # max_new_tokens: 模型单次推理最大生成 token 数
+    #   - 所有引擎 (llama/vllm/sglang) 共享此默认值
+    #   - 前端 / API 可覆盖 (请求级 max_tokens 参数)
+    #   - 小模型 (7B/8B) 建议 512-1024
+    #   - 大模型 (14B+) 建议 1024-2048
+    #   - Thinking/推理模型建议 2048-4096
+    max_new_tokens: 2048
+
     engines:
+        # ============ LLaMA Engine (HuggingFace Transformers) ============
+        # 适用于 LLaMA 3.x / 3.1 / 3.2 Instruct 系列模型
+        # 通过 HuggingFace AutoModelForCausalLM 加载, 支持 K/V 注入
+        llama:
+            enabled: true
+            model_name: "/opt/ai-demo/models/llama-3.1-8b-instruct"
+            device: "cuda"
+            dtype: "float16"
+            trust_remote_code: true
+            # 8-bit 量化 (显存不足时启用, 如单卡 V100 32G 跑 8B 模型)
+            load_in_8bit: false
+            max_model_len: 8192
+            gpu_memory_utilization: 0.8
+
+            # ============ 量化配置 ============
+            # quantization: 量化方式
+            #   - "none" (默认): 不量化, 使用 dtype 精度
+            #   - "4bit": 4-bit NF4 量化 (bitsandbytes, 显存节省 ~75%)
+            #   - "8bit": 8-bit LLM.int8() 量化 (bitsandbytes, 显存节省 ~50%)
+            #   - "fp8": FP8 (E4M3) 量化 (显存节省 ~50%, 精度损失 < 1%)
+            #     注意: HuggingFace Transformers 的 FP8 支持需要:
+            #       - transformers >= 4.38.0
+            #       - accelerate >= 0.26.0
+            #       - Ada Lovelace+ GPU (L40, L20, RTX 4090, H100)
+            #     推荐使用 vLLM/SGLang 引擎的 FP8 支持 (更成熟)
+            #   - "gptq": GPTQ 预量化模型
+            #   - "awq": AWQ 预量化模型
+            #
+            # 注意: 4bit/8bit 需要安装 bitsandbytes>=0.41.0
+            # 安装: pip install bitsandbytes>=0.41.0
+            #
+            # 显存参考 (以 LLaMA-3.1-8B 为例):
+            #   float16: ~16 GB
+            #   fp8:     ~8 GB
+            #   8bit:    ~8 GB
+            #   4bit:    ~5 GB
+            quantization: "none"
+            # 4-bit 量化详细配置 (仅 quantization="4bit" 时生效)
+            quantization_config:
+                bnb_4bit_quant_type: "nf4" # NF4 (推荐) | FP4
+                bnb_4bit_use_double_quant: true # 双重量化, 额外节省 ~0.4 bit/param
+                bnb_4bit_compute_dtype: "bfloat16" # 计算精度: bfloat16 (推荐) | float16
+
         vllm:
             enabled: true
-            model_name: "/opt/ai-demo/models/deepseek-r1-distill-qwen-7b"
+            model_name: "/opt/ai-demo/models/qwen3-14b-instruct"
             # ============ GPU Parallelism ============
             # tensor_parallel_size: 模型张量并行度
             #   - 1: 单 GPU (默认，适合显存充足的场景)
@@ -34,13 +86,14 @@ model:
             #   tensor_parallel_size: 2  (模型分布到两张 GPU)
             #   gpu_memory_utilization: 0.85  (留出余量给 K/V cache)
             #   max_model_len: 4096  (7B/8B 模型足够)
+            #   max_model_len: 8192  (14B 模型建议)
             #
             # 注意: 使用 tensor_parallel_size=2 时需要:
             #   1. 设置 CUDA_VISIBLE_DEVICES=0,1
             #   2. 确保两张 GPU 通过 NVLink/PCIe 互联
             #   3. vLLM 会自动处理模型分片和通信
             tensor_parallel_size: 1
-            max_model_len: 4096
+            max_model_len: 8192 # 14B 模型上下文窗口
             gpu_memory_utilization: 0.85
             trust_remote_code: true
 
@@ -55,6 +108,43 @@ model:
             #   - "auto": 自动选择 (等同于 prompt_prefix)
             injection_mode: "prompt_prefix"
 
+            # ============ 模型实现后端 (vLLM 0.16+) ============
+            # model_impl: vLLM 模型实现后端选择
+            #   - "auto" (默认): vLLM 自动选择最优实现 (原生 > transformers)
+            #   - "transformers": 强制使用 Transformers backend
+            #     适用于 vLLM 原生尚不支持的新架构模型, 例如:
+            #       - Qwen-3.5 (Qwen3_5ForConditionalGeneration)
+            #       - 其他 Transformers 已支持但 vLLM 尚未适配的架构
+            #     需要 transformers >= 5.2.0
+            #   注意: transformers backend 性能可能低于 vLLM 原生实现
+            #   待 vLLM 原生支持后, 改回 "auto" 即可获得最优性能
+            model_impl: "auto"
+
+            # ============ 量化配置 ============
+            # vLLM 支持的量化方式:
+            #   - "none": 不量化
+            #   - "gptq": GPTQ 预量化模型 (推荐, 速度最快)
+            #   - "awq": AWQ 预量化模型 (推荐, 精度较好)
+            #   - "fp8": FP8 (E4M3) 量化 (推荐, 显存节省 ~50%, 精度损失 < 1%)
+            #     需要 Ada Lovelace+ GPU (L40, L20, RTX 4090, H100 等)
+            #     支持预量化 FP8 模型 (如 neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8)
+            #     也支持在线 FP8 量化 (vLLM 自动将 FP16/BF16 权重转为 FP8)
+            #   - "4bit": bitsandbytes 4-bit 量化
+            #   - "8bit": bitsandbytes 8-bit 量化
+            #
+            # vLLM + GPTQ/AWQ/FP8 是生产环境的推荐组合:
+            #   - 速度快 (vLLM 原生支持量化 kernel)
+            #   - FP8 无需预量化模型, 可直接加载 FP16/BF16 模型
+            #   - GPTQ/AWQ 需要使用预量化模型 (如 TheBloke/Llama-2-7B-GPTQ)
+            quantization: "none"
+            quantization_config:
+                bnb_4bit_quant_type: "nf4"
+                bnb_4bit_use_double_quant: true
+                bnb_4bit_compute_dtype: "bfloat16"
+                # FP8 专属配置 (仅 quantization="fp8" 时生效)
+                fp8_kv_cache: false         # 是否对 KV Cache 也使用 FP8 (进一步节省显存, 可能影响长上下文质量)
+                fp8_compute_dtype: "bfloat16"  # FP8 计算精度 (bfloat16 推荐)
+
             # ============ v4.0: AGA 全局知识注入 (可选) ============
             # 启用后, AGA 会通过 register_forward_hook 在推理过程中
             # 根据 entropy gating 动态注入全局知识
@@ -63,6 +153,63 @@ model:
             aga_config:
                 bottleneck_dim: 64
                 num_slots: 100
+
+        # ============ SGLang Engine ============
+        # SGLang 高性能推理引擎, 原生支持 Qwen3.5 等新架构
+        #
+        # SGLang vs vLLM:
+        #   - RadixAttention: 基于基数树的 KV Cache 管理, 更高效的前缀复用
+        #   - 原生支持 Qwen3.5 架构, 无需 model_impl="transformers" 回退
+        #   - 更好的 structured generation 支持 (JSON, regex 等)
+        #
+        # 适用场景:
+        #   - Qwen3.5 等 vLLM 原生尚不支持的新架构
+        #   - 需要高效前缀复用的 DKI 偏好注入场景
+        #   - 需要 structured generation 的场景
+        #
+        # 安装: pip install sglang[all]
+        sglang:
+            enabled: true
+            model_name: "/opt/ai-demo/models/qwen3.5-27b-instruct"
+            tensor_parallel_size: 1
+            max_model_len: 8192
+            gpu_memory_utilization: 0.85
+            trust_remote_code: true
+            injection_mode: "prompt_prefix"
+
+            # ============ 量化配置 ============
+            # SGLang 支持的量化方式:
+            #   - "none": 不量化
+            #   - "gptq": GPTQ 预量化模型 (映射为 gptq_marlin)
+            #   - "awq": AWQ 预量化模型 (映射为 awq_marlin)
+            #   - "fp8": FP8 (E4M3) 量化 (需要 Ada Lovelace+ GPU)
+            #     SGLang 原生支持 FP8, 使用 bfloat16 计算精度
+            #     适用于 Qwen3.5-FP8 等预量化 FP8 模型
+            #     配合 triton backend 确保 Mamba/attention 兼容性
+            #   - "4bit": bitsandbytes 4-bit 量化
+            #   - "8bit": bitsandbytes 8-bit 量化
+            quantization: "none"
+            quantization_config:
+                bnb_4bit_quant_type: "nf4"
+                bnb_4bit_use_double_quant: true
+                bnb_4bit_compute_dtype: "bfloat16"
+                # FP8 专属配置 (仅 quantization="fp8" 时生效)
+                fp8_kv_cache: false         # 是否对 KV Cache 也使用 FP8
+                fp8_compute_dtype: "bfloat16"  # FP8 计算精度
+
+            # ============ SGLang 特有配置 ============
+            # mem_fraction_static: SGLang 静态内存比例
+            #   控制 SGLang 为 KV Cache 预分配的 GPU 显存比例
+            #   默认 0.80, 为 CUDA Graph 和临时计算留足空间
+            #   27B AWQ-int4 模型在 L20 (46GB) 上建议 0.78-0.82
+            mem_fraction_static: 0.80
+            # schedule_policy: 调度策略
+            #   - "lpm": Longest Prefix Match (推荐, 最大化 DKI 偏好前缀复用)
+            #   - "random": 随机调度
+            #   - "fcfs": 先来先服务
+            schedule_policy: "lpm"
+            # chunked_prefill_size: 分块预填充大小 (减少首 token 延迟)
+            chunked_prefill_size: 8192
 
 # ============ Embedding Settings ============
 embedding:
@@ -285,16 +432,28 @@ dki:
             vector_weight: 0.3 # w3: 向量相似度权重
             recency_weight: 0.2 # w4: 时间近度权重
 
-        # 动态 History 预算
+        # ============ v5.7: 重新设计的 Token 预算 ============
+        # 预算分配策略 (以 4096 上下文为例):
+        #   生成预留 = 30% 上下文 = 1228 tokens
+        #   标记开销 (instruction_reserve) = 120 tokens
+        #   偏好 (preference_max_tokens) = 100-200 tokens
+        #   当前输入 = 直接估算 (不预留, 高估 15%)
+        #   剩余 → 历史消息
         budget:
-            generation_reserve: 512 # 生成预留 tokens
-            instruction_reserve: 150 # 限定提示预留 tokens
+            generation_reserve: 512 # v5.7: 仅作为 fallback, 实际使用 30% 上下文
+            instruction_reserve: 120 # 标记开销 (chat template 特殊标记等)
+            preference_max_tokens: 200 # 偏好最大 token 数 (100-200)
             min_recent_turns: 2 # 至少补充的近期完整轮次
-            max_recent_turns: 5 # 最多补充的近期完整轮次
+            max_recent_turns: 5 # 最多补充的近期完整轮次 (外置配置)
+            generation_ratio: 0.30 # v5.7: 生成预留比例 (30% 上下文窗口)
+            cross_session_limit: 10 # v6.1: 跨会话最大召回消息数
 
-        # 逐消息 Summary 阈值
+        # ============ v5.7: 历史消息压缩策略 ============
+        # 逐消息阈值判断:
+        #   < per_message_threshold (默认 300) → 保留全文
+        #   >= per_message_threshold → summary + trace_id
         summary:
-            per_message_threshold: 200 # 单条消息超过此 token 数 → summary
+            per_message_threshold: 300 # v5.7: 调整为 300 tokens (可外置配置)
             max_tokens_per_summary: 150 # 每条 summary 最大 tokens
             strategy: "extractive" # extractive (jieba TextRank) | llm
 
@@ -413,6 +572,22 @@ redis:
 
     # Health check
     health_check_interval: 30 # Health check interval (seconds)
+
+# ============ Rate Limiting Settings (P1-2) ============
+# 用户级限流: 防止单个用户耗尽 GPU 推理资源
+rate_limit:
+    enabled: true
+    max_rpm: 30           # 每用户每分钟最大请求数
+    max_concurrent: 3     # 每用户最大并发请求数
+    burst_size: 5         # 突发容量
+
+# ============ Circuit Breaker Settings (P1-2) ============
+# 适配器熔断: 防止故障扩散
+circuit_breaker:
+    enabled: true
+    failure_threshold: 5  # 连续失败次数阈值
+    recovery_timeout: 30  # 熔断恢复超时 (秒)
+    half_open_max_calls: 1  # 半开状态最大探测请求数
 
 # ============ Non-Vectorized Data Handler Settings ============
 non_vectorized_handler:
@@ -553,6 +728,10 @@ experiment:
           path: "./data/persona_chat.json"
         - name: "hotpot_qa"
           path: "./data/hotpot_qa.json"
+        - name: "longmemeval_multi_turn"
+          path: "./data/longmemeval_multi_turn.json"
+        - name: "longmemeval_needle"
+          path: "./data/longmemeval_needle.json"
     metrics:
         - "memory_recall"
         - "hallucination_rate"
@@ -626,3 +805,10 @@ experiment:
               - text: "我在北京工作"
                 type: "general"
                 priority: 6
+
+        - username: "exp_user_longmem"
+          display_name: "LongMemEval Test User"
+          preferences:
+              - text: "I am a user participating in long-term memory evaluation"
+                type: "general"
+                priority: 5
