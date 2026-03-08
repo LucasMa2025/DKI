@@ -3,13 +3,16 @@
 # Requirements
 
 # ============ Core Dependencies ============
-torch>=2.0.0
-transformers>=4.36.0
+torch>=2.5.0
+transformers>=4.57.0
+huggingface-hub>=1.3.0   # Required by transformers ≥4.48; also fixes is_offline_mode removal
 accelerate>=0.25.0
 safetensors>=0.4.0
 
 # ============ Inference Engines ============
-vllm>=0.2.0
+vllm>=0.7.2
+# sglang[all]>=0.5.4  # SGLang: 原生支持 Qwen3.5 等新架构, RadixAttention 前缀复用
+sglang>=0.5.4
 # llama-cpp-python>=0.2.0  # Optional for llama.cpp
 
 # ============ FlashAttention (Performance Optimization) ============
@@ -19,7 +22,7 @@ vllm>=0.2.0
 #   - FA3 (full): H100/H200 (compute capability 9.0+)
 #   - FA2: A100/RTX 4090 (compute capability 8.0+)
 #   - Standard fallback: V100 and older
-flash-attn>=2.5.0  # FlashAttention-2/3
+# flash-attn>=2.4.2  # FlashAttention-2/3
 triton>=2.1.0      # Triton compiler (FA3 dependency)
 
 # ============ Embeddings & Vector Store ============
@@ -58,6 +61,8 @@ python-dotenv>=1.0.0
 
 # ============ Dynamic Vector Search ============
 # BM25 for hybrid search (BM25 + embedding reranking)
+# v7.0: BM25-only mode when no vector_index_config provided
+#        BM25 + Embedding when vector_index_config is configured
 rank-bm25>=0.2.2
 
 # ============ Chinese NLP (Recall v4) ============
