@@ -1,0 +1,13 @@
+    db: Dict[str, Any] = field(default_factory=lambda: {
+        "backend": "postgresql",
+        "pg_host": "localhost",
+        "pg_port": 5432,
+        "pg_database": "dkidemo",
+        "pg_username": "postgres",
+        "pg_password": "pg_2025",
+        "pgvector_enabled": True,
+        "embedding_dim": 768,
+        "pool_size": 10,
+        "max_overflow": 20,
+        "echo": False,
+    })
