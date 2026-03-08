@@ -65,7 +65,7 @@
         
         <el-table-column label="Messages" width="100" align="center">
           <template #default="{ row }">
-            <span class="message-count">{{ row.messageCount }}</span>
+            <span class="message-count">{{ row.messageCount || 0 }}</span>
           </template>
         </el-table-column>
         
@@ -214,7 +214,7 @@ const filteredSessions = computed(() => {
 })
 
 const totalMessages = computed(() => {
-  return sessions.value.reduce((sum, s) => sum + s.messageCount, 0)
+  return sessions.value.reduce((sum, s) => sum + (s.messageCount || 0), 0)
 })
 
 const todaySessions = computed(() => {

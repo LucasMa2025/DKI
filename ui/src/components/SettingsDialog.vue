@@ -67,6 +67,11 @@
               <el-switch v-model="settings.compactMode" />
               <span class="setting-hint">Reduce message spacing</span>
             </el-form-item>
+            
+            <el-form-item label="Streaming Mode">
+              <el-switch v-model="settings.streamingEnabled" />
+              <span class="setting-hint">Enable streaming generation (tokens appear progressively)</span>
+            </el-form-item>
           </el-form>
         </div>
       </el-tab-pane>
@@ -332,6 +337,7 @@ const settings = reactive({
   sendOnEnter: settingsStore.sendOnEnter,
   showTimestamps: settingsStore.showTimestamps,
   compactMode: settingsStore.compactMode,
+  streamingEnabled: settingsStore.streamingEnabled,
   
   // Model
   defaultModel: settingsStore.defaultModel,
@@ -359,6 +365,7 @@ watch(() => settingsStore.$state, () => {
   settings.sendOnEnter = settingsStore.sendOnEnter
   settings.showTimestamps = settingsStore.showTimestamps
   settings.compactMode = settingsStore.compactMode
+  settings.streamingEnabled = settingsStore.streamingEnabled
   settings.defaultModel = settingsStore.defaultModel
   settings.temperature = settingsStore.temperature
   settings.maxTokens = settingsStore.maxTokens
@@ -407,6 +414,7 @@ function handleSave() {
     sendOnEnter: settings.sendOnEnter,
     showTimestamps: settings.showTimestamps,
     compactMode: settings.compactMode,
+    streamingEnabled: settings.streamingEnabled,
   })
   
   settingsStore.updateModelSettings({

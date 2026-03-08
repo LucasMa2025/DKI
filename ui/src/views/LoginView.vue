@@ -67,7 +67,7 @@
             
             <div class="form-options">
               <el-checkbox v-model="form.remember">Remember me</el-checkbox>
-              <el-link type="primary" :underline="false">Forgot password?</el-link>
+              <el-link type="primary" :underline="false" @click="showForgotPassword = true">Forgot password?</el-link>
             </div>
             
             <el-form-item>
@@ -99,7 +99,7 @@
               show-icon
             >
               <template #default>
-                Use any username and password to log in (demo mode)
+                New users are auto-created on first login. Set a password in Profile to secure your account.
               </template>
             </el-alert>
           </div>
@@ -107,6 +107,57 @@
       </div>
     </div>
     
+    <!-- Forgot Password Dialog -->
+    <el-dialog
+      v-model="showForgotPassword"
+      title="Recover Password"
+      width="400px"
+      :close-on-click-modal="false"
+    >
+      <el-alert
+        type="info"
+        :closable="false"
+        show-icon
+        style="margin-bottom: 20px"
+      >
+        <template #default>
+          Enter the email address associated with your account and set a new password.
+        </template>
+      </el-alert>
+      <el-form
+        ref="forgotFormRef"
+        :model="forgotForm"
+        :rules="forgotRules"
+        label-position="top"
+      >
+        <el-form-item label="Email" prop="email">
+          <el-input v-model="forgotForm.email" placeholder="Enter your registered email" />
+        </el-form-item>
+        <el-form-item label="New Password" prop="newPassword">
+          <el-input
+            v-model="forgotForm.newPassword"
+            type="password"
+            placeholder="Enter new password"
+            show-password
+          />
+        </el-form-item>
+        <el-form-item label="Confirm Password" prop="confirmPassword">
+          <el-input
+            v-model="forgotForm.confirmPassword"
+            type="password"
+            placeholder="Re-enter new password"
+            show-password
+          />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="showForgotPassword = false">Cancel</el-button>
+        <el-button type="primary" :loading="forgotLoading" @click="handleForgotPassword">
+          Reset Password
+        </el-button>
+      </template>
+    </el-dialog>
+
     <!-- Register Dialog -->
     <el-dialog
       v-model="showRegister"
@@ -166,9 +217,12 @@ const authStore = useAuthStore()
 
 const formRef = ref<FormInstance>()
 const registerFormRef = ref<FormInstance>()
+const forgotFormRef = ref<FormInstance>()
 const loading = ref(false)
 const registerLoading = ref(false)
+const forgotLoading = ref(false)
 const showRegister = ref(false)
+const showForgotPassword = ref(false)
 
 const form = reactive({
   username: '',
@@ -180,6 +234,12 @@ const registerForm = reactive({
   username: '',
   email: '',
   password: '',
+  confirmPassword: '',
+})
+
+const forgotForm = reactive({
+  email: '',
+  newPassword: '',
   confirmPassword: '',
 })
 
@@ -221,6 +281,58 @@ const registerRules: FormRules = {
   ],
 }
 
+const forgotRules: FormRules = {
+  email: [
+    { required: true, message: 'Please enter email address', trigger: 'blur' },
+    { type: 'email', message: 'Please enter a valid email address', trigger: 'blur' },
+  ],
+  newPassword: [
+    { required: true, message: 'Please enter new password', trigger: 'blur' },
+    { min: 4, max: 128, message: 'Password must be 4-128 characters', trigger: 'blur' },
+  ],
+  confirmPassword: [
+    { required: true, message: 'Please confirm password', trigger: 'blur' },
+    {
+      validator: (_rule, value, callback) => {
+        if (value !== forgotForm.newPassword) {
+          callback(new Error('Passwords do not match'))
+        } else {
+          callback()
+        }
+      },
+      trigger: 'blur',
+    },
+  ],
+}
+
+async function handleForgotPassword() {
+  if (!forgotFormRef.value) return
+  
+  await forgotFormRef.value.validate(async (valid) => {
+    if (!valid) return
+    
+    forgotLoading.value = true
+    
+    try {
+      const { api } = await import('@/services/api')
+      const result = await api.auth.recoverPassword({
+        email: forgotForm.email,
+        new_password: forgotForm.newPassword,
+      })
+      
+      ElMessage.success(result.message || 'Password has been reset. Please sign in with your new password.')
+      showForgotPassword.value = false
+      forgotForm.email = ''
+      forgotForm.newPassword = ''
+      forgotForm.confirmPassword = ''
+    } catch (error) {
+      ElMessage.error(error instanceof Error ? error.message : 'Password recovery failed')
+    } finally {
+      forgotLoading.value = false
+    }
+  })
+}
+
 async function handleLogin() {
   if (!formRef.value) return
   
@@ -230,8 +342,6 @@ async function handleLogin() {
     loading.value = true
     
     try {
-      // Demo mode: accept any credentials
-      // In production, this would call the actual API
       const success = await authStore.login({
         username: form.username,
         password: form.password,
@@ -243,26 +353,10 @@ async function handleLogin() {
         const redirect = route.query.redirect as string || '/'
         router.push(redirect)
       } else {
-        // Demo mode fallback
-        authStore.user = {
-          id: `user-${Date.now()}`,
-          username: form.username,
-        }
-        authStore.token = `demo-token-${Date.now()}`
-        ElMessage.success('Login successful (demo mode)')
-        const redirect = route.query.redirect as string || '/'
-        router.push(redirect)
+        ElMessage.error('Login failed. Please check your credentials.')
       }
     } catch (error) {
-      // Demo mode fallback
-      authStore.user = {
-        id: `user-${Date.now()}`,
-        username: form.username,
-      }
-      authStore.token = `demo-token-${Date.now()}`
-      ElMessage.success('Login successful (demo mode)')
-      const redirect = route.query.redirect as string || '/'
-      router.push(redirect)
+      ElMessage.error(error instanceof Error ? error.message : 'Login failed')
     } finally {
       loading.value = false
     }
@@ -278,10 +372,18 @@ async function handleRegister() {
     registerLoading.value = true
     
     try {
-      // Demo mode: just close dialog and show success
+      const { api } = await import('@/services/api')
+      await api.auth.register({
+        username: registerForm.username,
+        password: registerForm.password,
+        email: registerForm.email || undefined,
+      })
+      
       ElMessage.success('Registration successful, please sign in')
       showRegister.value = false
       form.username = registerForm.username
+    } catch (error) {
+      ElMessage.error(error instanceof Error ? error.message : 'Registration failed')
     } finally {
       registerLoading.value = false
     }

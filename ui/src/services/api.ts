@@ -58,6 +58,19 @@ http.interceptors.response.use(
     }
 );
 
+// Helper: map backend snake_case SessionResponse to frontend camelCase Session
+function mapSessionResponse(raw: any): Session {
+    return {
+        id: raw.id,
+        title: raw.title || raw.id,
+        userId: raw.user_id || raw.userId,
+        messageCount: raw.message_count ?? raw.messageCount ?? 0,
+        createdAt: raw.created_at || raw.createdAt || "",
+        updatedAt: raw.updated_at || raw.updatedAt || "",
+        preview: raw.preview,
+    };
+}
+
 // API methods
 export const api = {
     // Auth - 使用 /api/auth 前缀
@@ -81,6 +94,28 @@ export const api = {
         }): Promise<User> {
             return http.post("/api/auth/register", data);
         },
+
+        async changePassword(data: {
+            old_password: string;
+            new_password: string;
+        }): Promise<{ message: string; success: boolean }> {
+            return http.put("/api/auth/password", data);
+        },
+
+        async recoverPassword(data: {
+            email: string;
+            new_password: string;
+        }): Promise<{ message: string; success: boolean }> {
+            return http.post("/api/auth/recover-password", data);
+        },
+
+        async updateProfile(data: {
+            display_name?: string;
+            email?: string;
+            avatar?: string;
+        }): Promise<User> {
+            return http.put("/api/auth/profile", data);
+        },
     },
 
     // Chat
@@ -89,11 +124,8 @@ export const api = {
     chat: {
         async send(request: ChatRequest): Promise<ChatResponse> {
             // 使用 DKI 插件 API: /v1/dki/chat
-            // 只传递:
-            // - query: 原始用户输入 (不含任何 prompt 构造)
-            // - user_id: 用户标识 (DKI 用于读取偏好和历史)
-            // - session_id: 会话标识 (DKI 用于读取会话历史)
-            const raw: any = await http.post("/v1/dki/chat", {
+            // 传递用户输入 + DKI 注入参数
+            const payload: Record<string, any> = {
                 // 原始用户输入，不拼接任何历史或 prompt
                 query: request.query,
                 // 用户标识 - DKI 用于读取偏好和历史
@@ -104,7 +136,15 @@ export const api = {
                 model: request.model,
                 temperature: request.temperature,
                 max_tokens: request.maxTokens,
-            });
+            };
+            // DKI 注入参数 (从 Settings 传递)
+            if (request.forceAlpha !== undefined && request.forceAlpha !== null) {
+                payload.force_alpha = request.forceAlpha;
+            }
+            if (request.useHybrid !== undefined) {
+                payload.use_hybrid = request.useHybrid;
+            }
+            const raw: any = await http.post("/v1/dki/chat", payload);
             
             // 后端返回 snake_case (DKIChatResponse)，前端期望 camelCase (ChatResponse)
             // 进行字段映射转换
@@ -133,6 +173,10 @@ export const api = {
                     cacheHit: dkiMeta.cache_hit ?? dkiMeta.cacheHit ?? false,
                     cacheTier: dkiMeta.cache_tier ?? dkiMeta.cacheTier ?? "none",
                     latencyMs: dkiMeta.latency_ms ?? dkiMeta.latencyMs ?? 0,
+                    // v8.2: DKIPlugin 新增字段
+                    retrievalMode: dkiMeta.retrieval_mode ?? dkiMeta.retrievalMode ?? "unknown",
+                    preferencesCount: dkiMeta.preferences_count ?? dkiMeta.preferencesCount ?? 0,
+                    relevantHistoryCount: dkiMeta.relevant_history_count ?? dkiMeta.relevantHistoryCount ?? 0,
                 } : undefined,
             } as ChatResponse;
         },
@@ -157,19 +201,23 @@ export const api = {
     // Sessions - 使用 /api/sessions 前缀
     sessions: {
         async list(): Promise<Session[]> {
-            return http.get("/api/sessions");
+            const raw: any[] = await http.get("/api/sessions");
+            return raw.map(mapSessionResponse);
         },
 
         async get(id: string): Promise<Session> {
-            return http.get(`/api/sessions/${id}`);
+            const raw: any = await http.get(`/api/sessions/${id}`);
+            return mapSessionResponse(raw);
         },
 
         async create(title: string): Promise<Session> {
-            return http.post("/api/sessions", { title });
+            const raw: any = await http.post("/api/sessions", { title });
+            return mapSessionResponse(raw);
         },
 
         async update(id: string, data: Partial<Session>): Promise<Session> {
-            return http.patch(`/api/sessions/${id}`, data);
+            const raw: any = await http.patch(`/api/sessions/${id}`, data);
+            return mapSessionResponse(raw);
         },
 
         async delete(id: string): Promise<void> {
@@ -177,7 +225,14 @@ export const api = {
         },
 
         async getMessages(sessionId: string): Promise<ChatMessage[]> {
-            return http.get(`/api/sessions/${sessionId}/messages`);
+            const raw: any[] = await http.get(`/api/sessions/${sessionId}/messages`);
+            return raw.map((m: any) => ({
+                id: m.id,
+                sessionId: m.session_id || m.sessionId || "",
+                role: m.role,
+                content: m.content,
+                timestamp: m.timestamp,
+            }));
         },
     },
 
@@ -271,25 +326,40 @@ export const api = {
     // Visualization
     // User isolation is handled server-side via Bearer token (auth interceptor)
     visualization: {
-        async getLatest(): Promise<any> {
+        async getLatest(sessionId?: string): Promise<any> {
+            if (sessionId) {
+                return http.get("/v1/dki/visualization/latest", {
+                    params: { session_id: sessionId },
+                });
+            }
             return http.get("/v1/dki/visualization/latest");
         },
 
         async getHistory(
             page: number = 1,
-            pageSize: number = 20
+            pageSize: number = 20,
+            sessionId?: string
         ): Promise<{
             items: any[];
             total: number;
             page: number;
             page_size: number;
         }> {
-            return http.get("/v1/dki/visualization/history", {
-                params: {
-                    page,
-                    page_size: pageSize,
-                },
-            });
+            const params: any = {
+                page,
+                page_size: pageSize,
+            };
+            if (sessionId) {
+                params.session_id = sessionId;
+            }
+            return http.get("/v1/dki/visualization/history", { params });
+        },
+
+        async getVizSessions(): Promise<{
+            sessions: Array<{ session_id: string; latest_timestamp: string }>;
+            total: number;
+        }> {
+            return http.get("/v1/dki/visualization/sessions");
         },
 
         async getDetail(requestId: string): Promise<any> {

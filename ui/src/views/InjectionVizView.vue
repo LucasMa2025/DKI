@@ -7,7 +7,34 @@
         <p>Detailed visualization analysis of DKI injection process</p>
       </div>
       <div class="header-actions">
-        <el-button :icon="Refresh" @click="refreshData" :loading="loading">
+        <el-select
+          v-model="selectedSessionId"
+          placeholder="Select Session..."
+          clearable
+          filterable
+          style="width: 280px"
+          @clear="onClearSession"
+          @change="onSessionChange"
+        >
+          <el-option-group label="Sessions with Visualization Data" v-if="vizSessionIds.size > 0">
+            <el-option
+              v-for="opt in sessionOptionsWithViz"
+              :key="opt.value"
+              :label="opt.label"
+              :value="opt.value"
+            />
+          </el-option-group>
+          <el-option-group label="Other Sessions" v-if="sessionOptionsWithoutViz.length > 0">
+            <el-option
+              v-for="opt in sessionOptionsWithoutViz"
+              :key="opt.value"
+              :label="opt.label + ' (no viz data)'"
+              :value="opt.value"
+              :disabled="false"
+            />
+          </el-option-group>
+        </el-select>
+        <el-button :icon="Refresh" @click="refreshData(selectedSessionId || undefined)" :loading="loading">
           Refresh
         </el-button>
       </div>
@@ -16,6 +43,15 @@
     <!-- Empty State Notice -->
     <div v-if="!hasRealData && !loading" class="empty-notice">
       <el-alert
+        v-if="selectedSessionId"
+        type="warning"
+        title="No Injection Data for This Session"
+        :description="`Session '${selectedSessionLabel}' has no visualization data yet. Please send a message in this session first, then return here to view the injection details.`"
+        show-icon
+        :closable="false"
+      />
+      <el-alert
+        v-else
         type="info"
         title="No Injection Data"
         description="Please send a message via the chat interface first. The system will automatically record each injection process. The flow diagram below shows the standard DKI injection flow."
@@ -954,10 +990,78 @@ import { CanvasRenderer } from 'echarts/renderers'
 import { PieChart as EchartsPieChart } from 'echarts/charts'
 import { TitleComponent, TooltipComponent, LegendComponent } from 'echarts/components'
 import { api } from '@/services/api'
+import { useChatStore } from '@/stores/chat'
 import dayjs from 'dayjs'
 
 // Register ECharts components
 use([CanvasRenderer, EchartsPieChart, TitleComponent, TooltipComponent, LegendComponent])
+
+// Chat store integration — track selected session
+const chatStore = useChatStore()
+const selectedSessionId = ref<string | null>(null)
+
+// v8.2: Track which sessions have visualization data available
+const vizSessionIds = ref<Set<string>>(new Set())
+
+const sessionOptionsWithViz = computed(() => {
+  return chatStore.sessions
+    .filter(s => vizSessionIds.value.has(s.id))
+    .map(s => ({
+      label: s.title || s.id,
+      value: s.id,
+    }))
+})
+
+const sessionOptionsWithoutViz = computed(() => {
+  return chatStore.sessions
+    .filter(s => !vizSessionIds.value.has(s.id))
+    .map(s => ({
+      label: s.title || s.id,
+      value: s.id,
+    }))
+})
+
+// v8.3: Human-readable label for the currently selected session
+const selectedSessionLabel = computed(() => {
+  if (!selectedSessionId.value) return ''
+  const s = chatStore.sessions.find(s => s.id === selectedSessionId.value)
+  return s?.title || selectedSessionId.value
+})
+
+// v8.3: Explicit handlers — avoid double-call from watch + @clear
+function onSessionChange(val: string | null) {
+  // Reset function call logs when session changes
+  functionCallLogs.value = []
+  fcStats.value = null
+  // val 是 el-select @change 事件传入的新值 (session ID 或 null)
+  // 当用户从下拉列表中选择一个会话时, val 是该会话的 ID
+  if (val) {
+    refreshData(val)
+  } else {
+    // val 为 null/空 — 清除选择, 加载全局最新
+    refreshData()
+  }
+}
+
+function onClearSession() {
+  // @clear 事件在用户点击清除按钮时触发
+  // 注意: el-select 的 @clear 会在 @change 之前触发
+  // 我们在这里显式设置 selectedSessionId 为 null, 然后加载全局数据
+  selectedSessionId.value = null
+  functionCallLogs.value = []
+  fcStats.value = null
+  refreshData()
+}
+
+async function loadVizSessions() {
+  try {
+    const res = await api.visualization.getVizSessions()
+    vizSessionIds.value = new Set(res.sessions.map((s: any) => s.session_id))
+  } catch {
+    // Ignore — fallback to showing all sessions without grouping
+    vizSessionIds.value = new Set()
+  }
+}
 
 // State
 const loading = ref(false)
@@ -1043,15 +1147,41 @@ const defaultFlowSteps = [
 ]
 
 // Methods
-async function refreshData() {
+async function refreshData(sessionId?: string) {
   loading.value = true
   try {
     // Try to fetch real data from backend
-    const [latestRes, historyRes] = await Promise.all([
-      api.visualization.getLatest().catch(() => null),
-      api.visualization.getHistory().catch(() => ({ items: [] })),
+    // Separate error handling: distinguish 404 (no data) from real errors
+    let latestRes: any = null
+    let latestError: string | null = null
+    let historyRes: any = { items: [] }
+
+    const results = await Promise.allSettled([
+      api.visualization.getLatest(sessionId),
+      api.visualization.getHistory(1, 20, sessionId),
     ])
-    
+
+    // Handle /latest result
+    if (results[0].status === 'fulfilled') {
+      latestRes = results[0].value
+    } else {
+      const errMsg = results[0].reason?.message || ''
+      // 404 means no data yet — not a real error
+      if (errMsg.includes('No injection history') || errMsg.includes('404')) {
+        latestError = null // expected: no data
+      } else {
+        latestError = errMsg
+        console.warn('[Visualization] Failed to fetch latest:', errMsg)
+      }
+    }
+
+    // Handle /history result
+    if (results[1].status === 'fulfilled') {
+      historyRes = results[1].value
+    } else {
+      console.warn('[Visualization] Failed to fetch history:', results[1].reason?.message)
+    }
+
     if (latestRes) {
       latestData.value = latestRes
       hasRealData.value = true
@@ -1059,10 +1189,17 @@ async function refreshData() {
       // No visualization data yet - show empty state instead of fake demo data
       latestData.value = null
       hasRealData.value = false
+      // Show hint for non-404 errors (actual backend issues)
+      if (latestError) {
+        ElMessage.warning(`Visualization data load failed: ${latestError}`)
+      }
     }
     
     // Only show real history items (no fake demo data)
     historyItems.value = historyRes.items || []
+    
+    // v8.2: Refresh viz session list so newly active sessions appear in the right group
+    loadVizSessions()
   } finally {
     loading.value = false
   }
@@ -1462,8 +1599,25 @@ const recallSignals = computed(() => {
 })
 
 // Lifecycle
-onMounted(() => {
-  refreshData()
+onMounted(async () => {
+  // Load sessions and viz session list in parallel
+  await Promise.all([
+    chatStore.loadSessions(),
+    loadVizSessions(),
+  ])
+
+  // v8.3 修正: 始终优先使用 chatStore.currentSessionId 作为初始选中会话
+  // 典型场景: 用户登录后在侧边栏选择了历史会话, 然后导航到 Visualization 页面
+  // 此时 chatStore.currentSessionId 已经被 MainLayout.selectSession() 设置
+  // 不应该因为 vizSessionIds 的检查而忽略它
+  const initSessionId = chatStore.currentSessionId
+  if (initSessionId) {
+    selectedSessionId.value = initSessionId
+    refreshData(initSessionId)
+  } else {
+    // 没有当前会话: 尝试加载全局最新 viz 数据
+    refreshData()
+  }
 })
 </script>
 

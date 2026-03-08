@@ -40,6 +40,11 @@ const routes: RouteRecordRaw[] = [
         name: 'Visualization',
         component: () => import('@/views/InjectionVizView.vue'),
       },
+      {
+        path: 'profile',
+        name: 'Profile',
+        component: () => import('@/views/ProfileView.vue'),
+      },
     ],
   },
   {

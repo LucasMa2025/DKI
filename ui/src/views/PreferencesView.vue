@@ -129,7 +129,14 @@
         label-position="top"
       >
         <el-form-item label="Preference Type" prop="preferenceType">
-          <el-select v-model="form.preferenceType" placeholder="Select type" style="width: 100%">
+          <el-select
+            v-model="form.preferenceType"
+            placeholder="Select or enter type"
+            filterable
+            allow-create
+            default-first-option
+            style="width: 100%"
+          >
             <el-option label="General" value="general" />
             <el-option label="Language Style" value="style" />
             <el-option label="Technical" value="technical" />
@@ -145,6 +152,8 @@
             placeholder="Select or enter category"
             filterable
             allow-create
+            default-first-option
+            clearable
             style="width: 100%"
           >
             <el-option

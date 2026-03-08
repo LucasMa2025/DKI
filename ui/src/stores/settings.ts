@@ -11,6 +11,7 @@ export const useSettingsStore = defineStore('settings', () => {
   const sendOnEnter = ref(true)
   const showTimestamps = ref(true)
   const compactMode = ref(false)
+  const streamingEnabled = ref(false)
   
   // Model settings
   const defaultModel = ref(config.defaults.model)
@@ -48,6 +49,7 @@ export const useSettingsStore = defineStore('settings', () => {
       sendOnEnter: sendOnEnter.value,
       showTimestamps: showTimestamps.value,
       compactMode: compactMode.value,
+      streamingEnabled: streamingEnabled.value,
     }
   }
   
@@ -85,6 +87,7 @@ export const useSettingsStore = defineStore('settings', () => {
     if (settings.sendOnEnter !== undefined) sendOnEnter.value = settings.sendOnEnter
     if (settings.showTimestamps !== undefined) showTimestamps.value = settings.showTimestamps
     if (settings.compactMode !== undefined) compactMode.value = settings.compactMode
+    if (settings.streamingEnabled !== undefined) streamingEnabled.value = settings.streamingEnabled
   }
   
   function updateModelSettings(settings: Partial<ModelSettings>) {
@@ -114,6 +117,7 @@ export const useSettingsStore = defineStore('settings', () => {
     sendOnEnter.value = true
     showTimestamps.value = true
     compactMode.value = false
+    streamingEnabled.value = false
     
     defaultModel.value = config.defaults.model
     temperature.value = config.defaults.temperature
@@ -138,6 +142,7 @@ export const useSettingsStore = defineStore('settings', () => {
     sendOnEnter,
     showTimestamps,
     compactMode,
+    streamingEnabled,
     
     // Model settings
     defaultModel,

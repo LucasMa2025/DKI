@@ -164,6 +164,9 @@ export const useChatStore = defineStore("chat", () => {
             temperature: settingsStore.temperature,
             maxTokens: settingsStore.maxTokens,
             stream: false,
+            // DKI 注入参数 (从 Settings 对话框读取)
+            forceAlpha: settingsStore.dkiEnabled ? settingsStore.dkiDefaultAlpha : 0,
+            useHybrid: settingsStore.dkiUseHybrid,
         };
 
         // Add placeholder for assistant message
@@ -274,5 +277,6 @@ export const useChatStore = defineStore("chat", () => {
         clearMessages,
         clearError,
         resetState,
+        generateSessionTitle,
     };
 });

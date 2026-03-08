@@ -85,6 +85,9 @@
           <el-button :icon="Setting" text />
           <template #dropdown>
             <el-dropdown-menu>
+              <el-dropdown-item command="profile">
+                <el-icon><User /></el-icon>Profile
+              </el-dropdown-item>
               <el-dropdown-item command="settings">
                 <el-icon><Setting /></el-icon>Settings
               </el-dropdown-item>
@@ -127,6 +130,7 @@ import {
   Edit,
   Delete,
   View,
+  User,
 } from '@element-plus/icons-vue'
 import { ElMessageBox, ElMessage } from 'element-plus'
 import { useAuthStore } from '@/stores/auth'
@@ -206,7 +210,9 @@ async function handleSessionCommand(command: string, sessionId: string) {
 }
 
 async function handleUserCommand(command: string) {
-  if (command === 'settings') {
+  if (command === 'profile') {
+    router.push('/profile')
+  } else if (command === 'settings') {
     showSettings.value = true
   } else if (command === 'theme') {
     settingsStore.theme = theme.value === 'light' ? 'dark' : 'light'

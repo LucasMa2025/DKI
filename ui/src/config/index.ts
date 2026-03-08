@@ -3,6 +3,12 @@ export const config = {
     // API settings
     // 注意: baseUrl 应该是后端服务器的根路径，不带 /api 后缀
     // 各 API 端点会自行添加正确的前缀 (/api/*, /v1/*)
+    //
+    // Demo App (独立上层应用) 默认端口 8080:
+    //   VITE_API_BASE_URL=http://localhost:8080
+    //
+    // 实验系统 (dki/web/app.py) 默认端口 8000:
+    //   VITE_API_BASE_URL=http://localhost:8000 (或留空使用同源)
     api: {
         baseUrl: import.meta.env.VITE_API_BASE_URL || "",
         timeout: 240000, // 240s — 14B think模型单 GPU 推理可能需要 40-180s+

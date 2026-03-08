@@ -37,8 +37,15 @@
         <el-tag v-if="settingsStore.dkiEnabled" type="success" size="small">
           DKI Enabled
         </el-tag>
+        <el-tag v-if="settingsStore.streamingEnabled" type="warning" size="small">
+          Stream
+        </el-tag>
       </div>
       <div class="header-right">
+        <!-- 对话锚点导航按钮 -->
+        <el-tooltip content="对话导航" v-if="userAnchors.length > 0">
+          <el-button :icon="List" text @click="showAnchorPanel = !showAnchorPanel" />
+        </el-tooltip>
         <el-tooltip content="DKI Debug Info" v-if="settingsStore.dkiDebugMode">
           <el-button :icon="InfoFilled" text @click="showDebugPanel = !showDebugPanel" />
         </el-tooltip>
@@ -49,7 +56,7 @@
     </header>
     
     <!-- Messages Area -->
-    <div class="messages-container" ref="messagesContainer">
+    <div class="messages-container" ref="messagesContainer" @scroll="handleScroll">
       <!-- Empty state -->
       <div v-if="messages.length === 0" class="empty-state">
         <img src="/logo.svg" alt="DKI" class="empty-logo" />
@@ -70,8 +77,9 @@
       <!-- Messages -->
       <div v-else class="messages-list">
         <div
-          v-for="message in messages"
+          v-for="(message, idx) in messages"
           :key="message.id"
+          :id="'msg-' + message.id"
           class="message-wrapper"
           :class="[`message-${message.role}`]"
         >
@@ -96,9 +104,12 @@
             
             <div
               class="message-body"
-              :class="{ loading: message.content === '' && chatStore.loading }"
+              :class="{
+                loading: message.content === '' && (chatStore.loading || chatStore.streaming),
+                streaming: chatStore.streaming && idx === messages.length - 1 && message.role === 'assistant',
+              }"
             >
-              <template v-if="message.content === '' && chatStore.loading">
+              <template v-if="message.content === '' && (chatStore.loading || chatStore.streaming)">
                 <div class="typing-indicator">
                   <span></span>
                   <span></span>
@@ -125,11 +136,48 @@
               </el-tag>
               <el-tag size="small">α={{ message.dkiMetadata.alpha?.toFixed(2) }}</el-tag>
               <el-tag size="small">{{ message.dkiMetadata.latencyMs }}ms</el-tag>
+              <el-tag v-if="message.dkiMetadata.retrievalMode && message.dkiMetadata.retrievalMode !== 'unknown'" size="small" type="warning">
+                {{ message.dkiMetadata.retrievalMode }}
+              </el-tag>
             </div>
           </div>
         </div>
       </div>
     </div>
+    
+    <!-- Scroll to Top / Bottom Buttons -->
+    <transition name="fade">
+      <div v-if="showScrollTop" class="scroll-btn scroll-top-btn" @click="scrollToTop">
+        <el-icon><ArrowUp /></el-icon>
+      </div>
+    </transition>
+    <transition name="fade">
+      <div v-if="showScrollBottom" class="scroll-btn scroll-bottom-btn" @click="scrollToBottom">
+        <el-icon><ArrowDown /></el-icon>
+      </div>
+    </transition>
+    
+    <!-- Anchor Navigation Panel (右侧浮层) -->
+    <transition name="slide-right">
+      <div v-if="showAnchorPanel && userAnchors.length > 0" class="anchor-panel">
+        <div class="anchor-panel-header">
+          <span>对话导航</span>
+          <el-icon class="anchor-close" @click="showAnchorPanel = false"><Close /></el-icon>
+        </div>
+        <div class="anchor-list">
+          <div
+            v-for="(anchor, idx) in userAnchors"
+            :key="anchor.id"
+            class="anchor-item"
+            :class="{ active: activeAnchorId === anchor.id }"
+            @click="scrollToAnchor(anchor.id)"
+          >
+            <span class="anchor-index">{{ idx + 1 }}</span>
+            <span class="anchor-text">{{ anchor.preview }}</span>
+          </div>
+        </div>
+      </div>
+    </transition>
     
     <!-- Input Area -->
     <div class="input-area">
@@ -138,15 +186,16 @@
           v-model="inputMessage"
           type="textarea"
           :rows="1"
-          :autosize="{ minRows: 1, maxRows: 6 }"
+          :autosize="{ minRows: 1, maxRows: 10 }"
           placeholder="Type a message... (Enter to send, Shift+Enter for new line)"
           resize="none"
+          class="chat-textarea"
           @keydown="handleKeydown"
         />
         <el-button
           type="primary"
           :icon="Promotion"
-          :loading="chatStore.loading"
+          :loading="chatStore.loading || chatStore.streaming"
           :disabled="!inputMessage.trim()"
           @click="handleSend"
         />
@@ -155,6 +204,7 @@
         <span class="input-hint">
           DKI {{ settingsStore.dkiEnabled ? 'Enabled' : 'Disabled' }} · 
           {{ settingsStore.dkiUseHybrid ? 'Hybrid Injection' : 'Standard Injection' }}
+          {{ settingsStore.streamingEnabled ? ' · Streaming' : '' }}
         </span>
       </div>
     </div>
@@ -175,6 +225,9 @@
           </el-descriptions-item>
           <el-descriptions-item label="Injection Mode">
             {{ settingsStore.dkiUseHybrid ? 'Hybrid Injection' : 'Standard Injection' }}
+          </el-descriptions-item>
+          <el-descriptions-item label="Streaming">
+            {{ settingsStore.streamingEnabled ? 'Enabled' : 'Disabled' }}
           </el-descriptions-item>
           <el-descriptions-item label="Default Alpha">
             {{ settingsStore.dkiDefaultAlpha }}
@@ -235,13 +288,15 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, nextTick, watch } from 'vue'
-import { Delete, Edit, InfoFilled, Promotion } from '@element-plus/icons-vue'
+import { ref, computed, nextTick, watch, onMounted, onUnmounted } from 'vue'
+import { Delete, Edit, InfoFilled, Promotion, ArrowUp, ArrowDown, List, Close } from '@element-plus/icons-vue'
 import { ElMessageBox, ElMessage } from 'element-plus'
 import { useChatStore } from '@/stores/chat'
 import { useAuthStore } from '@/stores/auth'
 import { useSettingsStore } from '@/stores/settings'
 import { renderMarkdown } from '@/utils/markdown'
+import { api } from '@/services/api'
+import type { ChatRequest } from '@/types'
 import dayjs from 'dayjs'
 
 const chatStore = useChatStore()
@@ -257,6 +312,17 @@ const editingTitle = ref(false)
 const editTitleValue = ref('')
 const titleInputRef = ref<any>(null)
 
+// 滚动按钮状态
+const showScrollTop = ref(false)
+const showScrollBottom = ref(false)
+
+// 锚点导航状态
+const showAnchorPanel = ref(false)
+const activeAnchorId = ref<string | null>(null)
+
+// 当前活跃的 EventSource (流式)
+let activeEventSource: EventSource | null = null
+
 const messages = computed(() => chatStore.messages)
 const currentSession = computed(() => chatStore.currentSession)
 
@@ -267,6 +333,18 @@ const lastDkiMetadata = computed(() => {
     }
   }
   return null
+})
+
+// 对话锚点: 提取所有用户消息的前 5-20 个字作为预览
+const userAnchors = computed(() => {
+  return messages.value
+    .filter(m => m.role === 'user' && m.content)
+    .map(m => {
+      const text = m.content.trim().replace(/\s+/g, ' ')
+      const maxLen = 20
+      const preview = text.length > maxLen ? text.slice(0, maxLen) + '...' : text
+      return { id: m.id, preview }
+    })
 })
 
 const quickPrompts = [
@@ -280,22 +358,220 @@ function formatTime(timestamp: string) {
   return dayjs(timestamp).format('HH:mm')
 }
 
+// ============ 滚动控制 ============
+function handleScroll() {
+  if (!messagesContainer.value) return
+  const el = messagesContainer.value
+  const scrollTop = el.scrollTop
+  const scrollHeight = el.scrollHeight
+  const clientHeight = el.clientHeight
+  
+  // 距离顶部超过 200px 时显示回到顶部按钮
+  showScrollTop.value = scrollTop > 200
+  // 距离底部超过 200px 时显示回到底部按钮
+  showScrollBottom.value = (scrollHeight - scrollTop - clientHeight) > 200
+}
+
+function scrollToTop() {
+  if (messagesContainer.value) {
+    messagesContainer.value.scrollTo({ top: 0, behavior: 'smooth' })
+  }
+}
+
 function scrollToBottom() {
   nextTick(() => {
     if (messagesContainer.value) {
-      messagesContainer.value.scrollTop = messagesContainer.value.scrollHeight
+      messagesContainer.value.scrollTo({
+        top: messagesContainer.value.scrollHeight,
+        behavior: 'smooth',
+      })
     }
   })
 }
 
+// ============ 锚点导航 ============
+function scrollToAnchor(messageId: string) {
+  const el = document.getElementById('msg-' + messageId)
+  if (el) {
+    el.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    activeAnchorId.value = messageId
+    // 高亮闪烁效果
+    el.classList.add('anchor-highlight')
+    setTimeout(() => el.classList.remove('anchor-highlight'), 1500)
+  }
+}
+
+// ============ 发送消息 (支持普通/流式切换) ============
 async function handleSend() {
-  if (!inputMessage.value.trim() || chatStore.loading) return
+  if (!inputMessage.value.trim() || chatStore.loading || chatStore.streaming) return
   
   const message = inputMessage.value
   inputMessage.value = ''
   
-  await chatStore.sendMessage(message)
+  if (settingsStore.streamingEnabled) {
+    await handleSendStream(message)
+  } else {
+    await chatStore.sendMessage(message)
+  }
   scrollToBottom()
+}
+
+// 流式发送
+async function handleSendStream(content: string) {
+  if (!content.trim()) return
+  
+  const isNewSession = !chatStore.currentSessionId
+  
+  // 确保有会话
+  if (!chatStore.currentSessionId) {
+    const session = await chatStore.createSession()
+    if (!session) return
+    chatStore.currentSessionId = session.id
+  }
+  
+  // 添加用户消息到本地
+  const userMessage = {
+    id: `temp-${Date.now()}`,
+    sessionId: chatStore.currentSessionId!,
+    role: 'user' as const,
+    content: content.trim(),
+    timestamp: new Date().toISOString(),
+  }
+  chatStore.messages.push(userMessage)
+  
+  // 添加助手占位消息
+  const assistantMessage = {
+    id: `temp-assistant-${Date.now()}`,
+    sessionId: chatStore.currentSessionId!,
+    role: 'assistant' as const,
+    content: '',
+    timestamp: new Date().toISOString(),
+  }
+  chatStore.messages.push(assistantMessage)
+  
+  chatStore.streaming = true
+  chatStore.loading = true
+  
+  try {
+    const request: ChatRequest = {
+      query: content.trim(),
+      dkiUserId: authStore.user?.id,
+      dkiSessionId: chatStore.currentSessionId!,
+      model: settingsStore.defaultModel,
+      temperature: settingsStore.temperature,
+      maxTokens: settingsStore.maxTokens,
+      stream: true,
+      forceAlpha: settingsStore.dkiEnabled ? settingsStore.dkiDefaultAlpha : 0,
+      useHybrid: settingsStore.dkiUseHybrid,
+    }
+    
+    // 使用 fetch + ReadableStream 处理 SSE (比 EventSource 更灵活, 支持 POST)
+    const authData = localStorage.getItem('auth')
+    let token = ''
+    if (authData) {
+      try { token = JSON.parse(authData).token || '' } catch { /* ignore */ }
+    }
+    
+    const baseUrl = settingsStore.apiBaseUrl || '/api'
+    const response = await fetch(`${baseUrl}/v1/dki/chat/stream`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { 'Authorization': `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify({
+        query: request.query,
+        user_id: request.dkiUserId,
+        session_id: request.dkiSessionId,
+        model: request.model,
+        temperature: request.temperature,
+        max_tokens: request.maxTokens,
+        force_alpha: request.forceAlpha,
+        use_hybrid: request.useHybrid,
+      }),
+    })
+    
+    if (!response.ok) {
+      throw new Error(`Stream request failed: ${response.status} ${response.statusText}`)
+    }
+    
+    const reader = response.body?.getReader()
+    if (!reader) throw new Error('No readable stream')
+    
+    const decoder = new TextDecoder()
+    let buffer = ''
+    chatStore.loading = false  // 停止 loading 动画, 开始流式显示
+    
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      
+      buffer += decoder.decode(value, { stream: true })
+      
+      // 解析 SSE 事件
+      const lines = buffer.split('\n')
+      buffer = lines.pop() || ''  // 保留不完整的行
+      
+      for (const line of lines) {
+        if (line.startsWith('event: ')) {
+          // 事件类型行, 下一行是 data
+          continue
+        }
+        if (line.startsWith('data: ')) {
+          const dataStr = line.slice(6)
+          try {
+            const data = JSON.parse(dataStr)
+            const lastMsg = chatStore.messages[chatStore.messages.length - 1]
+            
+            if (data.content !== undefined && lastMsg?.role === 'assistant') {
+              // token 事件
+              lastMsg.content += data.content
+              scrollToBottom()
+            } else if (data.text !== undefined) {
+              // done 事件
+              if (lastMsg?.role === 'assistant') {
+                lastMsg.content = data.text
+              }
+            } else if (data.error) {
+              // error 事件
+              if (lastMsg?.role === 'assistant') {
+                lastMsg.content = `❌ 流式生成错误: ${data.error}`
+              }
+            }
+          } catch {
+            // 忽略解析错误
+          }
+        }
+      }
+    }
+    
+    // 更新会话信息
+    const session = chatStore.sessions.find(s => s.id === chatStore.currentSessionId)
+    if (session) {
+      session.preview = content.slice(0, 50)
+      session.messageCount = chatStore.messages.length
+      session.updatedAt = new Date().toISOString()
+    }
+    
+    // 自动命名新会话
+    if (isNewSession && chatStore.currentSessionId) {
+      const autoTitle = chatStore.generateSessionTitle
+        ? (chatStore as any).generateSessionTitle(content)
+        : content.slice(0, 30)
+      chatStore.renameSession(chatStore.currentSessionId, autoTitle).catch(() => {})
+    }
+    
+  } catch (e) {
+    const errMsg = e instanceof Error ? e.message : 'Stream failed'
+    chatStore.error = errMsg
+    const lastMsg = chatStore.messages[chatStore.messages.length - 1]
+    if (lastMsg?.role === 'assistant' && !lastMsg.content) {
+      lastMsg.content = `❌ 流式请求失败: ${errMsg}`
+    }
+  } finally {
+    chatStore.streaming = false
+    chatStore.loading = false
+  }
 }
 
 function handleKeydown(e: KeyboardEvent) {
@@ -350,6 +626,14 @@ async function handleClearChat() {
   
   chatStore.clearMessages()
 }
+
+// 清理流式连接
+onUnmounted(() => {
+  if (activeEventSource) {
+    activeEventSource.close()
+    activeEventSource = null
+  }
+})
 
 // Auto scroll on new messages
 watch(
@@ -655,14 +939,27 @@ watch(
   gap: 12px;
   align-items: flex-end;
   
-  .el-input {
+  .chat-textarea {
     flex: 1;
     
     :deep(.el-textarea__inner) {
       border-radius: 12px;
       padding: 12px 16px;
       font-size: 14px;
+      line-height: 1.6;
       resize: none;
+      max-height: 240px;      /* 最大高度限制 ≈ 10 行 */
+      overflow-y: auto;
+      transition: height 0.15s ease;
+      scrollbar-width: thin;   /* Firefox 细滚动条 */
+      
+      &::-webkit-scrollbar {
+        width: 4px;
+      }
+      &::-webkit-scrollbar-thumb {
+        background-color: var(--border-color);
+        border-radius: 4px;
+      }
     }
   }
   
@@ -670,6 +967,7 @@ watch(
     height: 44px;
     width: 44px;
     border-radius: 12px;
+    flex-shrink: 0;
   }
 }
 
@@ -698,6 +996,188 @@ watch(
   .gating-info {
     margin-top: 16px;
   }
+}
+
+// ============ 滚动按钮 ============
+.scroll-btn {
+  position: fixed;
+  right: 40px;
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  background-color: var(--bg-surface);
+  border: 1px solid var(--border-color);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+  z-index: 100;
+  transition: all 0.2s ease;
+  
+  &:hover {
+    background-color: var(--primary-color);
+    color: white;
+    border-color: var(--primary-color);
+    transform: scale(1.1);
+  }
+  
+  .el-icon {
+    font-size: 18px;
+  }
+}
+
+.scroll-top-btn {
+  bottom: 160px;
+}
+
+.scroll-bottom-btn {
+  bottom: 110px;
+}
+
+// ============ 锚点导航面板 ============
+.anchor-panel {
+  position: fixed;
+  right: 16px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 220px;
+  max-height: 60vh;
+  background-color: var(--bg-surface);
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12);
+  z-index: 200;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.anchor-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border-color);
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+  
+  .anchor-close {
+    cursor: pointer;
+    color: var(--text-muted);
+    transition: color 0.2s;
+    
+    &:hover {
+      color: var(--text-primary);
+    }
+  }
+}
+
+.anchor-list {
+  overflow-y: auto;
+  padding: 8px 0;
+  scrollbar-width: thin;
+  
+  &::-webkit-scrollbar {
+    width: 4px;
+  }
+  &::-webkit-scrollbar-thumb {
+    background-color: var(--border-color);
+    border-radius: 4px;
+  }
+}
+
+.anchor-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  
+  &:hover {
+    background-color: var(--bg-hover);
+  }
+  
+  &.active {
+    background-color: rgba(var(--primary-color-rgb, 64, 158, 255), 0.1);
+    
+    .anchor-index {
+      background-color: var(--primary-color);
+      color: white;
+    }
+  }
+  
+  .anchor-index {
+    flex-shrink: 0;
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    background-color: var(--bg-hover);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-muted);
+  }
+  
+  .anchor-text {
+    font-size: 13px;
+    color: var(--text-secondary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+}
+
+// ============ 锚点高亮动画 ============
+.anchor-highlight {
+  animation: anchorFlash 1.5s ease;
+}
+
+@keyframes anchorFlash {
+  0%, 100% { background-color: transparent; }
+  25% { background-color: rgba(var(--primary-color-rgb, 64, 158, 255), 0.15); }
+  50% { background-color: transparent; }
+  75% { background-color: rgba(var(--primary-color-rgb, 64, 158, 255), 0.08); }
+}
+
+// ============ 流式消息光标 ============
+.message-body.streaming {
+  .markdown-content::after,
+  .plain-content::after {
+    content: '▌';
+    animation: blink 0.8s infinite;
+    color: var(--primary-color);
+    font-weight: bold;
+  }
+}
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+// ============ 过渡动画 ============
+.fade-enter-active,
+.fade-leave-active {
+  transition: opacity 0.3s ease;
+}
+.fade-enter-from,
+.fade-leave-to {
+  opacity: 0;
+}
+
+.slide-right-enter-active,
+.slide-right-leave-active {
+  transition: all 0.3s ease;
+}
+.slide-right-enter-from,
+.slide-right-leave-to {
+  opacity: 0;
+  transform: translateY(-50%) translateX(20px);
 }
 
 @keyframes slideUp {

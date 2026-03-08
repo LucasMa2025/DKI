@@ -4,6 +4,7 @@ export interface User {
   username: string
   email?: string
   avatar?: string
+  hasPassword?: boolean
   createdAt?: string
 }
 
@@ -39,6 +40,10 @@ export interface DKIMetadata {
   cacheTier?: string
   latencyMs: number
   gatingDecision?: GatingDecision
+  // v8.2: DKIPlugin 新增字段
+  retrievalMode?: string        // bm25_only | bm25_embedding | keyword | unknown
+  preferencesCount?: number     // 偏好数量
+  relevantHistoryCount?: number // 召回的相关历史消息数
 }
 
 export interface GatingDecision {
@@ -62,6 +67,9 @@ export interface ChatRequest {
   temperature?: number
   maxTokens?: number
   stream?: boolean
+  // DKI 注入参数 (从 Settings 读取)
+  forceAlpha?: number    // 覆盖默认 alpha 值 [0, 1]
+  useHybrid?: boolean    // 是否使用混合注入 (K/V + suffix)
 }
 
 export interface ChatResponse {
@@ -139,6 +147,7 @@ export interface AppSettings {
   sendOnEnter: boolean
   showTimestamps: boolean
   compactMode: boolean
+  streamingEnabled: boolean
 }
 
 export interface ModelSettings {
