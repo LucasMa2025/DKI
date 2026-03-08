@@ -165,17 +165,83 @@ Route = DKI  if Score_DKI > θ_dki
 
 DKI v4.0 uses **recall_v4** as the primary strategy with **stable** as the fallback:
 
-| Strategy                | Status        | Use Case          | Context Usage | Stability  |
-| ----------------------- | ------------- | ----------------- | ------------- | ---------- |
-| **recall_v4** (default) | ✅ Primary    | Long history      | Dynamic       | ⭐⭐⭐⭐⭐ |
-| **stable** (fallback)   | ✅ Fallback   | recall_v4 failure | Medium        | ⭐⭐⭐⭐⭐ |
-| **full_attention**      | ⚠️ Deprecated | Research only     | Minimal       | ⭐⭐⭐     |
+| Strategy                | Status        | Use Case               | Context Usage | Stability  |
+| ----------------------- | ------------- | ---------------------- | ------------- | ---------- |
+| **recall_v4** (default) | ✅ Primary    | Long history scenarios | Dynamic       | ⭐⭐⭐⭐⭐ |
+| **stable** (fallback)   | ✅ Fallback   | recall_v4 failure      | Medium        | ⭐⭐⭐⭐⭐ |
+| **full_attention**      | ⚠️ Deprecated | Research only          | Minimal       | ⭐⭐⭐     |
 
-**Fallback Mechanism**: When recall_v4 fails, the system automatically falls back to stable; if stable also fails, it degrades to plain LLM inference.
+**Fallback Mechanism**: When recall_v4 fails (e.g., components not initialized, recall errors), the system automatically falls back to the stable strategy using hybrid injection (preference K/V + history suffix prompt). If stable also fails, it degrades to plain LLM inference without injection.
+
+```yaml
+# config.yaml
+dki:
+    injection_strategy: "recall_v4" # recall_v4 (recommended) | stable (fallback)
+```
+
+### Hybrid Injection Strategy (Stable) — Fallback
+
+**Fallback strategy**, automatically activated when recall_v4 fails. Uses a **layered injection approach** that mirrors human cognition:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                  DKI Hybrid Injection Architecture (Stable)             │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │  Layer 1: User Preferences (K/V Injection - Attention Hook)     │    │
+│  │  ├── Content: Dietary, style, interests                         │    │
+│  │  ├── Position: Negative (conceptually "before" user input)      │    │
+│  │  ├── Mechanism: PyTorch Hook modifies Attention K/V             │    │
+│  │  ├── Influence: Implicit, background (like personality)         │    │
+│  │  └── α: 0.3-0.5 (lower, for subtle influence)                   │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                         │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │  Layer 2: Session History (Suffix Prompt)                       │    │
+│  │  ├── Content: Recent conversation turns                         │    │
+│  │  ├── Position: After user query (positive positions)            │    │
+│  │  ├── Mechanism: Standard token concatenation                    │    │
+│  │  ├── Influence: Explicit, citable (like memory)                 │    │
+│  │  └── Prompt: Trust-establishing guidance                        │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                         │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │  Layer 3: Current Query (Standard Input)                        │    │
+│  │  └── Primary focus of attention                                 │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Full Attention / Engram-Inspired Strategy (⚠️ Deprecated)
+
+> **Deprecation Notice**: The Full Attention strategy and Engram-Inspired Injection strategy have been deprecated. These strategies injected both preferences and history entirely via K/V to achieve near-zero context usage, but have **fundamental limitations with long history**:
+>
+> 1. **Limited K/V injection capacity**: As conversation history grows (tens to hundreds of turns), K/V token count increases dramatically, exceeding the effective attention range
+> 2. **No explicit referenceability**: History injected via K/V cannot be explicitly referenced or reasoned about by the model
+> 3. **OOD risk**: Massive K/V injection at negative positions causes severe distribution shift from training
+> 4. **Poor factual accuracy**: The model cannot extract specific facts (dates, prices, etc.) from K/V-injected history
+>
+> **Replacement**: Use **Recall v4 Memory Recall Strategy** (see below), which provides stable and reliable memory recall for long history scenarios through multi-signal retrieval + dynamic summarization + application-layer fact supplementation.
 
 ### Recall v4 Memory Recall Strategy (Recommended)
 
-**Production-recommended strategy**. Simulates human memory recall through multi-signal retrieval, dynamic history construction, and application-layer fact supplementation.
+**Production-recommended strategy**. Simulates human memory recall through multi-signal retrieval, dynamic history construction, and application-layer fact supplementation, providing stable and reliable memory capabilities for long history scenarios. Core implementation in `dki/core/recall/`.
+
+> **⚠️ Important Distinction: DKI Recall v4 Summary ≠ Rolling Summary**
+>
+> DKI's summary mechanism is fundamentally different from the Rolling Summary used by ChatGPT/Claude/Grok and other AI systems:
+>
+> | Dimension            | DKI Recall v4 Summary                                              | Rolling Summary (ChatGPT/Claude/Grok)           |
+> | -------------------- | ------------------------------------------------------------------ | ----------------------------------------------- |
+> | **Trigger**          | On-demand, only when recalled message exceeds threshold            | Continuous, runs after every N turns            |
+> | **Scope**            | Per-message granularity, only summarizes individual long messages  | Global, compresses entire conversation          |
+> | **Traceability**     | Each summary carries `trace_id` → can retrieve original message    | Original messages are discarded                 |
+> | **Strategy**         | Extractive (jieba TextRank) by default, no LLM call needed         | Requires LLM call for abstractive summary       |
+> | **Information Loss** | Minimal — original messages preserved, summary is just a "pointer" | Significant — original context permanently lost |
+> | **Fact Recovery**    | `retrieve_fact` call can fetch original message chunks on demand   | Cannot recover lost details                     |
+> | **Purpose**          | Fit context budget while preserving recall capability              | Compress to fit context window                  |
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -203,8 +269,73 @@ DKI v4.0 uses **recall_v4** as the primary strategy with **stable** as the fallb
 │  │  → Fact supplementation (chunked offset+limit) → Continue       │    │
 │  └─────────────────────────────────────────────────────────────────┘    │
 │                                                                         │
+│  Advantages:                                                            │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │  ✅ Stable and reliable for long history                        │    │
+│  │  ✅ Facts are traceable (trace_id → original message)           │    │
+│  │  ✅ Dynamic context budget management                           │    │
+│  │  ✅ Multi-model support (DeepSeek, GLM, Generic)                │    │
+│  │  ✅ Preferences still via K/V injection (reuses existing infra) │    │
+│  │  ✅ Summary is extractive by default (no extra LLM call)        │    │
+│  │  ✅ retrieve_fact enables on-demand detail recovery             │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
+
+**Configuration Example**:
+
+```yaml
+dki:
+    injection_strategy: "recall_v4"
+
+    recall:
+        enabled: true
+        strategy: "summary_with_fact_call"
+
+        signals:
+            keyword_enabled: true
+            keyword_topk: 5
+            keyword_method: "tfidf"
+            vector_enabled: true
+            vector_top_k: 10
+
+        budget:
+            generation_reserve: 512
+            min_recent_turns: 2
+            max_recent_turns: 5
+
+        summary:
+            per_message_threshold: 200
+            strategy: "extractive" # extractive (jieba TextRank) | llm
+
+        fact_call:
+            enabled: true
+            max_rounds: 3
+            max_fact_tokens: 800
+```
+
+**Fallback Mechanism**:
+
+```
+recall_v4 execution fails
+    ↓ automatic fallback
+stable (hybrid injection: preference K/V + history suffix)
+    ↓ if also fails
+plain LLM inference (no injection)
+```
+
+#### Why Rolling Summary Is Not Needed
+
+Unlike ChatGPT/Claude/Grok, DKI **does not need** Rolling Summary:
+
+| Approach           | Reason                                  | DKI Alternative                            |
+| ------------------ | --------------------------------------- | ------------------------------------------ |
+| RAG+Prompt         | Context window limit, needs compression | K/V injection doesn't consume context      |
+| Rolling Summary    | Information loss from compression       | Memory Trigger for precise recall          |
+| Summary Generation | Extra LLM call overhead                 | Reference Resolver for on-demand retrieval |
+
+**Key insight**: DKI's Recall v4 summary is a **per-message, on-demand, traceable** operation — not a global, continuous, lossy compression. The original messages are always preserved and can be retrieved via `retrieve_fact` when the model needs specific details. This is fundamentally different from Rolling Summary which permanently discards original context.
 
 ## 🚀 Quick Start
 
