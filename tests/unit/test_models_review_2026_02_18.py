@@ -156,7 +156,10 @@ class TestForwardKVInjectionCleanup:
         import importlib
         mod = importlib.import_module(adapter_module)
         cls = getattr(mod, adapter_class)
+        # 检查 forward_with_kv_injection 本身或其委托的实现方法
         source = inspect.getsource(cls.forward_with_kv_injection)
+        if hasattr(cls, '_forward_with_kv_injection_impl'):
+            source += inspect.getsource(cls._forward_with_kv_injection_impl)
         
         assert "empty_cache()" in source, (
             f"{adapter_class}.forward_with_kv_injection should call "
@@ -182,7 +185,10 @@ class TestForwardKVInjectionCleanup:
         import importlib
         mod = importlib.import_module(adapter_module)
         cls = getattr(mod, adapter_class)
+        # 检查 forward_with_kv_injection 本身或其委托的实现方法
         source = inspect.getsource(cls.forward_with_kv_injection)
+        if hasattr(cls, '_forward_with_kv_injection_impl'):
+            source += inspect.getsource(cls._forward_with_kv_injection_impl)
         
         assert "del " in source, (
             f"{adapter_class}.forward_with_kv_injection should delete "

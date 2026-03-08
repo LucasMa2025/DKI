@@ -110,7 +110,7 @@ class TestSuffixBuilder:
     # ============ 短消息测试 (全部保留原文) ============
 
     def test_build_short_messages(self, builder, short_messages):
-        """短消息应全部保留为原文"""
+        """短消息应全部保留为原文, trace_ids 不包含原文消息"""
         result = builder.build(
             query="你好",
             recalled_messages=short_messages,
@@ -119,7 +119,8 @@ class TestSuffixBuilder:
         assert result.message_count == 3
         assert result.summary_count == 0
         assert result.has_fact_call_instruction is False
-        assert "msg-001" in result.trace_ids
+        # v6.1: trace_ids 只收集 summary 类型, 原文消息不需要 retrieve_fact
+        assert result.trace_ids == []
 
     # ============ 长消息测试 (v6.0: 全局预算分配) ============
 
@@ -135,7 +136,8 @@ class TestSuffixBuilder:
         assert result.message_count == 1
         assert result.summary_count == 0
         assert result.has_fact_call_instruction is False
-        assert "msg-long" in result.trace_ids
+        # v6.1: 原文消息不出现在 trace_ids 中
+        assert result.trace_ids == []
 
     def test_build_long_message_generates_summary(self, builder, long_message):
         """v6.0: 长消息在预算不足时应生成 summary"""
@@ -152,6 +154,7 @@ class TestSuffixBuilder:
         )
         assert result.summary_count >= 1
         assert result.has_fact_call_instruction is True
+        # v6.1: trace_ids 只包含 summary 类型的 trace_id
         assert "msg-long" in result.trace_ids
 
     def test_summary_item_has_epistemic_markers(self, builder, long_message):
@@ -366,3 +369,227 @@ class TestSuffixBuilderExtractSummarize:
         text = "这是第一句话。这是第二句话。这是第三句话。这是第四句话。这是第五句话。"
         summary = builder._summarize(text)
         assert len(summary) > 0
+
+
+# ============================================================
+# v6.1: trace_ids 只收集 summary + LLM summary 验证
+# ============================================================
+
+class TestTraceIdsOnlySummary:
+    """v6.1: 验证 trace_ids 只收集 summary 类型条目的 trace_id"""
+
+    @pytest.fixture
+    def config(self):
+        return RecallConfig.from_dict({
+            "summary": {
+                "per_message_threshold": 50,
+                "max_tokens_per_summary": 30,
+                "strategy": "extractive",
+            },
+            "budget": {
+                "generation_reserve": 100,
+                "instruction_reserve": 50,
+            },
+        })
+
+    @pytest.fixture
+    def formatter(self):
+        return GenericFormatter(language="cn")
+
+    @pytest.fixture
+    def builder(self, config, formatter):
+        return SuffixBuilder(config=config, prompt_formatter=formatter)
+
+    def test_all_messages_no_trace_ids(self, builder):
+        """全部为原文消息时, trace_ids 应为空列表"""
+        messages = [
+            FakeMessage(id=f"msg-{i}", content=f"短消息{i}", role="user")
+            for i in range(5)
+        ]
+        result = builder.build(
+            query="你好",
+            recalled_messages=messages,
+            context_window=4096,
+        )
+        assert result.summary_count == 0
+        assert result.trace_ids == []
+        assert result.has_fact_call_instruction is False
+
+    def test_mixed_only_summary_trace_ids(self, builder):
+        """混合消息时, trace_ids 只包含 summary 的 trace_id"""
+        short_msg = FakeMessage(id="msg-short", content="短消息", role="user")
+        long_msg = FakeMessage(
+            id="msg-long-001",
+            content="这是一条非常长的消息。" * 20,
+            role="assistant",
+        )
+        result = builder.build(
+            query="你好",
+            recalled_messages=[short_msg, long_msg],
+            context_window=400,  # 小窗口迫使长消息压缩
+        )
+        # 短消息保留原文, 长消息被压缩为 summary
+        if result.summary_count > 0:
+            # trace_ids 只包含 summary 的 ID, 不包含原文的 ID
+            assert "msg-short" not in result.trace_ids
+            assert "msg-long-001" in result.trace_ids
+
+    def test_multiple_summaries_multiple_trace_ids(self, builder):
+        """多条 summary 时, 每条 summary 对应一个 trace_id"""
+        long_msgs = [
+            FakeMessage(
+                id=f"msg-long-{i}",
+                content=f"这是第{i}条非常长的消息。" * 20,
+                role="user" if i % 2 == 0 else "assistant",
+            )
+            for i in range(3)
+        ]
+        result = builder.build(
+            query="你好",
+            recalled_messages=long_msgs,
+            context_window=400,  # 小窗口
+        )
+        # 所有 trace_ids 都应来自 summary 类型的 items
+        summary_ids = {i.trace_id for i in result.items if i.type == "summary"}
+        assert set(result.trace_ids) == summary_ids
+
+    def test_constraint_instruction_only_has_summary_trace_ids(self, builder):
+        """[可信+推理限定] 块只包含 summary 的 trace_id, 不包含原文消息的"""
+        short_msg = FakeMessage(id="msg-short", content="你好", role="user")
+        long_msg = FakeMessage(
+            id="msg-long-for-constraint",
+            content="这是一条非常长的消息。" * 20,
+            role="assistant",
+        )
+        result = builder.build(
+            query="你好",
+            recalled_messages=[short_msg, long_msg],
+            context_window=400,
+        )
+        if result.summary_count > 0:
+            # 后缀文本中的 [可信+推理限定] 块不应包含 msg-short
+            assert "msg-short" not in result.text or "msg-short" in result.text.split("[可信+推理限定]")[0]
+            # 但应包含 summary 的 trace_id
+            assert "msg-long-for-constraint" in result.text
+
+
+class TestLLMSummarizeValidation:
+    """v6.1: 验证 _llm_summarize 输出验证逻辑"""
+
+    def test_invalid_summary_empty(self):
+        """空输出应被判定为无效"""
+        assert SuffixBuilder._is_summary_invalid("", "原文") is True
+
+    def test_invalid_summary_too_short(self):
+        """太短的输出应被判定为无效"""
+        assert SuffixBuilder._is_summary_invalid("abc", "原文") is True
+
+    def test_invalid_summary_only_role_label(self):
+        """只包含角色标签的输出应被判定为无效"""
+        assert SuffixBuilder._is_summary_invalid("assistant", "原文") is True
+        assert SuffixBuilder._is_summary_invalid("assistant.", "原文") is True
+        assert SuffixBuilder._is_summary_invalid("assistant。", "原文") is True
+        assert SuffixBuilder._is_summary_invalid("user", "原文") is True
+        assert SuffixBuilder._is_summary_invalid("助手", "原文") is True
+        assert SuffixBuilder._is_summary_invalid("用户", "原文") is True
+
+    def test_invalid_summary_with_template_markers(self):
+        """包含 chat template 标记的输出应被判定为无效"""
+        assert SuffixBuilder._is_summary_invalid(
+            "<|im_start|>assistant\n摘要内容", "原文"
+        ) is True
+        assert SuffixBuilder._is_summary_invalid(
+            "<|begin_of_text|>摘要内容", "原文"
+        ) is True
+        assert SuffixBuilder._is_summary_invalid(
+            "<|start_header_id|>assistant<|end_header_id|>摘要内容", "原文"
+        ) is True
+
+    def test_valid_summary(self):
+        """正常的摘要应被判定为有效"""
+        assert SuffixBuilder._is_summary_invalid(
+            "用户提到了ERP系统的选择，讨论了金蝶和SAP的产品对比", "原文"
+        ) is False
+
+    def test_valid_summary_short_but_meaningful(self):
+        """短但有意义的摘要应有效"""
+        assert SuffixBuilder._is_summary_invalid(
+            "讨论了ERP产品的价格和功能对比", "原文"
+        ) is False
+
+    def test_llm_summarize_with_chat_template(self):
+        """_llm_summarize 应使用 chat template 格式"""
+        config = RecallConfig.from_dict({
+            "summary": {"strategy": "llm", "max_tokens_per_summary": 100},
+        })
+        formatter = GenericFormatter(language="cn")
+        
+        # Mock model adapter with tokenizer
+        mock_adapter = MagicMock()
+        mock_tokenizer = MagicMock()
+        mock_adapter.tokenizer = mock_tokenizer
+        
+        # 模拟 apply_chat_template 成功
+        mock_tokenizer.apply_chat_template.return_value = (
+            "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n"
+            "你是一个摘要助手...\n"
+            "<|start_header_id|>user<|end_header_id|>\n"
+            "请将以下对话内容压缩为摘要...\n"
+            "<|start_header_id|>assistant<|end_header_id|>\n"
+        )
+        
+        # 模拟 generate 返回有效摘要
+        mock_output = MagicMock()
+        mock_output.text = "用户讨论了ERP系统的选择方案"
+        mock_adapter.generate.return_value = mock_output
+        
+        builder = SuffixBuilder(
+            config=config,
+            prompt_formatter=formatter,
+            model_adapter=mock_adapter,
+        )
+        
+        result = builder._llm_summarize("很长的对话内容...", max_tokens=100)
+        
+        # 验证使用了 apply_chat_template
+        mock_tokenizer.apply_chat_template.assert_called_once()
+        call_args = mock_tokenizer.apply_chat_template.call_args
+        messages = call_args[0][0] if call_args[0] else call_args[1].get('conversation', call_args[1].get('messages'))
+        # 验证 messages 格式: system + user
+        assert len(messages) == 2
+        assert messages[0]["role"] == "system"
+        assert messages[1]["role"] == "user"
+        
+        assert result == "用户讨论了ERP系统的选择方案"
+
+    def test_llm_summarize_invalid_output_fallback(self):
+        """LLM 输出无效时应回退到抽取式摘要"""
+        config = RecallConfig.from_dict({
+            "summary": {"strategy": "llm", "max_tokens_per_summary": 100},
+        })
+        formatter = GenericFormatter(language="cn")
+        
+        mock_adapter = MagicMock()
+        mock_tokenizer = MagicMock()
+        mock_adapter.tokenizer = mock_tokenizer
+        mock_tokenizer.apply_chat_template.return_value = "formatted prompt"
+        # 模拟 encode 返回合理的 token 列表 (用于 _count_tokens)
+        mock_tokenizer.encode.side_effect = lambda text: list(range(len(text)))
+        
+        # 模拟 generate 返回无效输出 (llama3.1-8b 的典型问题)
+        mock_output = MagicMock()
+        mock_output.text = "assistant。assistant。assistant。assistant。assistant"
+        mock_adapter.generate.return_value = mock_output
+        
+        builder = SuffixBuilder(
+            config=config,
+            prompt_formatter=formatter,
+            model_adapter=mock_adapter,
+        )
+        
+        long_text = "这是第一句话。这是第二句话。这是第三句话。这是第四句话。这是第五句话。"
+        result = builder._llm_summarize(long_text, max_tokens=100)
+        
+        # 应回退到抽取式摘要, 而不是返回 "assistant..."
+        assert "assistant" not in result.lower()
+        assert len(result) > 0
