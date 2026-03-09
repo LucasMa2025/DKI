@@ -146,6 +146,32 @@ async def create_plugin(
         )
         logger.info(f"Model adapter auto-created: {model_adapter.model_name}")
     
+    # ============ Step 2.5: 闭源模型自动路由 ============
+    # 闭源模型无法进行 K/V 注入, 自动启用 dynamic_router 并强制 RAG 路由
+    _is_closed_source = getattr(model_adapter, "is_closed_source", False)
+    if _is_closed_source:
+        logger.info(
+            "[closed_source] Closed-source model detected, "
+            "auto-enabling dynamic router with forced RAG route"
+        )
+        # 如果用户未显式配置 dynamic_router, 自动启用
+        if not dynamic_router:
+            dynamic_router = True
+        # 如果未提供 rag_system, 自动创建一个使用闭源适配器的 RAG 系统
+        if rag_system is None:
+            try:
+                from dki.core.rag_system import RAGSystem
+                rag_system = RAGSystem(model_adapter=model_adapter)
+                logger.info(
+                    "[closed_source] Auto-created RAGSystem with "
+                    f"closed-source adapter: {model_adapter.model_name}"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[closed_source] Failed to auto-create RAGSystem: {e}. "
+                    f"You may need to provide rag_system manually."
+                )
+    
     # ============ Step 3: 处理 Redis 配置 ============
     redis_config_dict = None
     if redis_url:

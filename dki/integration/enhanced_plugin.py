@@ -436,6 +436,14 @@ class EnhancedDKIPlugin:
         if force_mode:
             return force_mode
         
+        # ============ 闭源模型强制 RAG ============
+        # 闭源模型无法进行 K/V 注入, 必须走 RAG 路由 (prompt 拼接)
+        if self._is_closed_source_model():
+            logger.debug(
+                "[Router] Closed-source model detected, forcing RAG route"
+            )
+            return "rag"
+        
         # 路由器未启用 → 默认 DKI
         if not self._config.dynamic_router.enabled or not self._router:
             return "dki"
@@ -476,6 +484,27 @@ class EnhancedDKIPlugin:
             logger.warning(f"Router decision failed, defaulting to DKI: {e}")
             return "dki"
     
+    def _is_closed_source_model(self) -> bool:
+        """
+        检测当前模型是否为闭源模型
+
+        检测逻辑 (优先级从高到低):
+        1. 模型适配器自身标记 (is_closed_source=True)
+        2. ModelFactory.is_closed_source_engine() (基于 config)
+        """
+        try:
+            model = self._dki_plugin.model
+            if getattr(model, "is_closed_source", False):
+                return True
+        except Exception:
+            pass
+        try:
+            from dki.models.factory import ModelFactory
+            return ModelFactory.is_closed_source_engine()
+        except Exception:
+            pass
+        return False
+
     async def _execute_rag(
         self,
         query: str,
