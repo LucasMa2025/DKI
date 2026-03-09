@@ -33,7 +33,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple, Union
-from datetime import datetime
+from datetime import datetime, timezone
 
 from loguru import logger
 
@@ -52,6 +52,7 @@ from dki.core.exceptions import (
 
 from dki.core.text_utils import (
     strip_think_content,
+    estimate_tokens_fast,
     detect_vague_reference,
     build_clarification_instruction,
 )
@@ -153,7 +154,7 @@ class InjectionMetadata:
     safety_violations: Optional[List[str]] = None
     
     # 时间戳
-    timestamp: datetime = field(default_factory=datetime.utcnow)
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     request_id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
     
     def to_dict(self) -> Dict[str, Any]:
@@ -407,10 +408,13 @@ class DKIPlugin:
             config=self._cache_config,
         )
         
-        # ============ P1-3: 偏好文本缓存 (5 分钟 TTL) ============
+        # ============ P1-3: 偏好文本缓存 (5 分钟 TTL, 有界 LRU) ============
         # 偏好是低频变更数据，但每次 chat 都查 DB → P95 延迟来源
         # KV (衍生物) 有三级缓存，偏好文本 (源数据) 也应有缓存
-        self._preference_text_cache: Dict[str, Tuple[List, float]] = {}
+        # 修复: 使用 OrderedDict 实现有界 LRU, 防止内存无限增长
+        from collections import OrderedDict
+        self._preference_text_cache: OrderedDict = OrderedDict()
+        self._preference_text_cache_maxsize: int = 1000
         self._preference_cache_ttl: float = 300.0  # 5 分钟 TTL (秒)
         
         # P0-4: AsyncSingleFlight 防止偏好缓存 thundering herd
@@ -633,22 +637,31 @@ class DKIPlugin:
         """
         now = time.time()
         
-        # 1. 检查 TTL 缓存
+        # 1. 检查 TTL 缓存 (有界 LRU)
         if user_id in self._preference_text_cache:
             cached_prefs, cached_at = self._preference_text_cache[user_id]
             if now - cached_at < self._preference_cache_ttl:
+                # 命中: 移到末尾 (LRU)
+                self._preference_text_cache.move_to_end(user_id)
                 logger.debug(f"Preference text cache hit for user {user_id}")
                 return cached_prefs
+            else:
+                # 已过期, 移除
+                self._preference_text_cache.pop(user_id, None)
         
-        # 2. P0-4: Single-flight — 合并并发请求
+        # 2. P0-4: Single-flight — 合并并发请求 (shield 保护 + 异常降级)
         flight_key = f"pref:{user_id}"
         if flight_key in self._preference_single_flight:
             # 已有 in-flight 请求, 等待其结果
             logger.debug(f"Preference single-flight join for user {user_id}")
-            return await self._preference_single_flight[flight_key]
+            try:
+                return await asyncio.shield(self._preference_single_flight[flight_key])
+            except Exception:
+                # 降级: 主请求异常时, 等待方返回空列表而不是向上传播
+                return []
         
         # 创建 future, 标记 in-flight
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         future: asyncio.Future = loop.create_future()
         self._preference_single_flight[flight_key] = future
         
@@ -656,6 +669,10 @@ class DKIPlugin:
             # 缓存未命中，查询 DB
             preferences = await self.data_adapter.get_user_preferences(user_id)
             self._preference_text_cache[user_id] = (preferences, time.time())
+            self._preference_text_cache.move_to_end(user_id)
+            # 有界淘汰: 超过上限时移除最久未使用的条目
+            while len(self._preference_text_cache) > self._preference_text_cache_maxsize:
+                self._preference_text_cache.popitem(last=False)
             
             # 通知所有等待者
             if not future.done():
@@ -1456,6 +1473,10 @@ class DKIPlugin:
                 
                 clean_text, _ = strip_think_content(full_text)
                 metadata.latency_ms = (time.time() - start_time) * 1000
+                
+                # 流式模式下估算 token (修复 token 统计为 0 的问题)
+                input_tokens = estimate_tokens_fast(prompt, overestimate_factor=1.15)
+                output_tokens = estimate_tokens_fast(clean_text, overestimate_factor=1.15)
                 
                 yield {
                     "type": "done",
