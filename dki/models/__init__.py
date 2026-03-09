@@ -7,6 +7,7 @@ from dki.models.sglang_adapter import SGLangAdapter
 from dki.models.llama_adapter import LlamaAdapter
 from dki.models.deepseek_adapter import DeepSeekAdapter
 from dki.models.glm_adapter import GLMAdapter
+from dki.models.closed_source_adapter import ClosedSourceAdapter
 
 __all__ = [
     "BaseModelAdapter",
@@ -17,4 +18,5 @@ __all__ = [
     "LlamaAdapter", 
     "DeepSeekAdapter",
     "GLMAdapter",
+    "ClosedSourceAdapter",
 ]

@@ -26,6 +26,7 @@ from dki.models.sglang_adapter import SGLangAdapter
 from dki.models.llama_adapter import LlamaAdapter
 from dki.models.deepseek_adapter import DeepSeekAdapter
 from dki.models.glm_adapter import GLMAdapter
+from dki.models.closed_source_adapter import ClosedSourceAdapter
 from dki.config.config_loader import ConfigLoader
 
 
@@ -54,6 +55,7 @@ class ModelFactory:
         'llama': LlamaAdapter,
         'deepseek': DeepSeekAdapter,
         'glm': GLMAdapter,
+        'closed_source': ClosedSourceAdapter,
     }
     
     # 全局实例池: key = "namespace:engine:model_name"
@@ -159,6 +161,19 @@ class ModelFactory:
             })
         elif engine == 'llama':
             adapter_kwargs['load_in_8bit'] = engine_config.load_in_8bit
+        elif engine == 'closed_source':
+            # 闭源模型特殊参数: api_key, api_base, timeout 等
+            adapter_kwargs.update({
+                'api_key': getattr(engine_config, 'api_key', None),
+                'api_base': getattr(engine_config, 'api_base', None),
+                'api_version': getattr(engine_config, 'api_version', None),
+                'max_model_len': engine_config.max_model_len,
+                'timeout': getattr(engine_config, 'timeout', 120.0),
+                'max_retries': getattr(engine_config, 'max_retries', 2),
+                'default_system_prompt': getattr(
+                    engine_config, 'default_system_prompt', None
+                ),
+            })
         
         # Override with explicit kwargs
         adapter_kwargs.update(kwargs)
@@ -338,3 +353,39 @@ class ModelFactory:
             ns = key.split(":", 1)[0]
             namespaces[ns] = namespaces.get(ns, 0) + 1
         return namespaces
+
+    @classmethod
+    def is_closed_source_engine(cls, engine: Optional[str] = None) -> bool:
+        """
+        检查指定引擎 (或默认引擎) 是否为闭源模型
+
+        用途:
+        - 路由层据此自动强制 RAG 路由 (闭源模型无法 K/V 注入)
+        - integration factory 据此设置 force_rag=True
+
+        Args:
+            engine: 引擎名称, None 时使用 config 默认引擎
+
+        Returns:
+            True 如果引擎是闭源模型
+        """
+        config = ConfigLoader().config
+        engine = engine or config.model.default_engine
+        return engine.lower() == "closed_source"
+
+    @classmethod
+    def get_adapter_is_closed_source(
+        cls, adapter: Optional[BaseModelAdapter] = None
+    ) -> bool:
+        """
+        检查适配器实例是否为闭源模型
+
+        Args:
+            adapter: 适配器实例, None 时检查默认实例
+
+        Returns:
+            True 如果适配器是闭源模型 (具有 is_closed_source=True 属性)
+        """
+        if adapter is None:
+            return False
+        return getattr(adapter, "is_closed_source", False)
