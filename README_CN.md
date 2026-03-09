@@ -60,6 +60,7 @@ DKI 通过配置驱动适配器读取上层应用数据库
 -   **💾 分层 KV 缓存**：L1(GPU) → L2(CPU) → L3(SSD) → L4(重计算)
 -   **📊 监控 API**：统计数据、注入日志、健康检查
 -   **🔌 多引擎支持**：vLLM、SGLang、LLaMA、DeepSeek、GLM（均支持流式生成）
+-   **☁️ 闭源模型支持 (v4.1)**：OpenAI、DeepSeek API、GLM API、Moonshot 等任意 OpenAI 兼容 API — 自动 RAG 路由
 -   **✅ 优雅降级**：recall_v4 → stable → 纯 LLM，三级回退
 -   **🚀 极简集成 (v4.0)**：3 行代码集成、FastAPI Middleware、动态路由、消息管理
 -   **🔀 动态路由 (v4.0)**：自动在 RAG 和 DKI 之间切换，五维评分模型
@@ -133,8 +134,11 @@ DKI 作为 LLM 的**注意力层级插件**，通过 PyTorch Hook 机制实现 K
 │  └─────────────────────────────┬───────────────────────────────────┘    │
 │                                ▼                                        │
 │  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  LLM 引擎 (vLLM / SGLang / LLaMA / DeepSeek / GLM)              │    │
-│  │  └── 带 K/V 注入的推理 (支持同步/异步/流式)                       │    │
+│  │  LLM 引擎                                                       │    │
+│  │  ├── 开源模型 (vLLM/SGLang/LLaMA/DeepSeek/GLM)                 │    │
+│  │  │   └── 带 K/V 注入的推理 (同步/异步/流式)                      │    │
+│  │  └── 闭源模型 (OpenAI/DeepSeek API/GLM API/Moonshot/...)       │    │
+│  │      └── RAG 路由 → API 调用 (自动检测, 无 K/V 注入)            │    │
 │  └─────────────────────────────────────────────────────────────────┘    │
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
@@ -160,6 +164,68 @@ Route = DKI  if Score_DKI > θ_dki
 | 个性化       | 无/弱       | 强 (偏好 K/V 注入)  |
 | 首次交互     | ★ 强        | 弱 (无历史可召回)   |
 | 跨会话连续性 | 弱          | ★ 强 (跨会话记忆)   |
+
+### 闭源模型支持 (v4.1)
+
+DKI v4.1 新增对**闭源模型**（OpenAI、DeepSeek API、GLM API、Moonshot 等）的支持，通过自动 RAG 路由机制实现：
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│              闭源模型 — 自动 RAG 路由                                     │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  config.yaml: default_engine: "closed_source"                          │
+│       ↓                                                                 │
+│  ModelFactory → ClosedSourceAdapter (is_closed_source=True)            │
+│       ↓                                                                 │
+│  create_plugin() 检测到 is_closed_source → 强制 dynamic_router=True    │
+│       ↓                                                                 │
+│  EnhancedDKIPlugin._resolve_route_mode() → 强制 "rag"                 │
+│       ↓                                                                 │
+│  RAGSystem.chat() → model.generate() → HTTP API 调用                  │
+│       ↓                                                                 │
+│  返回响应 (统一 DKIPluginResponse 格式)                                 │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**核心设计决策**：
+
+| 方面 | 设计 |
+| ---- | ---- |
+| K/V 注入 | 不可用（无法访问模型内部） |
+| 路由 | 自动强制走 RAG（prompt 拼接） |
+| Chat API | `ClosedSourceAdapter.generate()` → OpenAI 兼容 HTTP API |
+| 配置 | 仅需修改 `config.yaml`，无需改代码 |
+| 集成 | 与开源模型相同：`create_plugin()` / `DKIMiddleware` / `EnhancedDKIPlugin` |
+| 流式 | 支持（SSE, Server-Sent Events） |
+| 降级 | 三级降级：RAG → DKI（会降级）→ 纯 LLM |
+
+**配置示例**：
+
+```yaml
+model:
+    default_engine: "closed_source"
+    engines:
+        closed_source:
+            enabled: true
+            model_name: "deepseek-chat"
+            api_key: "${DEEPSEEK_API_KEY}"
+            api_base: "https://api.deepseek.com/v1"
+            max_model_len: 32768
+            timeout: 120.0
+            max_retries: 2
+```
+
+**使用方式**（与开源模型完全一致）：
+
+```python
+from dki.integration import create_plugin
+
+# 同样的 3 行代码集成 — 闭源路由完全自动
+dki = await create_plugin(adapter_config_path="config/adapter_config.yaml")
+response = await dki.chat("推荐一家餐厅", user_id="u1", session_id="s1")
+```
 
 ### 注入策略选择
 
@@ -615,7 +681,8 @@ DKI/
 │   │   ├── sglang_adapter.py            # SGLang 适配器 (流式)
 │   │   ├── llama_adapter.py             # LLaMA 适配器 (流式)
 │   │   ├── deepseek_adapter.py          # DeepSeek 适配器 (流式)
-│   │   └── glm_adapter.py              # GLM 适配器 (流式)
+│   │   ├── glm_adapter.py              # GLM 适配器 (流式)
+│   │   └── closed_source_adapter.py    # ☁️ 闭源 API 适配器 (v4.1)
 │   │
 │   ├── cache/                           # 缓存系统
 │   │   ├── preference_cache.py          # 偏好缓存管理 (L1+L2)
@@ -700,6 +767,7 @@ DKI/
 | FlashAttention       | ✅ 完成   | FA3/FA2 自动检测                                |
 | 用户管理             | ✅ 完成   | 注册/登录/密码修改/找回                         |
 | Vue3 示例 UI         | ✅ 完成   | 聊天/流式/锚点/偏好/统计                        |
+| 闭源模型支持         | ✅ 完成   | OpenAI/DeepSeek/GLM API 自动 RAG 路由 (v4.1)  |
 | 单元测试             | ✅ 完成   | 核心组件测试覆盖                                |
 | 注意力热力图         | 🔄 规划中 | 调试用注意力权重可视化                          |
 | 文件上传/Skills      | 🔄 规划中 | 文本文件上传和技能支持                          |
@@ -714,11 +782,19 @@ DKI/
 ```yaml
 # 模型引擎
 model:
-    default_engine: "vllm" # vllm, sglang, llama, deepseek, glm
+    default_engine: "vllm" # vllm, sglang, llama, deepseek, glm, closed_source
     engines:
         vllm:
             model_name: "Qwen/Qwen2-7B-Instruct"
             tensor_parallel_size: 1
+
+        # 闭源模型 (v4.1)
+        # closed_source:
+        #     enabled: true
+        #     model_name: "deepseek-chat"
+        #     api_key: "${DEEPSEEK_API_KEY}"
+        #     api_base: "https://api.deepseek.com/v1"
+        #     max_model_len: 32768
 
 # DKI 插件设置
 dki:
@@ -870,6 +946,9 @@ A: 支持。所有模型适配器（vLLM、SGLang、LLaMA、DeepSeek、GLM）均
 
 **Q: 上层应用需要做什么修改？**  
 A: 提供适配器配置文件，调用 `create_plugin()` 创建插件，然后调用 `dki.chat()` 即可。
+
+**Q: DKI 支持 GPT-4、DeepSeek API 等闭源模型吗？**  
+A: 支持（v4.1+）。在 `config.yaml` 中设置 `default_engine: "closed_source"` 并配置 API key 和 API 地址即可。DKI 会自动检测闭源模型并将所有请求通过 RAG 路由（prompt 拼接 + API 调用）。集成 API（`create_plugin()`、`dki.chat()`）完全不变——无需修改代码。注意：闭源模型不支持 K/V 注入，因为无法访问模型内部。
 
 **Q: 生产环境部署建议？**  
 A:

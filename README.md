@@ -60,6 +60,7 @@ This focused scope enables:
 -   **💾 Tiered KV Cache**: L1(GPU) → L2(CPU) → L3(SSD) → L4(Recompute)
 -   **📊 Monitoring API**: Statistics, injection logs, health checks
 -   **🔌 Multi-Engine Support**: vLLM, SGLang, LLaMA, DeepSeek, GLM (all with streaming)
+-   **☁️ Closed-Source Model Support (v4.1)**: OpenAI, DeepSeek API, GLM API, Moonshot, any OpenAI-compatible API — auto RAG routing
 -   **✅ Graceful Degradation**: recall_v4 → stable → plain LLM, three-tier fallback
 -   **🚀 Minimal Integration (v4.0)**: 3-line integration, FastAPI Middleware, dynamic routing, message management
 -   **🔀 Dynamic Routing (v4.0)**: Auto-switch between RAG and DKI, five-dimension scoring model
@@ -133,8 +134,11 @@ DKI operates as an **attention-level plugin** for LLMs, implementing K/V injecti
 │  └─────────────────────────────┬───────────────────────────────────┘    │
 │                                ▼                                        │
 │  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  LLM Engine (vLLM / SGLang / LLaMA / DeepSeek / GLM)            │    │
-│  │  └── Inference with K/V Injection (sync/async/streaming)        │    │
+│  │  LLM Engine                                                     │    │
+│  │  ├── Open-Source (vLLM/SGLang/LLaMA/DeepSeek/GLM)              │    │
+│  │  │   └── Inference with K/V Injection (sync/async/streaming)   │    │
+│  │  └── Closed-Source (OpenAI/DeepSeek API/GLM API/Moonshot/...)  │    │
+│  │      └── RAG route → API call (auto-detected, no K/V injection)│    │
 │  └─────────────────────────────────────────────────────────────────┘    │
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
@@ -160,6 +164,68 @@ Route = DKI  if Score_DKI > θ_dki
 | Personalization          | None/weak          | Strong (preference K/V injection) |
 | First Interaction        | ★ Strong           | Weak (no history to recall)       |
 | Cross-Session Continuity | Weak               | ★ Strong (cross-session memory)   |
+
+### Closed-Source Model Support (v4.1)
+
+DKI v4.1 adds support for **closed-source models** (OpenAI, DeepSeek API, GLM API, Moonshot, etc.) via an automatic RAG routing mechanism:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│              Closed-Source Model — Auto RAG Route                       │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  config.yaml: default_engine: "closed_source"                          │
+│       ↓                                                                 │
+│  ModelFactory → ClosedSourceAdapter (is_closed_source=True)            │
+│       ↓                                                                 │
+│  create_plugin() detects is_closed_source → force dynamic_router=True  │
+│       ↓                                                                 │
+│  EnhancedDKIPlugin._resolve_route_mode() → force "rag"                │
+│       ↓                                                                 │
+│  RAGSystem.chat() → model.generate() → HTTP API call                  │
+│       ↓                                                                 │
+│  Response (same DKIPluginResponse format)                              │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**Key Design Decisions**:
+
+| Aspect | Design |
+| ------ | ------ |
+| K/V Injection | Not available (model internals inaccessible) |
+| Route | Auto-forced to RAG (prompt concatenation) |
+| Chat API | `ClosedSourceAdapter.generate()` → OpenAI-compatible HTTP API |
+| Configuration | `config.yaml` only, no code changes |
+| Integration | Same `create_plugin()` / `DKIMiddleware` / `EnhancedDKIPlugin` API |
+| Streaming | Supported via SSE (Server-Sent Events) |
+| Fallback | Three-tier: RAG → DKI (will degrade) → plain LLM |
+
+**Configuration Example**:
+
+```yaml
+model:
+    default_engine: "closed_source"
+    engines:
+        closed_source:
+            enabled: true
+            model_name: "deepseek-chat"
+            api_key: "${DEEPSEEK_API_KEY}"
+            api_base: "https://api.deepseek.com/v1"
+            max_model_len: 32768
+            timeout: 120.0
+            max_retries: 2
+```
+
+**Usage** (identical to open-source models):
+
+```python
+from dki.integration import create_plugin
+
+# Same 3-line integration — closed-source routing is automatic
+dki = await create_plugin(adapter_config_path="config/adapter_config.yaml")
+response = await dki.chat("Recommend a restaurant", user_id="u1", session_id="s1")
+```
 
 ### Injection Strategy Selection
 
@@ -607,7 +673,8 @@ DKI/
 │   │   ├── sglang_adapter.py            # SGLang adapter (streaming)
 │   │   ├── llama_adapter.py             # LLaMA adapter (streaming)
 │   │   ├── deepseek_adapter.py          # DeepSeek adapter (streaming)
-│   │   └── glm_adapter.py              # GLM adapter (streaming)
+│   │   ├── glm_adapter.py              # GLM adapter (streaming)
+│   │   └── closed_source_adapter.py    # ☁️ Closed-source API adapter (v4.1)
 │   │
 │   ├── cache/                           # Cache system
 │   │   ├── preference_cache.py          # Preference cache (L1+L2)
@@ -683,6 +750,7 @@ DKI/
 | FlashAttention                 | ✅ Done    | FA3/FA2 auto-detection                               |
 | User Management                | ✅ Done    | Register/login/password change/recovery              |
 | Vue3 Example UI                | ✅ Done    | Chat/streaming/anchors/preferences/stats             |
+| Closed-Source Model Support     | ✅ Done    | Auto RAG routing for OpenAI/DeepSeek/GLM APIs (v4.1) |
 | Unit Tests                     | ✅ Done    | Core component test coverage                         |
 | Attention Heatmap              | 🔄 Planned | Debug attention weight visualization                 |
 | File Upload/Skills             | 🔄 Planned | Text file upload and skill support                   |
@@ -697,11 +765,19 @@ Edit `config/config.yaml`:
 ```yaml
 # Model Engine
 model:
-    default_engine: "vllm" # vllm, sglang, llama, deepseek, glm
+    default_engine: "vllm" # vllm, sglang, llama, deepseek, glm, closed_source
     engines:
         vllm:
             model_name: "Qwen/Qwen2-7B-Instruct"
             tensor_parallel_size: 1
+
+        # Closed-source model (v4.1)
+        # closed_source:
+        #     enabled: true
+        #     model_name: "deepseek-chat"
+        #     api_key: "${DEEPSEEK_API_KEY}"
+        #     api_base: "https://api.deepseek.com/v1"
+        #     max_model_len: 32768
 
 # DKI Plugin Settings
 dki:
@@ -853,6 +929,9 @@ A: Yes. All model adapters (vLLM, SGLang, LLaMA, DeepSeek, GLM) implement `async
 
 **Q: What changes does the upstream app need?**  
 A: Provide an adapter config file, call `create_plugin()` to create the plugin, then call `dki.chat()`. That's it.
+
+**Q: Can DKI work with closed-source models like GPT-4 or DeepSeek API?**  
+A: Yes (v4.1+). Set `default_engine: "closed_source"` in `config.yaml` with your API key and base URL. DKI automatically detects the closed-source model and routes all requests through RAG (prompt concatenation + API call). The integration API (`create_plugin()`, `dki.chat()`) remains identical — no code changes needed. Note: K/V injection is not available for closed-source models since model internals are inaccessible.
 
 **Q: Production deployment recommendations?**  
 A:

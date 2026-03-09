@@ -112,6 +112,51 @@ response = await dki.chat(
 )
 ```
 
+### Level 4: Closed-Source Model（闭源模型，v4.1）
+
+DKI v4.1 支持闭源模型（OpenAI、DeepSeek API、GLM API、Moonshot 等），只需在 `config.yaml` 中配置即可，集成代码完全不变：
+
+```yaml
+# config/config.yaml
+model:
+    default_engine: "closed_source"
+    engines:
+        closed_source:
+            enabled: true
+            model_name: "deepseek-chat"           # 或 gpt-4o, glm-4 等
+            api_key: "${DEEPSEEK_API_KEY}"         # 从环境变量读取
+            api_base: "https://api.deepseek.com/v1"
+            max_model_len: 32768
+            timeout: 120.0
+            max_retries: 2
+```
+
+```python
+from dki.integration import create_plugin
+
+# 与开源模型完全相同的 3 行代码
+# DKI 自动检测闭源模型 → 强制走 RAG 路由 → API 调用
+dki = await create_plugin(adapter_config_path="config/adapter_config.yaml")
+
+response = await dki.chat(
+    query="推荐一家餐厅",
+    user_id="user_001",
+    session_id="session_001",
+)
+print(response.text)
+
+# 流式也支持 (SSE)
+async for chunk in dki.chat_stream(
+    query="推荐一本好书",
+    user_id="user_001",
+    session_id="session_001",
+):
+    if chunk["type"] == "token":
+        print(chunk["content"], end="", flush=True)
+```
+
+> **注意**：闭源模型不支持 K/V 注入（无法访问模型内部），DKI 会自动使用 RAG 路由（prompt 拼接方式）。用户偏好和历史仍然通过适配器读取，但以 prompt 形式拼接而非 K/V 注入。
+
 ### 向后兼容：直接使用 DKIPlugin
 
 v4.0 完全向后兼容，原有的 `DKIPlugin` 接口不变：
@@ -330,15 +375,17 @@ print(f"History Count: {response.metadata.relevant_history_count}")
 | Token 消耗   | 不消耗           | 消耗上下文窗口      |
 | 适用场景     | 用户级记忆       | 外部知识库          |
 | 上层应用改动 | 只需传 user_id   | 需要 prompt 工程    |
+| 闭源模型     | 不支持 (v4.1 自动降级到 RAG) | ✅ 支持 |
 
-### v4.0 Integration Layer
+### v4.0/v4.1 Integration Layer
 
-| 集成模式           | 适用场景            | 代码量   |
-| ------------------ | ------------------- | -------- |
-| One-Line Factory   | 快速集成、脚本      | 3 行     |
-| FastAPI Middleware | Web 应用            | 5 行     |
-| Full Control       | 动态路由 + 消息管理 | 10-15 行 |
-| DKIPlugin (直接)   | 完全控制、高级定制  | 10-20 行 |
+| 集成模式              | 适用场景            | 代码量   |
+| --------------------- | ------------------- | -------- |
+| One-Line Factory      | 快速集成、脚本      | 3 行     |
+| FastAPI Middleware    | Web 应用            | 5 行     |
+| Full Control          | 动态路由 + 消息管理 | 10-15 行 |
+| Closed-Source (v4.1)  | 闭源 API 模型       | 3 行     |
+| DKIPlugin (直接)      | 完全控制、高级定制  | 10-20 行 |
 
 ### Hybrid Injection
 
