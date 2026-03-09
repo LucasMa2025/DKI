@@ -135,10 +135,10 @@ DKI operates as an **attention-level plugin** for LLMs, implementing K/V injecti
 │                                ▼                                        │
 │  ┌─────────────────────────────────────────────────────────────────┐    │
 │  │  LLM Engine                                                     │    │
-│  │  ├── Open-Source (vLLM/SGLang/LLaMA/DeepSeek/GLM)              │    │
-│  │  │   └── Inference with K/V Injection (sync/async/streaming)   │    │
-│  │  └── Closed-Source (OpenAI/DeepSeek API/GLM API/Moonshot/...)  │    │
-│  │      └── RAG route → API call (auto-detected, no K/V injection)│    │
+│  │  ├── Open-Source (vLLM/SGLang/LLaMA/DeepSeek/GLM)               │    │
+│  │  │   └── Inference with K/V Injection (sync/async/streaming)    │    │
+│  │  └── Closed-Source (OpenAI/DeepSeek API/GLM API/Moonshot/...)   │    │
+│  │      └── RAG route → API call (auto-detected, no K/V injection) │    │
 │  └─────────────────────────────────────────────────────────────────┘    │
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
@@ -174,32 +174,32 @@ DKI v4.1 adds support for **closed-source models** (OpenAI, DeepSeek API, GLM AP
 │              Closed-Source Model — Auto RAG Route                       │
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                         │
-│  config.yaml: default_engine: "closed_source"                          │
+│  config.yaml: default_engine: "closed_source"                           │
 │       ↓                                                                 │
-│  ModelFactory → ClosedSourceAdapter (is_closed_source=True)            │
+│  ModelFactory → ClosedSourceAdapter (is_closed_source=True)             │
 │       ↓                                                                 │
-│  create_plugin() detects is_closed_source → force dynamic_router=True  │
+│  create_plugin() detects is_closed_source → force dynamic_router=True   │
 │       ↓                                                                 │
-│  EnhancedDKIPlugin._resolve_route_mode() → force "rag"                │
+│  EnhancedDKIPlugin._resolve_route_mode() → force "rag"                  │
 │       ↓                                                                 │
-│  RAGSystem.chat() → model.generate() → HTTP API call                  │
+│  RAGSystem.chat() → model.generate() → HTTP API call                    │
 │       ↓                                                                 │
-│  Response (same DKIPluginResponse format)                              │
+│  Response (same DKIPluginResponse format)                               │
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
 **Key Design Decisions**:
 
-| Aspect | Design |
-| ------ | ------ |
-| K/V Injection | Not available (model internals inaccessible) |
-| Route | Auto-forced to RAG (prompt concatenation) |
-| Chat API | `ClosedSourceAdapter.generate()` → OpenAI-compatible HTTP API |
-| Configuration | `config.yaml` only, no code changes |
-| Integration | Same `create_plugin()` / `DKIMiddleware` / `EnhancedDKIPlugin` API |
-| Streaming | Supported via SSE (Server-Sent Events) |
-| Fallback | Three-tier: RAG → DKI (will degrade) → plain LLM |
+| Aspect        | Design                                                             |
+| ------------- | ------------------------------------------------------------------ |
+| K/V Injection | Not available (model internals inaccessible)                       |
+| Route         | Auto-forced to RAG (prompt concatenation)                          |
+| Chat API      | `ClosedSourceAdapter.generate()` → OpenAI-compatible HTTP API      |
+| Configuration | `config.yaml` only, no code changes                                |
+| Integration   | Same `create_plugin()` / `DKIMiddleware` / `EnhancedDKIPlugin` API |
+| Streaming     | Supported via SSE (Server-Sent Events)                             |
+| Fallback      | Three-tier: RAG → DKI (will degrade) → plain LLM                   |
 
 **Configuration Example**:
 
@@ -750,7 +750,7 @@ DKI/
 | FlashAttention                 | ✅ Done    | FA3/FA2 auto-detection                               |
 | User Management                | ✅ Done    | Register/login/password change/recovery              |
 | Vue3 Example UI                | ✅ Done    | Chat/streaming/anchors/preferences/stats             |
-| Closed-Source Model Support     | ✅ Done    | Auto RAG routing for OpenAI/DeepSeek/GLM APIs (v4.1) |
+| Closed-Source Model Support    | ✅ Done    | Auto RAG routing for OpenAI/DeepSeek/GLM APIs (v4.1) |
 | Unit Tests                     | ✅ Done    | Core component test coverage                         |
 | Attention Heatmap              | 🔄 Planned | Debug attention weight visualization                 |
 | File Upload/Skills             | 🔄 Planned | Text file upload and skill support                   |
