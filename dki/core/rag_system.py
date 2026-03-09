@@ -30,6 +30,7 @@ from dki.core.exceptions import (
     DKIError,
     AdapterConnectionError,
     AdapterTimeoutError,
+    KVOOMError,
     ModelError,
     ModelConnectionError,
     ModelTimeoutError,
@@ -44,6 +45,71 @@ from dki.database.repository import (
     UserPreferenceRepository,
 )
 from dki.config.config_loader import ConfigLoader
+
+from collections import OrderedDict
+
+
+# ============================================================
+# 有界 TTL 缓存 (修复无上限 dict 内存泄漏风险)
+# ============================================================
+
+class BoundedTTLCache:
+    """
+    有界 TTL 缓存 (LRU 淘汰 + TTL 过期)
+    
+    解决原始 dict 缓存无上限的问题:
+    - maxsize: 最大缓存条目数 (超过后淘汰最久未使用的条目)
+    - ttl: 条目存活时间 (秒)
+    """
+    
+    def __init__(self, maxsize: int = 1000, ttl: float = 300.0):
+        self._cache: OrderedDict = OrderedDict()
+        self._maxsize = maxsize
+        self._ttl = ttl
+    
+    def get(self, key: str) -> Optional[tuple]:
+        """获取缓存条目, 过期返回 None"""
+        item = self._cache.get(key)
+        if item is None:
+            return None
+        value, cached_time = item
+        if (time.time() - cached_time) >= self._ttl:
+            # 已过期, 移除
+            self._cache.pop(key, None)
+            return None
+        # 命中: 移到末尾 (LRU)
+        self._cache.move_to_end(key)
+        return item
+    
+    def set(self, key: str, value, timestamp: Optional[float] = None):
+        """设置缓存条目"""
+        ts = timestamp or time.time()
+        self._cache[key] = (value, ts)
+        self._cache.move_to_end(key)
+        # 超过上限: 淘汰最久未使用
+        while len(self._cache) > self._maxsize:
+            self._cache.popitem(last=False)
+    
+    def pop(self, key: str, default=None):
+        """移除缓存条目"""
+        return self._cache.pop(key, default)
+    
+    def clear(self):
+        """清空所有缓存"""
+        self._cache.clear()
+    
+    def __len__(self) -> int:
+        return len(self._cache)
+    
+    def __contains__(self, key: str) -> bool:
+        item = self._cache.get(key)
+        if item is None:
+            return False
+        _, cached_time = item
+        if (time.time() - cached_time) >= self._ttl:
+            self._cache.pop(key, None)
+            return False
+        return True
 
 
 # ============================================================
@@ -188,9 +254,10 @@ class RAGSystem:
             echo=self.config.database.echo,
         )
         
-        # v6.0: 偏好缓存 (TTL + SingleFlight)
-        self._preference_cache: Dict[str, Tuple[Optional[str], float]] = {}
-        self._preference_cache_ttl = preference_cache_ttl or self._PREFERENCE_CACHE_TTL
+        # v6.0: 偏好缓存 (TTL + SingleFlight + LRU 有界)
+        _ttl = preference_cache_ttl or self._PREFERENCE_CACHE_TTL
+        self._preference_cache = BoundedTTLCache(maxsize=1000, ttl=_ttl)
+        self._preference_cache_ttl = _ttl
         self._preference_single_flight: Dict[str, asyncio.Future] = {}
         
         # 统计
@@ -568,14 +635,13 @@ class RAGSystem:
         if not user_id:
             return None
         
-        # v6.0: 检查缓存
+        # v6.0: 检查缓存 (BoundedTTLCache 内部处理 TTL 过期)
         cached = self._preference_cache.get(user_id)
         if cached:
-            pref_text, cached_time = cached
-            if (time.time() - cached_time) < self._preference_cache_ttl:
-                self._stats["preference_cache_hits"] += 1
-                logger.debug(f"RAG preference cache hit for user {user_id}")
-                return pref_text
+            pref_text, _cached_time = cached
+            self._stats["preference_cache_hits"] += 1
+            logger.debug(f"RAG preference cache hit for user {user_id}")
+            return pref_text
         
         self._stats["preference_cache_misses"] += 1
         
@@ -585,7 +651,7 @@ class RAGSystem:
                 preferences = pref_repo.get_by_user(user_id, active_only=True)
                 
                 if not preferences:
-                    self._preference_cache[user_id] = (None, time.time())
+                    self._preference_cache.set(user_id, None)
                     return None
                 
                 # 按优先级合并偏好文本
@@ -597,14 +663,14 @@ class RAGSystem:
                 
                 if pref_texts:
                     combined = "\n".join(pref_texts)
-                    self._preference_cache[user_id] = (combined, time.time())
+                    self._preference_cache.set(user_id, combined)
                     logger.debug(
                         f"RAG loaded {len(pref_texts)} preferences for user {user_id}: "
                         f"{len(combined)} chars"
                     )
                     return combined
                 
-                self._preference_cache[user_id] = (None, time.time())
+                self._preference_cache.set(user_id, None)
         except Exception as e:
             logger.warning(f"RAG failed to load preferences for user {user_id}: {e}")
             raise RAGPreferenceError(
@@ -618,6 +684,11 @@ class RAGSystem:
         """
         异步加载用户偏好文本 (带 SingleFlight 防惊群)
         
+        修复:
+        - 使用 asyncio.get_running_loop() 替代废弃的 get_event_loop()
+        - 等待方使用 asyncio.shield() 防止被取消影响 future
+        - 等待方异常时降级为 None, 不向上传播
+        
         Args:
             user_id: 用户标识
             
@@ -627,35 +698,39 @@ class RAGSystem:
         if not user_id:
             return None
         
-        # v6.0: 检查缓存
+        # v6.0: 检查缓存 (BoundedTTLCache 内部处理 TTL 过期)
         cached = self._preference_cache.get(user_id)
         if cached:
-            pref_text, cached_time = cached
-            if (time.time() - cached_time) < self._preference_cache_ttl:
-                self._stats["preference_cache_hits"] += 1
-                logger.debug(f"RAG preference cache hit for user {user_id}")
-                return pref_text
+            pref_text, _cached_time = cached
+            self._stats["preference_cache_hits"] += 1
+            logger.debug(f"RAG preference cache hit for user {user_id}")
+            return pref_text
         
-        # SingleFlight: 防止并发请求同一用户偏好
+        # SingleFlight: 等待已有的 in-flight 请求 (shield 保护 + 异常降级)
         if user_id in self._preference_single_flight:
             logger.debug(f"RAG preference single-flight hit for user {user_id}")
-            return await self._preference_single_flight[user_id]
+            try:
+                return await asyncio.shield(self._preference_single_flight[user_id])
+            except Exception:
+                return None  # 降级: 不向上传播, 避免等待方因主请求异常而崩溃
         
-        future: asyncio.Future = asyncio.get_event_loop().create_future()
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future = loop.create_future()
         self._preference_single_flight[user_id] = future
         
         self._stats["preference_cache_misses"] += 1
         
         try:
             # 在线程池中执行同步 DB 操作
-            result = await asyncio.get_event_loop().run_in_executor(
+            result = await loop.run_in_executor(
                 None, self._load_user_preferences_sync, user_id
             )
-            self._preference_cache[user_id] = (result, time.time())
+            self._preference_cache.set(user_id, result)
             future.set_result(result)
             return result
         except Exception as e:
-            future.set_exception(e)
+            if not future.done():
+                future.set_exception(e)
             raise
         finally:
             self._preference_single_flight.pop(user_id, None)
@@ -706,16 +781,24 @@ class RAGSystem:
         v5.7: 从外置配置读取最大历史轮次 (与 DKI 一致)
         
         配置路径: dki.recall.budget.max_recent_turns (默认 5)
+        
+        v6.1 修复: 简化嵌套 getattr/isinstance 判断, 使用 try/except + 属性链
         """
         try:
-            recall_obj = getattr(self.config.dki, 'recall', None)
-            if recall_obj:
-                budget_obj = getattr(recall_obj, 'budget', None) if hasattr(recall_obj, 'budget') else (recall_obj.get('budget') if isinstance(recall_obj, dict) else None)
-                if budget_obj:
-                    val = getattr(budget_obj, 'max_recent_turns', 5) if hasattr(budget_obj, 'max_recent_turns') else (budget_obj.get('max_recent_turns', 5) if isinstance(budget_obj, dict) else 5)
-                    return val
-        except Exception:
+            return self.config.dki.recall.budget.max_recent_turns
+        except (AttributeError, TypeError):
             pass
+        
+        # 回退: 尝试 dict 风格访问
+        try:
+            recall_obj = getattr(self.config.dki, 'recall', None)
+            if isinstance(recall_obj, dict):
+                budget = recall_obj.get('budget', {})
+                if isinstance(budget, dict):
+                    return budget.get('max_recent_turns', 5)
+        except (AttributeError, TypeError):
+            pass
+        
         return 5
     
     def _prepare_chat_context(
@@ -834,29 +917,42 @@ class RAGSystem:
                 temperature=temperature,
                 **kwargs,
             )
+        except (ModelOOMError, KVOOMError) as e:
+            # 结构化异常: GPU OOM (优先匹配, 可重试)
+            raise RAGGenerationError(
+                f"Model OOM during RAG generation: {e}",
+                retryable=True, cause=e,
+            )
+        except ModelTimeoutError as e:
+            # 结构化异常: 超时 (可重试)
+            raise RAGGenerationError(
+                f"Model timeout during RAG generation: {e}",
+                retryable=True, cause=e,
+            )
+        except ModelConnectionError as e:
+            # 结构化异常: 连接错误 (可重试)
+            raise RAGGenerationError(
+                f"Model connection error during RAG generation: {e}",
+                retryable=True, cause=e,
+            )
+        except ModelError as e:
+            # 结构化异常: 其他模型错误 (不可重试)
+            raise RAGGenerationError(
+                f"RAG generation failed: {e}",
+                retryable=False, cause=e,
+            )
         except Exception as e:
-            # 区分不同的模型错误
+            # 回退: 未被结构化异常捕获的错误, 使用字符串匹配兜底
             err_msg = str(e).lower()
-            if "oom" in err_msg or "out of memory" in err_msg:
-                raise RAGGenerationError(
-                    f"Model OOM during RAG generation: {e}",
-                    retryable=True, cause=e,
-                )
-            elif "timeout" in err_msg:
-                raise RAGGenerationError(
-                    f"Model timeout during RAG generation: {e}",
-                    retryable=True, cause=e,
-                )
-            elif "connection" in err_msg or "connect" in err_msg:
-                raise RAGGenerationError(
-                    f"Model connection error during RAG generation: {e}",
-                    retryable=True, cause=e,
-                )
-            else:
-                raise RAGGenerationError(
-                    f"RAG generation failed: {e}",
-                    retryable=False, cause=e,
-                )
+            retryable = (
+                "oom" in err_msg or "out of memory" in err_msg
+                or "timeout" in err_msg
+                or "connection" in err_msg or "connect" in err_msg
+            )
+            raise RAGGenerationError(
+                f"RAG generation failed: {e}",
+                retryable=retryable, cause=e,
+            )
         
         # 移除 <think> 推理内容
         clean_response, think_stripped = strip_think_content(output.text)
@@ -909,6 +1005,69 @@ class RAGSystem:
                 )
         except Exception as e:
             logger.error(f"Failed to log conversation: {e}")
+    
+    async def _log_conversation_async(
+        self,
+        session_id: str,
+        user_id: Optional[str],
+        query: str,
+        clean_response: str,
+        memories: List[MemorySearchResult],
+        total_latency: float,
+    ):
+        """
+        异步记录对话到数据库 (非致命, 失败只记录日志)
+        
+        修复 fire-and-forget 问题: 使用 ensure_future + done_callback
+        确保异常不会被静默吞掉, 也不会阻塞调用方
+        """
+        try:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                None,
+                lambda: self._log_conversation(
+                    session_id=session_id,
+                    user_id=user_id,
+                    query=query,
+                    clean_response=clean_response,
+                    memories=memories,
+                    total_latency=total_latency,
+                ),
+            )
+        except Exception as e:
+            logger.error(f"Async conversation log failed: {e}")
+    
+    def _fire_and_forget_log(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        session_id: str,
+        user_id: Optional[str],
+        query: str,
+        clean_response: str,
+        memories: List[MemorySearchResult],
+        total_latency: float,
+    ):
+        """
+        Fire-and-forget 日志记录 (带异常回调, 防止内存泄漏)
+        
+        替代直接调用 loop.run_in_executor() 不 await 的模式
+        """
+        task = asyncio.ensure_future(
+            self._log_conversation_async(
+                session_id=session_id,
+                user_id=user_id,
+                query=query,
+                clean_response=clean_response,
+                memories=memories,
+                total_latency=total_latency,
+            )
+        )
+        task.add_done_callback(
+            lambda t: (
+                logger.error(f"Log task failed: {t.exception()}")
+                if t.exception() else None
+            )
+        )
     
     def chat(
         self,
@@ -1052,7 +1211,7 @@ class RAGSystem:
                 preference_text = None
             
             # 准备上下文 (在线程池中执行同步 DB 操作)
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             prompt, prompt_info, memories, history, preference_text = await loop.run_in_executor(
                 None,
                 lambda: self._prepare_chat_context(
@@ -1081,17 +1240,15 @@ class RAGSystem:
             end_time = time.perf_counter()
             total_latency = (end_time - start_time) * 1000
             
-            # 记录对话 (在线程池中执行, 不阻塞返回)
-            loop.run_in_executor(
-                None,
-                lambda: self._log_conversation(
-                    session_id=session_id,
-                    user_id=user_id,
-                    query=query,
-                    clean_response=clean_response,
-                    memories=memories,
-                    total_latency=total_latency,
-                ),
+            # 记录对话 (fire-and-forget, 带异常回调, 不阻塞返回)
+            self._fire_and_forget_log(
+                loop=loop,
+                session_id=session_id,
+                user_id=user_id,
+                query=query,
+                clean_response=clean_response,
+                memories=memories,
+                total_latency=total_latency,
             )
             
             return RAGResponse(
@@ -1155,7 +1312,7 @@ class RAGSystem:
                 preference_text = None
             
             # 准备上下文
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             prompt, prompt_info, memories, history, preference_text = await loop.run_in_executor(
                 None,
                 lambda: self._prepare_chat_context(
@@ -1214,18 +1371,20 @@ class RAGSystem:
                 clean_text, _ = strip_think_content(full_text)
                 total_latency = (time.perf_counter() - start_time) * 1000
                 
-                # 记录对话
-                loop.run_in_executor(
-                    None,
-                    lambda: self._log_conversation(
-                        session_id=session_id,
-                        user_id=user_id,
-                        query=query,
-                        clean_response=clean_text,
-                        memories=memories,
-                        total_latency=total_latency,
-                    ),
+                # 记录对话 (fire-and-forget, 带异常回调)
+                self._fire_and_forget_log(
+                    loop=loop,
+                    session_id=session_id,
+                    user_id=user_id,
+                    query=query,
+                    clean_response=clean_text,
+                    memories=memories,
+                    total_latency=total_latency,
                 )
+                
+                # 流式模式下估算 token (修复 token 统计为 0 的问题)
+                input_tokens = self._estimate_tokens(prompt)
+                output_tokens = self._estimate_tokens(clean_text)
                 
                 yield {
                     "type": "done",
@@ -1248,17 +1407,15 @@ class RAGSystem:
                 
                 total_latency = (time.perf_counter() - start_time) * 1000
                 
-                # 记录对话
-                loop.run_in_executor(
-                    None,
-                    lambda: self._log_conversation(
-                        session_id=session_id,
-                        user_id=user_id,
-                        query=query,
-                        clean_response=clean_response,
-                        memories=memories,
-                        total_latency=total_latency,
-                    ),
+                # 记录对话 (fire-and-forget, 带异常回调)
+                self._fire_and_forget_log(
+                    loop=loop,
+                    session_id=session_id,
+                    user_id=user_id,
+                    query=query,
+                    clean_response=clean_response,
+                    memories=memories,
+                    total_latency=total_latency,
                 )
                 
                 # 模拟流式: 一次性返回全部
