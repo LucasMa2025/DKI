@@ -72,11 +72,31 @@ class RecallSummaryConfig:
 
 @dataclass
 class RecallFactCallConfig:
-    """Function Call 配置"""
+    """
+    Function Call 配置
+    
+    fact_retrieve_method:
+    - "post_hoc" (默认): Executor O(1) forward, F1-4 静默剥离残留 fact call (现有行为)
+    - "inline_intercept": 生成中 stop 拦截 → 抓参数 → pull 事实 → continuation (开源模型)
+    - "entropy_gated": Generation + Entropy Monitoring → 高熵触发自主记忆检索 (开源模型, 需 logprobs)
+    - "native_tool_calls": OpenAI 兼容 API 原生 tools 参数 (闭源模型)
+    - "auto": 根据模型类型自动选择 (闭源→native_tool_calls, 开源→entropy_gated)
+    """
     enabled: bool = True
     max_rounds: int = 3
     max_fact_tokens: int = 800
     batch_size: int = 5
+    # ---- fact_retrieve_method 及专属配置 ----
+    fact_retrieve_method: str = "post_hoc"
+    inline_intercept_max_param_tokens: int = 64   # 参数提取的 max_tokens
+    inline_intercept_max_rounds: int = 3           # 最大拦截轮次
+    # ---- entropy_gated 专属配置 ----
+    entropy_probe_tokens: int = 64                 # Stage 1 探测生成的最大 token 数
+    entropy_logprobs_k: int = 5                    # logprobs 返回的 top-k 数
+    entropy_spike_threshold: float = 1.5           # 熵突增检测阈值 (std 倍数)
+    entropy_absolute_threshold: float = 3.0        # 绝对熵阈值 (nats)
+    entropy_window_size: int = 32                  # 滑动窗口大小
+    entropy_max_retrievals: int = 2                # 每次生成最大检索次数
 
 
 @dataclass
@@ -192,7 +212,11 @@ class RecallConfig:
         budget = RecallBudgetConfig(**budget_filtered) if budget_filtered else RecallBudgetConfig()
         
         summary = RecallSummaryConfig(**d.get("summary", {})) if "summary" in d else RecallSummaryConfig()
-        fact_call = RecallFactCallConfig(**d.get("fact_call", {})) if "fact_call" in d else RecallFactCallConfig()
+        # v7.1: RecallFactCallConfig 新增字段, 需要过滤未知字段
+        fact_call_dict = d.get("fact_call", {})
+        fact_call_fields = {f.name for f in RecallFactCallConfig.__dataclass_fields__.values()}
+        fact_call_filtered = {k: v for k, v in fact_call_dict.items() if k in fact_call_fields} if fact_call_dict else {}
+        fact_call = RecallFactCallConfig(**fact_call_filtered) if fact_call_filtered else RecallFactCallConfig()
         
         weights_dict = d.get("score_weights", {})
         score_weights = RecallScoreWeights(**weights_dict) if weights_dict else RecallScoreWeights()

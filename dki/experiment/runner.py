@@ -51,11 +51,14 @@ class ExperimentConfig:
     max_samples: int = 100
     max_new_tokens: int = 2048  # v6.4: 从 256 提升到 2048, 防止 thinking 模型输出截断
     temperature: float = 0.7
-    alpha_values: List[float] = field(default_factory=lambda: [0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
+    # v8.0: 对齐论文 Table 4 的 α 取值
+    alpha_values: List[float] = field(default_factory=lambda: [0.0, 0.3, 0.4, 0.5, 0.6, 0.7, 1.0])
     # force_alpha for DKI mode (v3.2): ensures injection actually fires
     # DualFactorGating often returns alpha<0.1 in experiment scenarios,
     # silently skipping injection. Default 0.4 is a reasonable value.
     force_alpha: float = 0.4
+    # v8.0: 事实检索方法 (entropy_gated | inline_intercept | post_hoc | auto)
+    fact_retrieve_method: str = "auto"
     
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -68,6 +71,7 @@ class ExperimentConfig:
             'temperature': self.temperature,
             'alpha_values': self.alpha_values,
             'force_alpha': self.force_alpha,
+            'fact_retrieve_method': self.fact_retrieve_method,
         }
 
 
@@ -78,6 +82,8 @@ class InjectionInfo:
     
     DKI: 显示偏好文本 + 历史后缀提示词 (不显示实际 K/V)
     RAG: 显示完整的构造提示词
+    
+    v8.0: 增加 entropy-gated 元认知检索信息
     """
     mode: str  # 'dki' or 'rag'
     
@@ -103,6 +109,15 @@ class InjectionInfo:
     # 注入参数
     alpha: float = 0.0
     
+    # v8.0: Entropy-Gated 元认知检索信息
+    fact_retrieve_method: str = "post_hoc"  # entropy_gated | inline_intercept | post_hoc | native_tool_calls
+    entropy_triggered: bool = False          # 是否触发了 entropy-gated 检索
+    entropy_probe_tokens: int = 0            # Stage 1 探测生成的 token 数
+    entropy_grounding_facts: List[str] = field(default_factory=list)  # 检索到的事实
+    entropy_stages: int = 1                  # 生成阶段数 (1=无触发, 2=触发重生成)
+    entropy_spike_position: int = -1         # 熵尖峰位置 (-1=未触发)
+    entropy_max_value: float = 0.0           # 最大熵值
+    
     def to_dict(self) -> Dict[str, Any]:
         return {
             'mode': self.mode,
@@ -116,6 +131,14 @@ class InjectionInfo:
             'rag_context': self.rag_context,
             'final_input': self.final_input,
             'alpha': self.alpha,
+            # v8.0: entropy-gated 信息
+            'fact_retrieve_method': self.fact_retrieve_method,
+            'entropy_triggered': self.entropy_triggered,
+            'entropy_probe_tokens': self.entropy_probe_tokens,
+            'entropy_grounding_facts': self.entropy_grounding_facts,
+            'entropy_stages': self.entropy_stages,
+            'entropy_spike_position': self.entropy_spike_position,
+            'entropy_max_value': self.entropy_max_value,
         }
     
     def get_display_text(self) -> str:
@@ -130,6 +153,10 @@ class InjectionInfo:
         lines.append(f"")
         
         if self.mode == 'dki':
+            # v8.0: 显示事实检索方法
+            lines.append(f"【事实检索方法】{self.fact_retrieve_method}")
+            lines.append(f"")
+            
             if self.preference_text:
                 lines.append(f"【偏好注入】(K/V 注入, α={self.alpha:.2f}, {self.preference_tokens} tokens)")
                 lines.append(f"───────────────────────────────────────────────────────")
@@ -148,6 +175,20 @@ class InjectionInfo:
                 for msg in self.history_messages:
                     role = "用户" if msg['role'] == 'user' else "助手"
                     lines.append(f"  [{role}] {msg['content'][:100]}{'...' if len(msg['content']) > 100 else ''}")
+                lines.append(f"")
+            
+            # v8.0: 显示 entropy-gated 信息
+            if self.entropy_triggered:
+                lines.append(f"【Entropy-Gated 元认知检索】")
+                lines.append(f"───────────────────────────────────────────────────────")
+                lines.append(f"  触发: ✅ (Stage {self.entropy_stages})")
+                lines.append(f"  探测 tokens: {self.entropy_probe_tokens}")
+                lines.append(f"  尖峰位置: token #{self.entropy_spike_position}")
+                lines.append(f"  最大熵值: {self.entropy_max_value:.3f} nats")
+                if self.entropy_grounding_facts:
+                    lines.append(f"  检索事实 ({len(self.entropy_grounding_facts)} 条):")
+                    for i, fact in enumerate(self.entropy_grounding_facts, 1):
+                        lines.append(f"    [{i}] {fact[:150]}{'...' if len(fact) > 150 else ''}")
                 lines.append(f"")
         
         elif self.mode == 'rag':
@@ -1721,11 +1762,11 @@ class ExperimentRunner:
         setup_users: bool = True,
     ) -> Dict[str, Any]:
         """
-        运行消融实验 — 对齐论文 Table 3 的 7 种配置
+        运行消融实验 — 对齐论文 Table 3 的 7 种配置 (v8.0)
         
         测试 DKI 各组件的独立贡献:
-        - full_dki:              完整 DKI (Recall v4 全部组件)
-        - wo_fact_call:          去除 Fact Call (禁用 retrieve_fact 循环)
+        - full_dki:              完整 DKI (Recall v4 + entropy-gated 事实召回)
+        - wo_fact_call:          去除 Fact Call (禁用 entropy-gated 检索循环)
         - wo_multi_signal:       去除多信号召回 (仅用向量检索)
         - wo_kv_injection:       去除 K/V 注入 (偏好放入 prompt)
         - stable_fallback_only:  仅 Stable 策略 (偏好 K/V + 固定 N 轮窗口)
@@ -1733,13 +1774,18 @@ class ExperimentRunner:
         - vanilla_llm:           无记忆基线
         
         指标: memory_recall, fabricated_halluc, irrelevant_halluc, latency, BLEU/ROUGE
+        
+        v8.0 更新:
+        - full_dki 默认使用 entropy_gated 事实检索
+        - wo_fact_call 通过 fact_retrieve_method=post_hoc 禁用检索循环
+        - 新增 entropy_triggered 统计
         """
         self._ensure_systems()
         
         if setup_users and not hasattr(self, '_experiment_user_map'):
             self.setup_experiment_users()
         
-        logger.info("Running ablation study (7 variants aligned with paper Table 3)")
+        logger.info("Running ablation study (7 variants aligned with paper Table 3, v8.0)")
         
         # Load data
         if data_path:
@@ -1756,45 +1802,52 @@ class ExperimentRunner:
                 gen = ExperimentDataGenerator("./data")
                 data = gen.generate_ablation_data()
         
-        # 消融配置 — 对齐论文 Table 3
-        # allow_fact_call: 是否启用 retrieve_fact() 循环
+        # 消融配置 — 对齐论文 Table 3 (v8.0)
+        # fact_retrieve_method: 'entropy_gated' | 'post_hoc' | 'inline_intercept' | None
         # recall_mode: 'multi_signal' | 'vector_only' | 'stable' | None
         # use_kv_injection: 是否使用 K/V 注入 (False → 偏好放入 prompt)
         # system: 'dki' | 'rag' | 'baseline'
         ablation_configs = {
             'full_dki': {
                 'system': 'dki', 'force_alpha': 0.4, 'use_memory': True,
-                'allow_fact_call': True, 'recall_mode': 'multi_signal',
+                'fact_retrieve_method': 'entropy_gated',
+                'recall_mode': 'multi_signal',
                 'use_kv_injection': True,
             },
             'wo_fact_call': {
                 'system': 'dki', 'force_alpha': 0.4, 'use_memory': True,
-                'allow_fact_call': False, 'recall_mode': 'multi_signal',
+                'fact_retrieve_method': 'post_hoc',  # 禁用 entropy-gated 检索
+                'recall_mode': 'multi_signal',
                 'use_kv_injection': True,
             },
             'wo_multi_signal': {
                 'system': 'dki', 'force_alpha': 0.4, 'use_memory': True,
-                'allow_fact_call': True, 'recall_mode': 'vector_only',
+                'fact_retrieve_method': 'entropy_gated',
+                'recall_mode': 'vector_only',
                 'use_kv_injection': True,
             },
             'wo_kv_injection': {
                 'system': 'dki', 'force_alpha': 0.4, 'use_memory': True,
-                'allow_fact_call': True, 'recall_mode': 'multi_signal',
+                'fact_retrieve_method': 'entropy_gated',
+                'recall_mode': 'multi_signal',
                 'use_kv_injection': False,
             },
             'stable_fallback_only': {
                 'system': 'dki', 'force_alpha': 0.4, 'use_memory': True,
-                'allow_fact_call': False, 'recall_mode': 'stable',
+                'fact_retrieve_method': 'post_hoc',
+                'recall_mode': 'stable',
                 'use_kv_injection': True,
             },
             'rag_baseline': {
                 'system': 'rag', 'force_alpha': None, 'use_memory': True,
-                'allow_fact_call': False, 'recall_mode': None,
+                'fact_retrieve_method': None,
+                'recall_mode': None,
                 'use_kv_injection': False,
             },
             'vanilla_llm': {
                 'system': 'baseline', 'force_alpha': None, 'use_memory': False,
-                'allow_fact_call': False, 'recall_mode': None,
+                'fact_retrieve_method': None,
+                'recall_mode': None,
                 'use_kv_injection': False,
             },
         }
@@ -1829,7 +1882,7 @@ class ExperimentRunner:
                     latency = 0.0
                     
                     if config['system'] == 'dki':
-                        # v7.0: 使用 DKIPlugin (消融控制通过 force_alpha 实现)
+                        # v8.0: 使用 DKIPlugin (消融控制通过 force_alpha + fact_retrieve_method)
                         dki_kwargs = {
                             'query': query,
                             'session_id': session_id,
@@ -1839,6 +1892,10 @@ class ExperimentRunner:
                         # 消融控制参数
                         if not config.get('use_kv_injection'):
                             dki_kwargs['force_alpha'] = 0.0  # 禁用 KV 注入
+                        
+                        # v8.0: 传递 fact_retrieve_method 到 DKI 插件
+                        if config.get('fact_retrieve_method'):
+                            dki_kwargs['fact_retrieve_method'] = config['fact_retrieve_method']
                         
                         response = self._run_plugin_chat(**dki_kwargs)
                         response_text = response.text
@@ -1891,7 +1948,19 @@ class ExperimentRunner:
                         rouge_scores = self.metrics.compute_rouge(reference, response_text)
                         rouge_l = rouge_scores.get('rougeL', 0.0)
                     
-                    results[ablation_mode]['samples'].append({
+                    # v8.0: 收集 entropy-gated 统计
+                    entropy_stats = {}
+                    if config['system'] == 'dki' and hasattr(response, 'metadata'):
+                        meta = response.metadata
+                        if hasattr(meta, 'entropy_triggered'):
+                            entropy_stats = {
+                                'entropy_triggered': meta.entropy_triggered,
+                                'entropy_probe_tokens': meta.entropy_probe_tokens,
+                                'entropy_retrievals': meta.entropy_retrievals,
+                                'fact_retrieve_method': meta.fact_retrieve_method,
+                            }
+                    
+                    sample_record = {
                         'query': query,
                         'response': response_text[:500],
                         'latency_ms': latency,
@@ -1901,7 +1970,11 @@ class ExperimentRunner:
                         'total_halluc': halluc['total_rate'],
                         'bleu4': bleu,
                         'rouge_l': rouge_l,
-                    })
+                    }
+                    if entropy_stats:
+                        sample_record['entropy_stats'] = entropy_stats
+                    
+                    results[ablation_mode]['samples'].append(sample_record)
                     results[ablation_mode]['latencies'].append(latency)
                     
                 except Exception as e:
@@ -1923,7 +1996,7 @@ class ExperimentRunner:
             bleu_scores = [s['bleu4'] for s in samples]
             rouge_scores = [s['rouge_l'] for s in samples]
             
-            summary[mode] = {
+            mode_summary = {
                 'sample_count': len(samples),
                 'memory_recall': float(np.mean(recalls)) if recalls else 0.0,
                 'fabricated_halluc_rate': float(np.mean(fab_rates)) if fab_rates else 0.0,
@@ -1934,6 +2007,27 @@ class ExperimentRunner:
                 'mean_latency_ms': float(np.mean(latencies)) if latencies else 0.0,
                 'p95_latency_ms': float(np.percentile(latencies, 95)) if latencies else 0.0,
             }
+            
+            # v8.0: entropy-gated 聚合统计
+            entropy_samples = [s for s in samples if 'entropy_stats' in s]
+            if entropy_samples:
+                triggered_count = sum(
+                    1 for s in entropy_samples if s['entropy_stats'].get('entropy_triggered')
+                )
+                total_retrievals = sum(
+                    s['entropy_stats'].get('entropy_retrievals', 0) for s in entropy_samples
+                )
+                mode_summary['entropy_stats'] = {
+                    'total_samples': len(entropy_samples),
+                    'triggered_count': triggered_count,
+                    'trigger_rate': triggered_count / len(entropy_samples) if entropy_samples else 0.0,
+                    'total_retrievals': total_retrievals,
+                    'avg_retrievals_per_triggered': (
+                        total_retrievals / triggered_count if triggered_count > 0 else 0.0
+                    ),
+                }
+            
+            summary[mode] = mode_summary
         
         results['summary'] = summary
         

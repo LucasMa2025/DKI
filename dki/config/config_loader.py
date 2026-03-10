@@ -173,6 +173,10 @@ class RAGConfig(BaseModel):
     top_k: int = 5
     similarity_threshold: float = 0.5
     index_type: str = "faiss"
+    # v7.1: 历史消息压缩策略
+    #   "truncate" (默认/baseline): 超预算时整条丢弃最旧消息
+    #   "compress" (production):    超预算时使用 SuffixBuilder 智能压缩 + trace_id 溯源
+    history_compression: str = "truncate"
 
 
 class EmbeddingConfig(BaseModel):
@@ -260,6 +264,25 @@ class EngineConfig(BaseModel):
     # v4.0: 是否启用 AGA 全局知识注入 (仅 vllm 引擎生效)
     aga_enabled: bool = False
     aga_config: Dict[str, Any] = Field(default_factory=dict)
+
+    # ============ 闭源模型配置 (仅 closed_source 引擎生效) ============
+    # api_key: API 密钥 (支持环境变量占位符, 如 "${DEEPSEEK_API_KEY}")
+    api_key: Optional[str] = None
+    # api_base: API 基础 URL
+    #   - OpenAI: https://api.openai.com/v1
+    #   - DeepSeek: https://api.deepseek.com/v1
+    #   - GLM (智谱): https://open.bigmodel.cn/api/paas/v4
+    #   - Moonshot: https://api.moonshot.cn/v1
+    #   - 本地 OpenAI 兼容服务: http://localhost:8000/v1
+    api_base: Optional[str] = None
+    # api_version: API 版本 (部分服务需要, 如 Azure OpenAI)
+    api_version: Optional[str] = None
+    # timeout: HTTP 请求超时时间 (秒)
+    timeout: float = 120.0
+    # max_retries: 最大重试次数
+    max_retries: int = 2
+    # default_system_prompt: 默认 system prompt (可选)
+    default_system_prompt: Optional[str] = None
 
 
 class ModelConfig(BaseModel):

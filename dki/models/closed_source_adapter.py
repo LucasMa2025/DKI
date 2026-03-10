@@ -538,6 +538,73 @@ class ClosedSourceAdapter:
         async for chunk_text in self._async_stream_api_call(request_body):
             yield chunk_text
 
+    # ================================================================
+    # Native Tool Calls (v7.1: 闭源模型原生 function calling)
+    # ================================================================
+
+    async def async_generate_with_tools(
+        self,
+        messages: List[Dict[str, Any]],
+        max_new_tokens: int = 2048,
+        temperature: float = 0.7,
+        tools: Optional[List[Dict]] = None,
+        tool_choice: str = "auto",
+        **kwargs,
+    ):
+        """
+        带 tools 的异步生成 (原生 function calling)
+
+        直接传入 messages 列表 (不需要 prompt 解析),
+        支持 tools 和 tool_choice 参数。
+
+        Returns:
+            ModelOutput, metadata 中包含 raw_message 和 finish_reason
+        """
+        start_time = time.time()
+
+        request_body = {
+            "model": self.model_name,
+            "messages": messages,
+            "max_tokens": max_new_tokens,
+            "temperature": temperature,
+        }
+        if tools:
+            request_body["tools"] = tools
+            request_body["tool_choice"] = tool_choice
+
+        response_data = await self._async_api_call(request_body)
+
+        text = ""
+        input_tokens = 0
+        output_tokens = 0
+        raw_message = {}
+        finish_reason = "stop"
+
+        if "choices" in response_data and response_data["choices"]:
+            choice = response_data["choices"][0]
+            raw_message = choice.get("message", {})
+            text = raw_message.get("content", "") or ""
+            finish_reason = choice.get("finish_reason", "stop")
+
+        if "usage" in response_data:
+            usage = response_data["usage"]
+            input_tokens = usage.get("prompt_tokens", 0)
+            output_tokens = usage.get("completion_tokens", 0)
+
+        latency_ms = (time.time() - start_time) * 1000
+
+        return self._make_output(
+            text=text,
+            latency_ms=latency_ms,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            metadata={
+                "model": response_data.get("model", self.model_name),
+                "finish_reason": finish_reason,
+                "raw_message": raw_message,  # 包含 tool_calls
+            },
+        )
+
     def stream_generate(
         self,
         prompt: str,

@@ -543,6 +543,104 @@ class MetricsCalculator:
             'max': float(np.max(arr)),
         }
     
+    def compute_entropy_retrieval_stats(
+        self,
+        samples: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """
+        计算 entropy-gated 检索统计指标 (v8.0).
+        
+        对齐论文 §4.4 Uncertainty-Driven Metacognitive Retrieval 的评估:
+        - trigger_rate: 熵门控触发率 (高熵样本占比)
+        - avg_retrievals: 平均每次触发的检索次数
+        - probe_overhead_ms: 探测阶段额外延迟
+        - retrieval_precision: 检索事实的相关性 (如果有 grounding 标注)
+        
+        Args:
+            samples: 包含 entropy_stats 字段的样本列表
+                每个样本应包含:
+                - entropy_stats.entropy_triggered: bool
+                - entropy_stats.entropy_probe_tokens: int
+                - entropy_stats.entropy_retrievals: int
+                - entropy_stats.fact_retrieve_method: str
+                - latency_ms: float (可选)
+                
+        Returns:
+            Dict with entropy retrieval statistics
+        """
+        if not samples:
+            return {
+                'total_samples': 0,
+                'entropy_gated_samples': 0,
+                'trigger_rate': 0.0,
+                'avg_retrievals_per_triggered': 0.0,
+                'total_retrievals': 0,
+                'avg_probe_tokens': 0.0,
+            }
+        
+        entropy_samples = [
+            s for s in samples
+            if 'entropy_stats' in s and s['entropy_stats']
+        ]
+        
+        if not entropy_samples:
+            return {
+                'total_samples': len(samples),
+                'entropy_gated_samples': 0,
+                'trigger_rate': 0.0,
+                'avg_retrievals_per_triggered': 0.0,
+                'total_retrievals': 0,
+                'avg_probe_tokens': 0.0,
+            }
+        
+        triggered = [
+            s for s in entropy_samples
+            if s['entropy_stats'].get('entropy_triggered', False)
+        ]
+        
+        total_retrievals = sum(
+            s['entropy_stats'].get('entropy_retrievals', 0)
+            for s in entropy_samples
+        )
+        
+        probe_tokens_list = [
+            s['entropy_stats'].get('entropy_probe_tokens', 0)
+            for s in entropy_samples
+        ]
+        
+        # 延迟对比: 触发 vs 未触发
+        triggered_latencies = [
+            s.get('latency_ms', 0) for s in triggered if s.get('latency_ms')
+        ]
+        non_triggered_latencies = [
+            s.get('latency_ms', 0)
+            for s in entropy_samples
+            if not s['entropy_stats'].get('entropy_triggered', False) and s.get('latency_ms')
+        ]
+        
+        stats = {
+            'total_samples': len(samples),
+            'entropy_gated_samples': len(entropy_samples),
+            'triggered_count': len(triggered),
+            'trigger_rate': len(triggered) / len(entropy_samples) if entropy_samples else 0.0,
+            'total_retrievals': total_retrievals,
+            'avg_retrievals_per_triggered': (
+                total_retrievals / len(triggered) if triggered else 0.0
+            ),
+            'avg_probe_tokens': float(np.mean(probe_tokens_list)) if probe_tokens_list else 0.0,
+        }
+        
+        if triggered_latencies:
+            stats['triggered_mean_latency_ms'] = float(np.mean(triggered_latencies))
+        if non_triggered_latencies:
+            stats['non_triggered_mean_latency_ms'] = float(np.mean(non_triggered_latencies))
+        if triggered_latencies and non_triggered_latencies:
+            stats['retrieval_overhead_ms'] = (
+                float(np.mean(triggered_latencies)) - float(np.mean(non_triggered_latencies))
+            )
+        
+        return stats
+
     def compute_all_metrics(
         self,
         responses: List[Dict[str, Any]],

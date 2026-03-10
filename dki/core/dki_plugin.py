@@ -395,9 +395,13 @@ class DKIPlugin:
             logger.warning(f"FunctionCallLogger init failed (non-critical): {fc_err}")
         
         # ============ Executor (纯执行, v3.3: O(1) forward pass) ============
+        # v7.1: 传递 fact_retriever, prompt_formatter, recall_config 以支持 inline_intercept
         self._executor = InjectionExecutor(
             model_adapter=model_adapter,
             function_call_logger=self._fc_logger,
+            fact_retriever=self._fact_retriever,
+            prompt_formatter=self._prompt_formatter,
+            recall_config=self._recall_config,
         )
         
         # ============ 偏好 K/V 缓存 (支持 Redis 分布式) ============
@@ -1008,12 +1012,47 @@ class DKIPlugin:
             # ============ Step 4: 执行注入计划 (Executor) ============
             injection_start = time.time()
             
-            result = await self._executor.execute(
-                plan=plan,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                **kwargs,
-            )
+            # v8.0: fact_retrieve_method 路由
+            fact_method = self._executor._get_fact_retrieve_method(plan)
+            
+            if (fact_method == "entropy_gated"
+                    and plan.has_fact_call_instruction
+                    and self._fact_retriever):
+                # Entropy-Gated: 两阶段生成 (probe + grounding)
+                logger.info(
+                    "[chat] entropy_gated mode: "
+                    "using two-stage generation with entropy monitoring"
+                )
+                result = await self._executor._execute_entropy_gated(
+                    plan=plan,
+                    prompt=plan.final_input,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    **kwargs,
+                )
+            elif (fact_method == "inline_intercept"
+                    and plan.has_fact_call_instruction
+                    and self._fact_retriever):
+                # Inline Intercept: stop 拦截
+                logger.info(
+                    "[chat] inline_intercept mode: "
+                    "using stop-token interception"
+                )
+                result = await self._executor._execute_inline_intercept(
+                    plan=plan,
+                    prompt=plan.final_input,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    **kwargs,
+                )
+            else:
+                # post_hoc / native_tool_calls / 无 fact call 指令
+                result = await self._executor.execute(
+                    plan=plan,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    **kwargs,
+                )
             
             # 从 result 填充 metadata
             metadata.inference_latency_ms = result.inference_latency_ms
@@ -1433,6 +1472,46 @@ class DKIPlugin:
             }
             
             # ============ Step 4: 流式执行 ============
+            # ---- v8.0: entropy_gated / inline_intercept 路由 ----
+            # 两者均不支持真正的流式, 回退到非流式后模拟流式输出
+            fact_method = self._executor._get_fact_retrieve_method(plan)
+            if (fact_method in ("entropy_gated", "inline_intercept")
+                    and plan.has_fact_call_instruction
+                    and self._fact_retriever):
+                logger.info(
+                    f"[chat_stream] {fact_method} mode: "
+                    "falling back to non-streaming execution"
+                )
+                if fact_method == "entropy_gated":
+                    result = await self._executor._execute_entropy_gated(
+                        plan=plan,
+                        prompt=plan.final_input,
+                        max_new_tokens=max_new_tokens,
+                        temperature=temperature,
+                        **kwargs,
+                    )
+                else:
+                    result = await self._executor._execute_inline_intercept(
+                        plan=plan,
+                        prompt=plan.final_input,
+                        max_new_tokens=max_new_tokens,
+                        temperature=temperature,
+                        **kwargs,
+                    )
+                clean_text, _ = strip_think_content(result.text)
+                metadata.latency_ms = (time.time() - start_time) * 1000
+                
+                # 模拟流式输出
+                yield {"type": "token", "content": clean_text}
+                yield {
+                    "type": "done",
+                    "text": clean_text,
+                    "input_tokens": result.input_tokens,
+                    "output_tokens": result.output_tokens,
+                    "metadata": metadata.to_dict(),
+                }
+                return
+            
             # 检查模型是否支持流式生成
             has_stream = (
                 hasattr(self.model, 'stream_generate')

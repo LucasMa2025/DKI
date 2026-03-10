@@ -46,6 +46,11 @@ from dki.core.plugin.injection_plan import (
     InjectionPlan,
     ExecutionResult,
 )
+from dki.core.recall.recall_config import (
+    RecallConfig,
+    RecallFactCallConfig,
+    FactResponse,
+)
 
 
 # ============================================================
@@ -298,6 +303,10 @@ class InjectionExecutor:
         model_adapter: BaseModelAdapter,
         # Function Call 日志记录器 (v3.2, 保留用于记录 Planner 侧事实解析)
         function_call_logger: Optional[Any] = None,
+        # ---- v7.1: inline_intercept 新增参数 ----
+        fact_retriever: Optional[Any] = None,
+        prompt_formatter: Optional[Any] = None,
+        recall_config: Optional[RecallConfig] = None,
     ):
         """
         初始化执行器
@@ -305,11 +314,19 @@ class InjectionExecutor:
         Args:
             model_adapter: LLM 模型适配器
             function_call_logger: Function Call 日志记录器 (可选)
+            fact_retriever: 事实检索器 (inline_intercept 模式使用)
+            prompt_formatter: Prompt 格式化器 (格式化检索到的事实)
+            recall_config: 召回配置 (获取 fact_retrieve_method 等参数)
         """
         self.model = model_adapter
         
         # Function Call 日志记录器
         self._fc_logger = function_call_logger
+        
+        # ---- v7.1: inline_intercept 依赖 ----
+        self._fact_retriever = fact_retriever
+        self._prompt_formatter = prompt_formatter
+        self._recall_config = recall_config
         
         # ============ 用户级隔离的偏好 K/V 缓存 (P0-2: BoundedUserKVCache) ============
         # 改进: 从无界 Dict 升级为有界 LRU 缓存
@@ -1317,3 +1334,471 @@ class InjectionExecutor:
             "kv_cache_bounded": cache_stats,
             "inference_guard_available": self._inference_guard is not None,
         }
+    
+    # ================================================================
+    # Inline Intercept Fact Retrieval (v7.1)
+    # ================================================================
+    
+    def _get_fact_retrieve_method(self, plan: Optional[InjectionPlan] = None) -> str:
+        """
+        获取 fact_retrieve_method 配置值
+        
+        优先级: recall_config > 默认 "post_hoc"
+        
+        支持的方法:
+        - "post_hoc": O(1) forward, F1-4 剥离残留 fact call
+        - "inline_intercept": stop 拦截 → 参数提取 → 检索 → continuation
+        - "entropy_gated": Generation + Entropy Monitoring → 高熵触发自主检索
+        - "native_tool_calls": OpenAI API 原生 tools 参数
+        - "auto": 闭源 → native_tool_calls, 开源 → entropy_gated
+        """
+        if self._recall_config and hasattr(self._recall_config, 'fact_call'):
+            method = self._recall_config.fact_call.fact_retrieve_method
+            if method == "auto":
+                # 自动推断: 闭源模型 → native_tool_calls, 开源 → entropy_gated
+                if getattr(self.model, 'is_closed_source', False):
+                    return "native_tool_calls"
+                return "entropy_gated"
+            return method
+        return "post_hoc"
+    
+    def _get_fact_call_config(self) -> RecallFactCallConfig:
+        """获取 fact_call 配置, 不存在则返回默认值"""
+        if self._recall_config and hasattr(self._recall_config, 'fact_call'):
+            return self._recall_config.fact_call
+        return RecallFactCallConfig()
+    
+    async def _execute_inline_intercept(
+        self,
+        plan: InjectionPlan,
+        prompt: str,
+        max_new_tokens: int,
+        temperature: float,
+        **kwargs,
+    ) -> ExecutionResult:
+        """
+        Inline Intercept Fact Retrieval (v7.1)
+        
+        核心流程:
+        1. generate(stop=["retrieve_fact("]) → 检测是否触发 fact call
+        2. 触发时: 短 generate(stop=[")"], max_tokens=64) 提取参数
+        3. FactRetriever.retrieve(trace_id) 获取事实
+        4. continuation generate (prefix caching 自动复用)
+        5. 循环直到正常结束或达到 max_rounds
+        
+        Token 预算优势:
+        - 事实替代 function call 的 token 位置
+        - prefix caching 复用前序 KV, 只需 prefill 事实部分
+        - 延迟公式: O(prompt×1) + O(fact_len×N)
+          vs post-hoc: O(prompt×N)
+        """
+        result = ExecutionResult()
+        fact_config = self._get_fact_call_config()
+        max_rounds = fact_config.inline_intercept_max_rounds
+        max_param_tokens = fact_config.inline_intercept_max_param_tokens
+        max_fact_tokens = fact_config.max_fact_tokens
+        total_fact_tokens = 0
+        
+        # Stop strings: 拦截 retrieve_fact(
+        stop_strings = ["retrieve_fact("]
+        
+        accumulated_text = ""
+        current_prompt = prompt
+        last_output = None
+        
+        inference_start = time.time()
+        
+        for round_idx in range(max_rounds):
+            # Round A: 生成到 stop 或正常结束
+            output = await self._model_generate(
+                prompt=current_prompt,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                stop=stop_strings,
+                **kwargs,
+            )
+            last_output = output
+            
+            generated_text = output.text or ""
+            accumulated_text += generated_text
+            
+            # 检查 finish_reason
+            finish_reason = "eos"
+            if hasattr(output, 'metadata') and isinstance(output.metadata, dict):
+                finish_reason = output.metadata.get('finish_reason', 'eos')
+            # 某些引擎用 stop_reason 而非 finish_reason
+            if finish_reason == "eos" and hasattr(output, 'metadata') and isinstance(output.metadata, dict):
+                finish_reason = output.metadata.get('stop_reason', finish_reason)
+            
+            # 额外检查: 文本是否以 stop string 结尾被截断
+            # (某些引擎不返回 finish_reason="stop", 但会截断文本)
+            text_ends_with_stop = any(
+                generated_text.rstrip().endswith(s.rstrip("("))
+                for s in stop_strings
+            )
+            
+            # 正常结束 (eos / length) 且未触发 stop → 返回
+            if finish_reason not in ("stop",) and not text_ends_with_stop:
+                break
+            
+            # 触发了 stop string → Round B: 短生成提取参数
+            param_prompt = current_prompt + generated_text + "retrieve_fact("
+            param_output = await self._model_generate(
+                prompt=param_prompt,
+                max_new_tokens=max_param_tokens,
+                temperature=0.0,  # 参数提取用 greedy
+                stop=[")"],
+                **kwargs,
+            )
+            
+            # 解析 trace_id
+            param_text = param_output.text or ""
+            trace_id = self._parse_trace_id(param_text)
+            if not trace_id:
+                logger.warning(
+                    f"Inline intercept round {round_idx + 1}: "
+                    f"failed to parse trace_id from: {param_text!r}"
+                )
+                break
+            
+            # 检索事实
+            session_id = plan.session_id or ""
+            fact_response = self._retrieve_fact(trace_id, session_id)
+            if not fact_response or not fact_response.messages:
+                logger.warning(
+                    f"Inline intercept round {round_idx + 1}: "
+                    f"no fact found for trace_id={trace_id}"
+                )
+                break
+            
+            # 格式化事实
+            fact_text = self._format_fact_for_continuation(fact_response)
+            fact_tokens = estimate_tokens_fast(fact_text)
+            total_fact_tokens += fact_tokens
+            
+            if total_fact_tokens > max_fact_tokens:
+                logger.info(
+                    f"Inline intercept: fact token budget exhausted "
+                    f"({total_fact_tokens}/{max_fact_tokens})"
+                )
+                break
+            
+            # Round C: Continuation — 拼接事实后继续生成
+            # prefix caching 自动复用 current_prompt + generated_text 的 KV
+            current_prompt = (
+                param_prompt + param_text + ")\n"
+                + fact_text + "\n"
+            )
+            
+            logger.info(
+                f"Inline intercept round {round_idx + 1}: "
+                f"trace_id={trace_id}, fact_tokens={fact_tokens}, "
+                f"total_fact_tokens={total_fact_tokens}"
+            )
+            
+            # 记录到 function call logger
+            if self._fc_logger:
+                try:
+                    self._fc_logger.log(
+                        event="inline_intercept_fact_call",
+                        round=round_idx + 1,
+                        trace_id=trace_id,
+                        fact_tokens=fact_tokens,
+                    )
+                except Exception:
+                    pass
+        
+        result.inference_latency_ms = (time.time() - inference_start) * 1000
+        result.text = accumulated_text
+        if last_output:
+            result.input_tokens = last_output.input_tokens
+            result.output_tokens = last_output.output_tokens
+            result.raw_output = last_output
+        
+        # 统计
+        self._stats.setdefault("inline_intercept_executions", 0)
+        self._stats["inline_intercept_executions"] += 1
+        self._stats.setdefault("inline_intercept_fact_tokens", 0)
+        self._stats["inline_intercept_fact_tokens"] += total_fact_tokens
+        
+        # F1-4: 防御性拦截 — 剥离可能残留的 retrieve_fact 调用
+        result.text, fact_stripped = _strip_retrieve_fact_calls(result.text)
+        if fact_stripped > 0:
+            logger.info(
+                f"F1-4: Stripped {fact_stripped} residual retrieve_fact call(s) "
+                f"from inline_intercept output"
+            )
+            self._stats.setdefault("fact_calls_stripped", 0)
+            self._stats["fact_calls_stripped"] += fact_stripped
+        
+        return result
+    
+    # ================================================================
+    # Inline Intercept 辅助方法
+    # ================================================================
+    
+    @staticmethod
+    def _parse_trace_id(param_text: str) -> Optional[str]:
+        """
+        从参数文本中解析 trace_id
+        
+        容错多种格式:
+        - trace_id="abc123"
+        - trace_id='abc123'
+        - "abc123"
+        - abc123
+        """
+        if not param_text:
+            return None
+        # 尝试 key=value 格式
+        m = re.search(r'trace_id\s*=\s*["\']?([a-zA-Z0-9_-]+)', param_text)
+        if m:
+            return m.group(1)
+        # 尝试纯字符串 (带引号)
+        m = re.search(r'["\']([a-zA-Z0-9_-]+)["\']', param_text)
+        if m:
+            return m.group(1)
+        # 尝试纯 ID (至少 4 字符)
+        m = re.search(r'([a-zA-Z0-9_-]{4,})', param_text)
+        if m:
+            return m.group(1)
+        return None
+    
+    def _retrieve_fact(
+        self, trace_id: str, session_id: str
+    ) -> Optional[FactResponse]:
+        """调用 FactRetriever 获取事实"""
+        if not self._fact_retriever:
+            logger.warning("Inline intercept: no fact_retriever configured")
+            return None
+        try:
+            return self._fact_retriever.retrieve(
+                trace_id=trace_id,
+                session_id=session_id,
+            )
+        except Exception as e:
+            logger.warning(f"Inline intercept fact retrieval failed: {e}")
+            return None
+    
+    def _format_fact_for_continuation(self, fact_response: FactResponse) -> str:
+        """格式化事实为 continuation 文本"""
+        if self._prompt_formatter and hasattr(self._prompt_formatter, 'format_fact_segment'):
+            try:
+                return self._prompt_formatter.format_fact_segment(fact_response)
+            except Exception as e:
+                logger.warning(f"format_fact_segment failed, using fallback: {e}")
+        
+        # 回退: 简单格式
+        parts = ["[事实内容]"]
+        for msg in fact_response.messages:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            parts.append(f"  {role}: {content}")
+        parts.append("[/事实]")
+        return "\n".join(parts)
+    
+    # ================================================================
+    # Entropy-Gated Fact Retrieval (v8.0)
+    # ================================================================
+    
+    async def _execute_entropy_gated(
+        self,
+        plan: InjectionPlan,
+        prompt: str,
+        max_new_tokens: int,
+        temperature: float,
+        **kwargs,
+    ) -> ExecutionResult:
+        """
+        Entropy-Gated Metacognitive Fact Retrieval (v8.0)
+        
+        核心创新: 用 Shannon entropy 作为元认知信号替代 function call 拦截.
+        模型在生成过程中自然表现出的不确定性 (高 logits 熵) 被解读为
+        "模型知道自己不知道" — 即元认知监控中的 FOK (Feeling of Knowing).
+        
+        两阶段生成流程:
+        Stage 1 (Probe): 短生成 (默认 64 tokens) + logprobs
+          → 计算逐 token 熵, 检测熵突增
+          → 如无高熵: 直接 continuation 生成剩余 tokens
+        Stage 2 (Grounding): 仅在高熵触发时执行
+          → 基于已生成上下文 + 原始查询检索相关记忆
+          → 注入事实 grounding 到 prompt
+          → 重新生成完整回复
+        
+        理论基础:
+        - Shannon entropy 量化 token 分布的不确定性
+        - 高熵 ≈ 模型在多个 token 间犹豫 → 可能缺乏事实支撑
+        - 滑动窗口相对熵突增比绝对阈值更鲁棒 (跨模型泛化)
+        
+        与 inline_intercept 的区别:
+        - 触发信号: 信息论内部状态 vs 文本 pattern matching
+        - 模型要求: 任何支持 logprobs 的 LLM vs 需要学会生成 function call
+        - 认知对应: 元认知不确定性感知 vs 工程拦截
+        """
+        from dki.core.entropy_gated_injection import (
+            EGDMIConfig,
+            EGDMIController,
+        )
+        
+        result = ExecutionResult()
+        fact_config = self._get_fact_call_config()
+        
+        # 从 recall_config 读取 entropy 配置
+        egdmi_config = EGDMIConfig(
+            entropy_check_interval=8,
+            entropy_window_size=getattr(fact_config, 'entropy_window_size', 32),
+            entropy_spike_threshold=getattr(
+                fact_config, 'entropy_spike_threshold', 1.5
+            ),
+            entropy_absolute_threshold=getattr(
+                fact_config, 'entropy_absolute_threshold', 3.0
+            ),
+            max_retrieval_per_generation=getattr(
+                fact_config, 'entropy_max_retrievals', 2
+            ),
+        )
+        
+        controller = EGDMIController(config=egdmi_config)
+        
+        # 设置记忆检索器 (如果有 fact_retriever)
+        if self._fact_retriever:
+            controller.set_retriever(memory_recall=None)
+        
+        probe_tokens = getattr(fact_config, 'entropy_probe_tokens', 64)
+        logprobs_k = getattr(fact_config, 'entropy_logprobs_k', 5)
+        
+        inference_start = time.time()
+        
+        # ============ Stage 1: Probe Generation ============
+        # 短生成 + logprobs, 检测熵突增
+        probe_output = await self._model_generate(
+            prompt=prompt,
+            max_new_tokens=probe_tokens,
+            temperature=temperature,
+            logprobs=logprobs_k,
+            **kwargs,
+        )
+        
+        probe_text = probe_output.text or ""
+        entropy_triggered = False
+        grounding = None
+        
+        # 分析 probe 阶段的 logprobs 熵
+        if hasattr(probe_output, 'logprobs') and probe_output.logprobs:
+            session_id = plan.session_id or ""
+            callback = controller.create_entropy_callback(
+                original_query=plan.original_query,
+                session_id=session_id,
+                user_id=plan.user_id,
+            )
+            
+            for token_logprobs in probe_output.logprobs:
+                cb_result = callback(token_logprobs, "")
+                if cb_result and cb_result.facts:
+                    entropy_triggered = True
+                    grounding = cb_result
+                    break
+        
+        if entropy_triggered and grounding and grounding.facts:
+            # ============ Stage 2: Re-generate with Grounding ============
+            # 注入检索到的事实作为 grounding context
+            grounding_text = (
+                "Relevant facts for your reference (retrieved due to "
+                "high uncertainty detected):\n"
+            )
+            for i, fact in enumerate(grounding.facts, 1):
+                grounding_text += f"[Fact {i}] {fact}\n"
+            grounding_text += (
+                "Please use these facts in your response.\n"
+            )
+            
+            # 在 prompt 中注入 grounding
+            enhanced_prompt = controller.inject_grounding_into_prompt(
+                prompt, grounding
+            )
+            
+            # 完整重新生成
+            full_output = await self._model_generate(
+                prompt=enhanced_prompt,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                **kwargs,
+            )
+            
+            result.inference_latency_ms = (
+                (time.time() - inference_start) * 1000
+            )
+            result.text = full_output.text or ""
+            result.input_tokens = full_output.input_tokens
+            result.output_tokens = full_output.output_tokens
+            result.raw_output = full_output
+            
+            logger.info(
+                f"[Entropy-Gated] Stage 2 triggered: "
+                f"{len(grounding.facts)} facts retrieved, "
+                f"trace_ids={grounding.source_trace_ids}"
+            )
+            
+            # 记录 function call logger
+            if self._fc_logger:
+                try:
+                    self._fc_logger.log(
+                        event="entropy_gated_fact_retrieval",
+                        facts_count=len(grounding.facts),
+                        trace_ids=grounding.source_trace_ids,
+                        relevance_scores=grounding.relevance_scores,
+                    )
+                except Exception:
+                    pass
+        else:
+            # ============ No Entropy Spike: Continuation ============
+            if probe_output.output_tokens >= max_new_tokens:
+                # Probe 已生成足够 tokens
+                result.inference_latency_ms = (
+                    (time.time() - inference_start) * 1000
+                )
+                result.text = probe_text
+                result.input_tokens = probe_output.input_tokens
+                result.output_tokens = probe_output.output_tokens
+                result.raw_output = probe_output
+            else:
+                # 继续生成剩余 tokens (prefix continuation)
+                remaining_tokens = max_new_tokens - probe_output.output_tokens
+                continuation_prompt = prompt + probe_text
+                
+                cont_output = await self._model_generate(
+                    prompt=continuation_prompt,
+                    max_new_tokens=remaining_tokens,
+                    temperature=temperature,
+                    **kwargs,
+                )
+                
+                full_text = probe_text + (cont_output.text or "")
+                result.inference_latency_ms = (
+                    (time.time() - inference_start) * 1000
+                )
+                result.text = full_text
+                result.input_tokens = cont_output.input_tokens
+                result.output_tokens = (
+                    probe_output.output_tokens + cont_output.output_tokens
+                )
+                result.raw_output = cont_output
+        
+        # 统计
+        self._stats.setdefault("entropy_gated_executions", 0)
+        self._stats["entropy_gated_executions"] += 1
+        self._stats.setdefault("entropy_gated_triggers", 0)
+        if entropy_triggered:
+            self._stats["entropy_gated_triggers"] += 1
+        
+        # F1-4: 防御性拦截 — 剥离可能残留的 retrieve_fact 调用
+        result.text, fact_stripped = _strip_retrieve_fact_calls(result.text)
+        if fact_stripped > 0:
+            logger.info(
+                f"F1-4: Stripped {fact_stripped} residual retrieve_fact "
+                f"call(s) from entropy_gated output"
+            )
+            self._stats.setdefault("fact_calls_stripped", 0)
+            self._stats["fact_calls_stripped"] += fact_stripped
+        
+        return result

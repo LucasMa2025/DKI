@@ -13,7 +13,7 @@ Attention-Level Memory Augmentation for Large Language Models
     app.add_middleware(DKIMiddleware, adapter_config_path="config/adapter.yaml")
 
 Author: AGI Demo Project
-Version: 4.0.0
+Version: 8.0.0
 """
 
 from dki.core.dki_system import DKISystem
@@ -27,7 +27,7 @@ except ImportError:
     # 允许在最小依赖下运行 (不依赖 FastAPI)
     pass
 
-__version__ = "4.0.0"
+__version__ = "8.0.0"
 __all__ = [
     # 核心系统
     "DKISystem",

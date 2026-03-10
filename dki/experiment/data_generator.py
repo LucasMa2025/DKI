@@ -372,7 +372,8 @@ class ExperimentDataGenerator:
             "Suggest a career development path.",
         ]
         
-        alpha_values = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+        # v8.0: 对齐论文 Table 4 的 α 取值
+        alpha_values = [0.0, 0.3, 0.4, 0.5, 0.6, 0.7, 1.0]
         
         data = []
         
@@ -647,15 +648,16 @@ class ExperimentDataGenerator:
         n_samples: int = 50,
     ) -> List[Dict[str, Any]]:
         """
-        生成消融实验数据
+        生成消融实验数据 — 对齐论文 Table 3 的 7 种配置
         
-        测试 DKI 各组件的贡献:
-        - Full DKI (偏好 K/V + 历史后缀 + 门控)
-        - No Gating (固定 α=1.0)
-        - No History (仅偏好 K/V, 无历史后缀)
-        - No Preference (仅历史后缀, 无偏好 K/V) 
-        - RAG Baseline
-        - No Memory Baseline
+        v8.0 配置:
+        - full_dki:              完整 DKI (Recall v4 + entropy-gated 事实召回)
+        - wo_fact_call:          去除 Fact Call (禁用 entropy-gated 事实检索循环)
+        - wo_multi_signal:       去除多信号召回 (仅用向量检索)
+        - wo_kv_injection:       去除 K/V 注入 (偏好放入 prompt)
+        - stable_fallback_only:  仅 Stable 策略 (偏好 K/V + 固定 N 轮窗口)
+        - rag_baseline:          RAG 对照
+        - vanilla_llm:           无记忆基线
         """
         memories_cn = [
             "用户是素食主义者，不吃肉类和海鲜。",
@@ -678,13 +680,15 @@ class ExperimentDataGenerator:
              "reference_answer": "你住在海淀区中关村附近，喜欢徒步和骑行，附近有圆明园、颐和园适合骑行，百望山适合徒步。"},
         ]
         
+        # v8.0: 对齐论文 Table 3 的 7 种消融配置
         ablation_modes = [
-            "full_dki",           # 完整 DKI
-            "no_gating",          # 无门控 (固定 α=1.0)
-            "no_history",         # 无历史后缀
-            "no_preference_kv",   # 无偏好 K/V
-            "rag_baseline",       # RAG 对照
-            "no_memory",          # 无记忆基线
+            "full_dki",              # 完整 DKI (Recall v4 + entropy-gated)
+            "wo_fact_call",          # 去除 Fact Call (禁用 entropy-gated 检索)
+            "wo_multi_signal",       # 去除多信号召回 (仅向量检索)
+            "wo_kv_injection",       # 去除 K/V 注入 (偏好放入 prompt)
+            "stable_fallback_only",  # 仅 Stable 策略
+            "rag_baseline",          # RAG 对照
+            "vanilla_llm",           # 无记忆基线
         ]
         
         data = []
@@ -1075,7 +1079,9 @@ class ExperimentDataGenerator:
         - context_budget: 上下文预算 (4096)
         """
         if memory_lengths is None:
-            memory_lengths = [500, 1000, 1500, 2000, 2500, 3000, 3500]
+            # v8.0: 对齐论文 Table 2 的 memory 长度范围
+            # 论文关注 2000+ tokens 下 DKI 优势显著的区间
+            memory_lengths = [1000, 1500, 2000, 2500, 3000, 3500]
         
         # 记忆片段池 — 每条约 50-100 tokens
         memory_fragments_cn = [

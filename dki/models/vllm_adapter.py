@@ -455,6 +455,52 @@ class VLLMAdapter(BaseModelAdapter):
         return stop_strings
     
     # ================================================================
+    # Logprobs 解析 (v8.0 熵门控)
+    # ================================================================
+    
+    @staticmethod
+    def _parse_vllm_logprobs(
+        raw_logprobs: list,
+    ) -> List[List[float]]:
+        """
+        将 vLLM 返回的 logprobs 转换为 EntropyMonitor 所需的格式.
+        
+        vLLM logprobs 格式 (per token):
+            List[Dict[int, Logprob]]
+            其中 Logprob 是 NamedTuple/dataclass, 有 .logprob 属性
+            
+        转换为:
+            List[List[float]]  — 每个 token 的 top-k log probabilities
+            
+        兼容性:
+            - vLLM >= 0.4.x: Logprob 对象有 .logprob 属性
+            - 旧版本: Logprob 可能直接是 float
+            - dict value 可能是 float 而非对象
+        """
+        result = []
+        for token_logprobs in raw_logprobs:
+            if token_logprobs is None:
+                continue
+            token_lps = []
+            if isinstance(token_logprobs, dict):
+                for _token_id, lp in token_logprobs.items():
+                    if hasattr(lp, 'logprob'):
+                        # vLLM Logprob 对象
+                        token_lps.append(lp.logprob)
+                    elif isinstance(lp, (int, float)):
+                        # 直接是数值
+                        token_lps.append(float(lp))
+                    else:
+                        # 尝试 float 转换
+                        try:
+                            token_lps.append(float(lp))
+                        except (TypeError, ValueError):
+                            continue
+            if token_lps:
+                result.append(token_lps)
+        return result
+    
+    # ================================================================
     # 核心推理接口
     # ================================================================
     
@@ -489,21 +535,40 @@ class VLLMAdapter(BaseModelAdapter):
         else:
             formatted_prompt = prompt
         
-        sampling_params = SamplingParams(
-            temperature=temperature,
-            top_p=top_p,
-            max_tokens=max_new_tokens,
-            stop=self._get_stop_strings(),
-        )
+        # ============ logprobs 支持 (v8.0 熵门控) ============
+        # 熵门控路径 (_execute_entropy_gated) 传递 logprobs=k,
+        # 需要将此参数转发到 vLLM SamplingParams.
+        # vLLM SamplingParams 原生支持 logprobs 参数:
+        #   logprobs=None (不返回) 或 logprobs=k (返回 top-k log probs)
+        logprobs_k = kwargs.get('logprobs', None)
+        
+        sp_kwargs = {
+            'temperature': temperature,
+            'top_p': top_p,
+            'max_tokens': max_new_tokens,
+            'stop': self._get_stop_strings(),
+        }
+        if logprobs_k is not None:
+            sp_kwargs['logprobs'] = logprobs_k
+        
+        sampling_params = SamplingParams(**sp_kwargs)
         
         outputs = self.llm.generate([formatted_prompt], sampling_params)
         output = outputs[0]
         
         end_time = time.perf_counter()
         
+        # ============ 提取 logprobs (v8.0) ============
+        # vLLM 返回 output.outputs[0].logprobs: List[Dict[int, Logprob]]
+        # 转换为 List[List[float]] 供 EntropyMonitor 使用
+        parsed_logprobs = None
+        if logprobs_k is not None and hasattr(output.outputs[0], 'logprobs') and output.outputs[0].logprobs:
+            parsed_logprobs = self._parse_vllm_logprobs(output.outputs[0].logprobs)
+        
         return ModelOutput(
             text=output.outputs[0].text,
             tokens=list(output.outputs[0].token_ids),
+            logprobs=parsed_logprobs,
             latency_ms=(end_time - start_time) * 1000,
             input_tokens=len(output.prompt_token_ids),
             output_tokens=len(output.outputs[0].token_ids),

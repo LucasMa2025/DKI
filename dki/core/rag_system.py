@@ -14,6 +14,7 @@ v6.0 更新:
 """
 
 import asyncio
+import json
 import time
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
@@ -45,8 +46,45 @@ from dki.database.repository import (
     UserPreferenceRepository,
 )
 from dki.config.config_loader import ConfigLoader
+from dki.core.recall.recall_config import RecallConfig, RecallFactCallConfig, FactResponse
 
 from collections import OrderedDict
+
+
+# ============================================================
+# retrieve_fact 工具定义 (闭源模型 native tool_calls 用)
+# ============================================================
+
+RETRIEVE_FACT_TOOL_DEF = {
+    "type": "function",
+    "function": {
+        "name": "retrieve_fact",
+        "description": (
+            "当回答需要精确原话、具体数值、时间、因果关系，"
+            "且当前摘要中未明确包含时，调用此函数获取原始记录。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "trace_id": {
+                    "type": "string",
+                    "description": "消息溯源 ID (从 [SUMMARY] 标记中获取)",
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "分页偏移 (默认 0)",
+                    "default": 0,
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "返回条数 (默认 5)",
+                    "default": 5,
+                },
+            },
+            "required": ["trace_id"],
+        },
+    },
+}
 
 
 # ============================================================
@@ -260,6 +298,13 @@ class RAGSystem:
         self._preference_cache_ttl = _ttl
         self._preference_single_flight: Dict[str, asyncio.Future] = {}
         
+        # v7.1: 历史消息压缩组件 (仅 compress 模式初始化)
+        self._suffix_builder = None
+        self._recall_config_obj = None
+        self._prompt_formatter_obj = None
+        if getattr(self.config.rag, 'history_compression', 'truncate') == 'compress':
+            self._init_suffix_builder()
+        
         # 统计
         self._stats: Dict[str, Any] = {
             "total_requests": 0,
@@ -270,7 +315,11 @@ class RAGSystem:
             "errors": 0,
         }
         
-        logger.info("RAG System initialized (v6.0: async + streaming + preference cache)")
+        _mode = getattr(self.config.rag, 'history_compression', 'truncate')
+        logger.info(
+            f"RAG System initialized (v7.1: async + streaming + preference cache, "
+            f"history_compression={_mode})"
+        )
     
     @property
     def model(self) -> BaseModelAdapter:
@@ -278,6 +327,72 @@ class RAGSystem:
         if self._model_adapter is None:
             self._model_adapter = ModelFactory.get_or_create(engine=self._engine)
         return self._model_adapter
+    
+    def _init_suffix_builder(self):
+        """
+        v7.1: 初始化 SuffixBuilder (仅 compress 模式使用)
+        
+        复用 DKI 的 recall 组件:
+        - RecallConfig: 从 config.dki.recall 读取
+        - PromptFormatter: 根据模型名自动选择
+        - SuffixBuilder: 智能压缩 + trace_id 溯源
+        """
+        try:
+            from dki.core.recall import (
+                RecallConfig,
+                SuffixBuilder,
+                create_formatter,
+            )
+            
+            # 从配置加载 recall config
+            recall_dict = {}
+            if hasattr(self.config, 'dki') and hasattr(self.config.dki, 'recall'):
+                recall_obj = self.config.dki.recall
+                if isinstance(recall_obj, dict):
+                    recall_dict = recall_obj
+                elif hasattr(recall_obj, 'model_dump'):
+                    recall_dict = recall_obj.model_dump()
+                elif hasattr(recall_obj, 'dict'):
+                    recall_dict = recall_obj.dict()
+            self._recall_config_obj = RecallConfig.from_dict(recall_dict)
+            
+            # 创建 PromptFormatter
+            model_name = ''
+            if self._model_adapter:
+                model_name = getattr(self._model_adapter, 'model_name', '') or ''
+            self._prompt_formatter_obj = create_formatter(
+                model_name=model_name,
+                formatter_type=self._recall_config_obj.prompt_formatter,
+                language='cn',
+            )
+            
+            # 创建 SuffixBuilder
+            token_counter = None
+            if self._model_adapter and hasattr(self._model_adapter, 'tokenizer'):
+                tokenizer = self._model_adapter.tokenizer
+                if tokenizer:
+                    token_counter = lambda text: len(tokenizer.encode(text)) if text else 0
+            self._suffix_builder = SuffixBuilder(
+                config=self._recall_config_obj,
+                prompt_formatter=self._prompt_formatter_obj,
+                token_counter=token_counter,
+                model_adapter=self._model_adapter,
+            )
+            
+            logger.info(
+                "RAG compress mode: SuffixBuilder initialized "
+                f"(formatter={type(self._prompt_formatter_obj).__name__})"
+            )
+        except ImportError:
+            logger.warning(
+                "RAG compress mode: recall components not available, "
+                "falling back to truncate mode"
+            )
+        except Exception as e:
+            logger.warning(
+                f"RAG compress mode: SuffixBuilder init failed ({e}), "
+                "falling back to truncate mode"
+            )
     
     def add_memory(
         self,
@@ -408,7 +523,7 @@ class RAGSystem:
         memories: List[MemorySearchResult],
         system_prompt: Optional[str] = None,
         history: Optional[List[Dict[str, str]]] = None,
-    ) -> tuple:
+    ) -> Tuple[str, "RAGPromptInfo", Dict[str, Any]]:
         """
         Build prompt with retrieved memories and conversation history.
         
@@ -422,20 +537,39 @@ class RAGSystem:
         
         Includes automatic truncation to prevent exceeding model context length.
         
+        v7.1: 新增 compress 模式 (history_compression="compress")
+        - 超预算的历史消息使用 SuffixBuilder 智能压缩
+        - 压缩后的消息保留 trace_id, 支持 retrieve_fact 溯源
+        - 返回值扩展为三元组: (prompt, prompt_info, compression_meta)
+        
         Args:
             query: User query
             memories: Retrieved memories
             system_prompt: Optional system prompt
-            history: Optional conversation history [{"role": "user/assistant", "content": "..."}]
+            history: Optional conversation history
+                     [{"role": "user/assistant", "content": "...", "id": "..."}]
             
         Returns:
-            Tuple of (formatted_prompt, RAGPromptInfo)
+            Tuple of (formatted_prompt, RAGPromptInfo, compression_meta)
+            compression_meta 包含:
+            - trace_ids: List[str] — 被压缩消息的 trace_id 列表
+            - has_fact_call_instruction: bool — 是否包含 fact call 指导
+            - summary_count: int — 被压缩的消息数量
+            - compression_mode: str — "truncate" | "compress"
         """
         # v5.7: 获取模型最大上下文长度, 生成预留 = 30% 上下文
         max_context = self._get_max_context_length()
         generation_reserve = int(max_context * 0.30)
         tag_overhead = 120  # chat template 标记开销
         max_prompt_tokens = max_context - generation_reserve - tag_overhead
+        
+        # 压缩元数据 (默认: 无压缩)
+        compression_meta: Dict[str, Any] = {
+            "trace_ids": [],
+            "has_fact_call_instruction": False,
+            "summary_count": 0,
+            "compression_mode": "truncate",
+        }
         
         # 用于记录的信息
         prompt_info = RAGPromptInfo(
@@ -467,10 +601,42 @@ class RAGSystem:
         elif context_text:
             full_system_prompt = f"Relevant information:\n{context_text}"
         
-        # === 3. 构建 conversation history (截断最旧的) ===
+        # === 3. 构建 conversation history ===
+        # 计算可用 token 预算
+        system_tokens = self._estimate_tokens(full_system_prompt) if full_system_prompt else 0
+        query_tokens = self._estimate_tokens(query)
+        remaining_tokens = max(max_prompt_tokens - system_tokens - query_tokens - 40, 0)
+        
         history_parts = []
         selected_history_msgs = []
-        if history:
+        
+        # 判断压缩模式
+        compression_mode = getattr(self.config.rag, 'history_compression', 'truncate')
+        use_compress = (
+            compression_mode == 'compress'
+            and self._suffix_builder is not None
+            and history
+        )
+        
+        if history and use_compress:
+            # ---- compress 模式: 使用 SuffixBuilder 智能压缩 ----
+            compression_meta["compression_mode"] = "compress"
+            selected_history_msgs, compression_meta = self._compress_history_with_suffix_builder(
+                history=history,
+                query=query,
+                remaining_tokens=remaining_tokens,
+                compression_meta=compression_meta,
+            )
+            
+            if selected_history_msgs:
+                for msg in selected_history_msgs:
+                    role = "User" if msg["role"] == "user" else "Assistant"
+                    history_parts.append(f"{role}: {msg['content']}")
+        
+        elif history:
+            # ---- truncate 模式 (默认/baseline): 整条丢弃最旧消息 ----
+            compression_meta["compression_mode"] = "truncate"
+            
             # v5.7: 移除历史消息中的 <think> 推理内容
             cleaned_history = []
             for msg in history:
@@ -482,11 +648,6 @@ class RAGSystem:
                     else:
                         continue  # 清理后为空, 跳过
                 cleaned_history.append(cleaned_msg)
-            
-            # 粗估可用 token 预算 (直接估算, 不预留)
-            system_tokens = self._estimate_tokens(full_system_prompt) if full_system_prompt else 0
-            query_tokens = self._estimate_tokens(query)
-            remaining_tokens = max_prompt_tokens - system_tokens - query_tokens - 40
             
             # 从最新开始，保留尽可能多的历史
             used_tokens = 0
@@ -564,13 +725,109 @@ class RAGSystem:
             prompt_info.history_text = ""
             prompt_info.retrieved_context = ""
         
-        return final_prompt, prompt_info
+        return final_prompt, prompt_info, compression_meta
+    
+    def _compress_history_with_suffix_builder(
+        self,
+        history: List[Dict[str, str]],
+        query: str,
+        remaining_tokens: int,
+        compression_meta: Dict[str, Any],
+    ) -> Tuple[List[Dict[str, str]], Dict[str, Any]]:
+        """
+        v7.1: 使用 SuffixBuilder 智能压缩历史消息
+        
+        将 RAG 的 history dict 列表适配为 SuffixBuilder 可接受的输入,
+        调用 SuffixBuilder.build() 获得压缩结果, 然后还原为 messages 列表。
+        
+        Args:
+            history: 历史消息列表 [{"role", "content", "id"(可选)}]
+            query: 当前查询 (用于 Query-Aware 评分)
+            remaining_tokens: 可用 token 预算
+            compression_meta: 压缩元数据 (将被更新)
+            
+        Returns:
+            (selected_msgs, updated_compression_meta)
+        """
+        from types import SimpleNamespace
+        
+        try:
+            # 将 dict 包装为 SimpleNamespace (SuffixBuilder 通过 getattr 访问)
+            wrapped_messages = []
+            for msg in history:
+                ns = SimpleNamespace(
+                    content=msg.get('content', ''),
+                    role=msg.get('role', 'user'),
+                    id=msg.get('id', str(id(msg))),
+                    message_id=msg.get('id', str(id(msg))),
+                )
+                wrapped_messages.append(ns)
+            
+            # 调用 SuffixBuilder
+            suffix_result = self._suffix_builder.build(
+                query=query,
+                recalled_messages=wrapped_messages,
+                context_window=remaining_tokens + 200,  # +200 补偿 SuffixBuilder 内部的预留
+                preference_tokens=0,
+            )
+            
+            # 从 AssembledSuffix.items 还原为 messages 列表
+            selected_msgs = []
+            for item in suffix_result.items:
+                selected_msgs.append({
+                    "role": item.role or "user",
+                    "content": item.content,
+                })
+            
+            # 更新压缩元数据
+            compression_meta["trace_ids"] = suffix_result.trace_ids
+            compression_meta["has_fact_call_instruction"] = suffix_result.has_fact_call_instruction
+            compression_meta["summary_count"] = suffix_result.summary_count
+            
+            if suffix_result.summary_count > 0:
+                logger.info(
+                    f"RAG compress mode: {suffix_result.message_count} msgs kept, "
+                    f"{suffix_result.summary_count} msgs compressed, "
+                    f"trace_ids={suffix_result.trace_ids}, "
+                    f"total_tokens={suffix_result.total_tokens}"
+                )
+            
+            return selected_msgs, compression_meta
+        
+        except Exception as e:
+            logger.warning(
+                f"RAG compress mode failed ({e}), falling back to truncate"
+            )
+            # 降级: 使用 truncate 逻辑
+            compression_meta["compression_mode"] = "truncate"
+            cleaned = []
+            for msg in history:
+                cleaned_msg = dict(msg)
+                if cleaned_msg.get('role') == 'assistant' and cleaned_msg.get('content'):
+                    cleaned_content, _ = strip_think_content(cleaned_msg['content'])
+                    if cleaned_content and cleaned_content.strip():
+                        cleaned_msg['content'] = cleaned_content
+                    else:
+                        continue
+                cleaned.append(cleaned_msg)
+            
+            selected = []
+            used = 0
+            for msg in reversed(cleaned):
+                t = self._estimate_tokens(msg['content']) + 8
+                if used + t > remaining_tokens:
+                    break
+                selected.insert(0, msg)
+                used += t
+            
+            return selected, compression_meta
     
     def _get_conversation_history(
         self,
         session_id: str,
         max_turns: int = 5,
         user_id: Optional[str] = None,
+        include_ids: bool = False,
     ) -> List[Dict[str, str]]:
         """
         Get conversation history for a session, with cross-session support.
@@ -580,10 +837,14 @@ class RAGSystem:
         - 然后获取当前会话的历史消息
         - 跨会话消息在前, 当前会话消息在后
         
+        v7.1: include_ids=True 时, 每条消息额外携带 "id" 字段
+              用于 compress 模式下 SuffixBuilder 的 trace_id 溯源
+        
         Args:
             session_id: Session identifier
             max_turns: Maximum number of conversation turns to retrieve
             user_id: User identifier (optional, for cross-session retrieval)
+            include_ids: If True, include message ID in each dict
             
         Returns:
             List of conversation messages
@@ -603,7 +864,10 @@ class RAGSystem:
                         limit=cross_session_limit * 2,  # 每轮 user+assistant
                     )
                     for msg in cross_msgs:
-                        result.append({"role": msg.role, "content": msg.content})
+                        entry = {"role": msg.role, "content": msg.content}
+                        if include_ids:
+                            entry["id"] = getattr(msg, 'id', str(id(msg)))
+                        result.append(entry)
                     if cross_msgs:
                         logger.info(
                             f"RAG cross-session: added {len(cross_msgs)} messages "
@@ -615,7 +879,10 @@ class RAGSystem:
             # 当前会话历史
             messages = conv_repo.get_recent(session_id, n_turns=max_turns)
             for msg in messages:
-                result.append({"role": msg.role, "content": msg.content})
+                entry = {"role": msg.role, "content": msg.content}
+                if include_ids:
+                    entry["id"] = getattr(msg, 'id', str(id(msg)))
+                result.append(entry)
         
         return result
     
@@ -811,12 +1078,14 @@ class RAGSystem:
         max_history_turns: Optional[int],
         include_history: bool,
         preference_text: Optional[str] = None,
-    ) -> Tuple[str, RAGPromptInfo, List[MemorySearchResult], Optional[List[Dict[str, str]]], Optional[str]]:
+    ) -> Tuple[str, "RAGPromptInfo", List[MemorySearchResult], Optional[List[Dict[str, str]]], Optional[str], Dict[str, Any]]:
         """
         准备 chat 上下文 (共享逻辑, 供 chat / async_chat / chat_stream 使用)
         
+        v7.1: 返回值扩展为六元组, 新增 compression_meta
+        
         Returns:
-            (prompt, prompt_info, memories, history, preference_text)
+            (prompt, prompt_info, memories, history, preference_text, compression_meta)
         """
         if max_history_turns is None:
             max_history_turns = self._get_max_history_turns()
@@ -848,15 +1117,21 @@ class RAGSystem:
             memories = []
         
         # 获取对话历史
+        # v7.1: compress 模式需要 include_ids=True 以保留 trace_id
         history = None
+        _use_compress = (
+            getattr(self.config.rag, 'history_compression', 'truncate') == 'compress'
+            and self._suffix_builder is not None
+        )
         if include_history:
             try:
                 history = self._get_conversation_history(
-                    session_id, max_turns=max_history_turns, user_id=user_id
+                    session_id, max_turns=max_history_turns,
+                    user_id=user_id, include_ids=_use_compress,
                 )
                 logger.debug(
                     f"Retrieved {len(history)} history messages for session "
-                    f"{session_id} (user={user_id})"
+                    f"{session_id} (user={user_id}, include_ids={_use_compress})"
                 )
             except Exception as e:
                 logger.warning(f"Failed to get conversation history: {e}")
@@ -882,7 +1157,7 @@ class RAGSystem:
         
         # 构建提示词
         try:
-            prompt, prompt_info = self._build_prompt(
+            prompt, prompt_info, compression_meta = self._build_prompt(
                 query, memories,
                 effective_system_prompt if effective_system_prompt else None,
                 history,
@@ -892,7 +1167,7 @@ class RAGSystem:
                 f"Failed to build RAG prompt: {e}", cause=e
             )
         
-        return prompt, prompt_info, memories, history, preference_text
+        return prompt, prompt_info, memories, history, preference_text, compression_meta
     
     def _generate_and_process(
         self,
@@ -1112,7 +1387,7 @@ class RAGSystem:
         self._stats["total_requests"] += 1
         
         try:
-            prompt, prompt_info, memories, history, preference_text = self._prepare_chat_context(
+            prompt, prompt_info, memories, history, preference_text, compression_meta = self._prepare_chat_context(
                 query=query,
                 session_id=session_id,
                 user_id=user_id,
@@ -1155,6 +1430,9 @@ class RAGSystem:
                     'preference_injected': bool(preference_text),
                     'preference_text': preference_text or "",
                     'think_content_stripped': think_stripped,
+                    'compression_mode': compression_meta.get('compression_mode', 'truncate'),
+                    'trace_ids': compression_meta.get('trace_ids', []),
+                    'has_fact_call_instruction': compression_meta.get('has_fact_call_instruction', False),
                 },
                 prompt_info=prompt_info,
             )
@@ -1212,7 +1490,7 @@ class RAGSystem:
             
             # 准备上下文 (在线程池中执行同步 DB 操作)
             loop = asyncio.get_running_loop()
-            prompt, prompt_info, memories, history, preference_text = await loop.run_in_executor(
+            prompt, prompt_info, memories, history, preference_text, compression_meta = await loop.run_in_executor(
                 None,
                 lambda: self._prepare_chat_context(
                     query=query,
@@ -1226,16 +1504,32 @@ class RAGSystem:
                 ),
             )
             
-            # 模型推理 (在线程池中执行)
-            clean_response, think_stripped, output = await loop.run_in_executor(
-                None,
-                lambda: self._generate_and_process(
+            # 模型推理: 检查 fact_retrieve_method 路由
+            fact_method = self._get_fact_retrieve_method()
+            
+            if fact_method == "native_tool_calls":
+                # 闭源模型: 使用原生 tool_calls 进行事实检索
+                fact_cfg = self._get_fact_call_config()
+                clean_response, think_stripped, output = await self._generate_with_tool_calls(
                     prompt=prompt,
                     max_new_tokens=max_new_tokens,
                     temperature=temperature,
+                    session_id=session_id,
+                    max_rounds=fact_cfg.inline_intercept_max_rounds,
+                    max_fact_tokens=fact_cfg.max_fact_tokens,
                     **kwargs,
-                ),
-            )
+                )
+            else:
+                # post_hoc (默认) / inline_intercept (开源): 在线程池中执行
+                clean_response, think_stripped, output = await loop.run_in_executor(
+                    None,
+                    lambda: self._generate_and_process(
+                        prompt=prompt,
+                        max_new_tokens=max_new_tokens,
+                        temperature=temperature,
+                        **kwargs,
+                    ),
+                )
             
             end_time = time.perf_counter()
             total_latency = (end_time - start_time) * 1000
@@ -1265,6 +1559,10 @@ class RAGSystem:
                     'preference_text': preference_text or "",
                     'think_content_stripped': think_stripped,
                     'async': True,
+                    'fact_retrieve_method': fact_method,
+                    'compression_mode': compression_meta.get('compression_mode', 'truncate'),
+                    'trace_ids': compression_meta.get('trace_ids', []),
+                    'has_fact_call_instruction': compression_meta.get('has_fact_call_instruction', False),
                 },
                 prompt_info=prompt_info,
             )
@@ -1313,7 +1611,7 @@ class RAGSystem:
             
             # 准备上下文
             loop = asyncio.get_running_loop()
-            prompt, prompt_info, memories, history, preference_text = await loop.run_in_executor(
+            prompt, prompt_info, memories, history, preference_text, compression_meta = await loop.run_in_executor(
                 None,
                 lambda: self._prepare_chat_context(
                     query=query,
@@ -1327,87 +1625,37 @@ class RAGSystem:
                 ),
             )
             
-            # 发送 metadata
+            # 发送 metadata (v7.1: 包含压缩模式信息)
             yield {
                 "type": "metadata",
                 "memories_count": len(memories),
                 "history_turns": len(history) if history else 0,
                 "preference_injected": bool(preference_text),
+                "compression_mode": compression_meta.get("compression_mode", "truncate"),
+                "trace_ids": compression_meta.get("trace_ids", []),
+                "has_fact_call_instruction": compression_meta.get("has_fact_call_instruction", False),
             }
             
-            # 检查模型是否支持流式生成
-            has_stream = (
-                hasattr(self.model, 'stream_generate')
-                or hasattr(self.model, 'async_stream_generate')
-            )
+            # 检查 fact_retrieve_method 路由
+            fact_method = self._get_fact_retrieve_method()
             
-            if has_stream:
-                full_text = ""
-                input_tokens = 0
-                output_tokens = 0
-                
-                if hasattr(self.model, 'async_stream_generate'):
-                    stream = self.model.async_stream_generate(
-                        prompt=prompt,
-                        max_new_tokens=max_new_tokens,
-                        temperature=temperature,
-                        **kwargs,
-                    )
-                    async for chunk in stream:
-                        token_text = chunk if isinstance(chunk, str) else getattr(chunk, 'text', str(chunk))
-                        full_text += token_text
-                        yield {"type": "token", "content": token_text}
-                elif hasattr(self.model, 'stream_generate'):
-                    for chunk in self.model.stream_generate(
-                        prompt=prompt,
-                        max_new_tokens=max_new_tokens,
-                        temperature=temperature,
-                        **kwargs,
-                    ):
-                        token_text = chunk if isinstance(chunk, str) else getattr(chunk, 'text', str(chunk))
-                        full_text += token_text
-                        yield {"type": "token", "content": token_text}
-                
-                clean_text, _ = strip_think_content(full_text)
-                total_latency = (time.perf_counter() - start_time) * 1000
-                
-                # 记录对话 (fire-and-forget, 带异常回调)
-                self._fire_and_forget_log(
-                    loop=loop,
+            if fact_method == "native_tool_calls":
+                # ---- 闭源模型 native_tool_calls 流式路径 ----
+                # Phase 1: 非流式 tool_calls 循环 (需要完整响应判断 finish_reason)
+                fact_cfg = self._get_fact_call_config()
+                clean_response, think_stripped, output = await self._generate_with_tool_calls(
+                    prompt=prompt,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
                     session_id=session_id,
-                    user_id=user_id,
-                    query=query,
-                    clean_response=clean_text,
-                    memories=memories,
-                    total_latency=total_latency,
-                )
-                
-                # 流式模式下估算 token (修复 token 统计为 0 的问题)
-                input_tokens = self._estimate_tokens(prompt)
-                output_tokens = self._estimate_tokens(clean_text)
-                
-                yield {
-                    "type": "done",
-                    "text": clean_text,
-                    "input_tokens": input_tokens,
-                    "output_tokens": output_tokens,
-                    "latency_ms": total_latency,
-                }
-            else:
-                # 模型不支持流式: 回退到非流式, 一次性返回
-                clean_response, think_stripped, output = await loop.run_in_executor(
-                    None,
-                    lambda: self._generate_and_process(
-                        prompt=prompt,
-                        max_new_tokens=max_new_tokens,
-                        temperature=temperature,
-                        **kwargs,
-                    ),
+                    max_rounds=fact_cfg.inline_intercept_max_rounds,
+                    max_fact_tokens=fact_cfg.max_fact_tokens,
+                    **kwargs,
                 )
                 
                 total_latency = (time.perf_counter() - start_time) * 1000
                 
-                # 记录对话 (fire-and-forget, 带异常回调)
+                # 记录对话 (fire-and-forget)
                 self._fire_and_forget_log(
                     loop=loop,
                     session_id=session_id,
@@ -1418,7 +1666,7 @@ class RAGSystem:
                     total_latency=total_latency,
                 )
                 
-                # 模拟流式: 一次性返回全部
+                # 模拟流式输出 (tool_calls 循环已完成, 结果一次性返回)
                 yield {"type": "token", "content": clean_response}
                 yield {
                     "type": "done",
@@ -1426,7 +1674,102 @@ class RAGSystem:
                     "input_tokens": output.input_tokens,
                     "output_tokens": output.output_tokens,
                     "latency_ms": total_latency,
+                    "fact_retrieve_method": fact_method,
                 }
+            else:
+                # ---- post_hoc (默认) 流式路径 ----
+                # 检查模型是否支持流式生成
+                has_stream = (
+                    hasattr(self.model, 'stream_generate')
+                    or hasattr(self.model, 'async_stream_generate')
+                )
+                
+                if has_stream:
+                    full_text = ""
+                    input_tokens = 0
+                    output_tokens = 0
+                    
+                    if hasattr(self.model, 'async_stream_generate'):
+                        stream = self.model.async_stream_generate(
+                            prompt=prompt,
+                            max_new_tokens=max_new_tokens,
+                            temperature=temperature,
+                            **kwargs,
+                        )
+                        async for chunk in stream:
+                            token_text = chunk if isinstance(chunk, str) else getattr(chunk, 'text', str(chunk))
+                            full_text += token_text
+                            yield {"type": "token", "content": token_text}
+                    elif hasattr(self.model, 'stream_generate'):
+                        for chunk in self.model.stream_generate(
+                            prompt=prompt,
+                            max_new_tokens=max_new_tokens,
+                            temperature=temperature,
+                            **kwargs,
+                        ):
+                            token_text = chunk if isinstance(chunk, str) else getattr(chunk, 'text', str(chunk))
+                            full_text += token_text
+                            yield {"type": "token", "content": token_text}
+                    
+                    clean_text, _ = strip_think_content(full_text)
+                    total_latency = (time.perf_counter() - start_time) * 1000
+                    
+                    # 记录对话 (fire-and-forget, 带异常回调)
+                    self._fire_and_forget_log(
+                        loop=loop,
+                        session_id=session_id,
+                        user_id=user_id,
+                        query=query,
+                        clean_response=clean_text,
+                        memories=memories,
+                        total_latency=total_latency,
+                    )
+                    
+                    # 流式模式下估算 token (修复 token 统计为 0 的问题)
+                    input_tokens = self._estimate_tokens(prompt)
+                    output_tokens = self._estimate_tokens(clean_text)
+                    
+                    yield {
+                        "type": "done",
+                        "text": clean_text,
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                        "latency_ms": total_latency,
+                    }
+                else:
+                    # 模型不支持流式: 回退到非流式, 一次性返回
+                    clean_response, think_stripped, output = await loop.run_in_executor(
+                        None,
+                        lambda: self._generate_and_process(
+                            prompt=prompt,
+                            max_new_tokens=max_new_tokens,
+                            temperature=temperature,
+                            **kwargs,
+                        ),
+                    )
+                    
+                    total_latency = (time.perf_counter() - start_time) * 1000
+                    
+                    # 记录对话 (fire-and-forget, 带异常回调)
+                    self._fire_and_forget_log(
+                        loop=loop,
+                        session_id=session_id,
+                        user_id=user_id,
+                        query=query,
+                        clean_response=clean_response,
+                        memories=memories,
+                        total_latency=total_latency,
+                    )
+                    
+                    # 模拟流式: 一次性返回全部
+                    yield {"type": "token", "content": clean_response}
+                    yield {
+                        "type": "done",
+                        "text": clean_response,
+                        "input_tokens": output.input_tokens,
+                        "output_tokens": output.output_tokens,
+                        "latency_ms": total_latency,
+                    }
         
         except Exception as e:
             self._stats["errors"] += 1
@@ -1438,6 +1781,393 @@ class RAGSystem:
                 "retryable": getattr(e, 'retryable', False),
             }
     
+    # ================================================================
+    # Native Tool Calls (闭源模型 fact retrieval)
+    # ================================================================
+
+    def _get_fact_retrieve_method(self) -> str:
+        """
+        获取 fact_retrieve_method 配置值
+        
+        优先从 config.dki.recall.fact_call 读取;
+        如果配置为 "auto", 则根据模型类型自动推断:
+        - 闭源模型 → "native_tool_calls"
+        - 开源模型 → "inline_intercept"
+        
+        Returns:
+            "post_hoc" | "inline_intercept" | "native_tool_calls"
+        """
+        method = "post_hoc"
+        try:
+            fact_call_cfg = self.config.dki.recall.fact_call
+            if isinstance(fact_call_cfg, dict):
+                method = fact_call_cfg.get("fact_retrieve_method", "post_hoc")
+            elif hasattr(fact_call_cfg, "fact_retrieve_method"):
+                method = fact_call_cfg.fact_retrieve_method
+        except (AttributeError, TypeError):
+            pass
+        
+        if method == "auto":
+            if getattr(self.model, 'is_closed_source', False):
+                method = "native_tool_calls"
+            else:
+                method = "inline_intercept"
+        
+        return method
+
+    def _get_fact_call_config(self) -> RecallFactCallConfig:
+        """获取 fact_call 配置"""
+        try:
+            fact_call_cfg = self.config.dki.recall.fact_call
+            if isinstance(fact_call_cfg, RecallFactCallConfig):
+                return fact_call_cfg
+            if isinstance(fact_call_cfg, dict):
+                return RecallFactCallConfig(**{
+                    k: v for k, v in fact_call_cfg.items()
+                    if k in RecallFactCallConfig.__dataclass_fields__
+                })
+        except (AttributeError, TypeError):
+            pass
+        return RecallFactCallConfig()
+
+    def _prompt_to_messages(self, prompt: str) -> List[Dict[str, Any]]:
+        """
+        将格式化后的 prompt 字符串反解析为 messages 列表
+        
+        支持 ChatML 格式 (<|im_start|>...<|im_end|>) 和纯文本格式。
+        闭源模型 API 需要 messages 列表而非拼接的 prompt 字符串。
+        """
+        messages = []
+        
+        # 尝试 ChatML 格式解析
+        import re
+        chatml_pattern = re.compile(
+            r'<\|im_start\|>(system|user|assistant)\n(.*?)<\|im_end\|>',
+            re.DOTALL,
+        )
+        matches = chatml_pattern.findall(prompt)
+        
+        if matches:
+            for role, content in matches:
+                messages.append({"role": role, "content": content.strip()})
+            return messages
+        
+        # 尝试 Llama3 格式解析
+        llama3_pattern = re.compile(
+            r'<\|start_header_id\|>(system|user|assistant)<\|end_header_id\|>\n*(.*?)(?=<\|start_header_id\|>|<\|eot_id\|>|$)',
+            re.DOTALL,
+        )
+        matches = llama3_pattern.findall(prompt)
+        if matches:
+            for role, content in matches:
+                content = content.strip()
+                if content:
+                    messages.append({"role": role, "content": content})
+            return messages
+        
+        # 回退: 整个 prompt 作为 user message
+        messages.append({"role": "user", "content": prompt.strip()})
+        return messages
+
+    async def _call_with_tools(
+        self,
+        messages: List[Dict[str, Any]],
+        max_new_tokens: int,
+        temperature: float,
+        tools: List[Dict],
+        **kwargs,
+    ) -> ModelOutput:
+        """
+        调用闭源模型 API (带 tools 参数)
+        
+        优先使用 adapter 的 async_generate_with_tools 方法;
+        如果不支持, 回退到普通 generate (tools 信息丢失)。
+        """
+        adapter = self.model
+        
+        if hasattr(adapter, 'async_generate_with_tools'):
+            return await adapter.async_generate_with_tools(
+                messages=messages,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                tools=tools,
+                tool_choice="auto",
+                **kwargs,
+            )
+        
+        # 回退: 不支持 tools, 用普通 generate
+        logger.warning(
+            "Model adapter does not support async_generate_with_tools, "
+            "falling back to generate without tools"
+        )
+        prompt = "\n".join(
+            f"{m['role']}: {m['content']}" for m in messages
+        )
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: adapter.generate(
+                prompt=prompt,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                **kwargs,
+            ),
+        )
+
+    async def _call_without_tools(
+        self,
+        messages: List[Dict[str, Any]],
+        max_new_tokens: int,
+        temperature: float,
+        **kwargs,
+    ) -> ModelOutput:
+        """
+        调用闭源模型 API (不带 tools, 最终回答轮)
+        """
+        adapter = self.model
+        
+        if hasattr(adapter, 'async_generate_with_tools'):
+            # 复用同一方法, 不传 tools
+            return await adapter.async_generate_with_tools(
+                messages=messages,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                tools=None,
+                **kwargs,
+            )
+        
+        prompt = "\n".join(
+            f"{m['role']}: {m['content']}" for m in messages
+        )
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: adapter.generate(
+                prompt=prompt,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                **kwargs,
+            ),
+        )
+
+    def _retrieve_fact_for_rag(
+        self,
+        trace_id: str,
+        session_id: str,
+    ) -> Optional[FactResponse]:
+        """
+        为 RAG 路径检索事实
+        
+        使用 FactRetriever (如果可用), 否则直接查数据库。
+        """
+        # 尝试使用 FactRetriever
+        try:
+            from dki.core.recall.fact_retriever import FactRetriever
+            from dki.core.recall.recall_config import RecallConfig
+            
+            recall_cfg = None
+            try:
+                recall_cfg = RecallConfig.from_dict(
+                    getattr(self.config.dki, 'recall', {})
+                    if hasattr(self.config, 'dki') and hasattr(self.config.dki, 'recall')
+                    else {}
+                )
+            except Exception:
+                recall_cfg = RecallConfig()
+            
+            retriever = FactRetriever(config=recall_cfg)
+            # 提供 conversation_repo
+            with self.db_manager.session_scope() as db:
+                conv_repo = ConversationRepository(db)
+                retriever._conversation_repo = conv_repo
+                return retriever.retrieve(
+                    trace_id=trace_id,
+                    session_id=session_id,
+                    db_session=db,
+                )
+        except Exception as e:
+            logger.warning(f"RAG fact retrieval failed for trace_id={trace_id}: {e}")
+            return None
+
+    def _format_fact_result(self, fact_response: Optional[FactResponse]) -> str:
+        """
+        格式化事实检索结果为文本
+        
+        用于 tool result message 的 content。
+        """
+        if not fact_response or not fact_response.messages:
+            return "未找到相关事实记录。"
+        
+        parts = []
+        for msg in fact_response.messages:
+            role = msg.get("role", "unknown")
+            content = msg.get("content", "")
+            parts.append(f"{role}: {content}")
+        
+        result = "\n".join(parts)
+        
+        if fact_response.has_more:
+            result += (
+                f"\n(还有更多内容, 可继续调用 retrieve_fact, "
+                f"trace_id=\"{fact_response.trace_id}\", "
+                f"offset={fact_response.offset + len(fact_response.messages)})"
+            )
+        
+        return result
+
+    async def _generate_with_tool_calls(
+        self,
+        prompt: str,
+        max_new_tokens: int,
+        temperature: float,
+        session_id: str,
+        max_rounds: int = 3,
+        max_fact_tokens: int = 800,
+        **kwargs,
+    ) -> Tuple[str, bool, ModelOutput]:
+        """
+        带 native tool_calls 的生成 (闭源模型)
+        
+        流程:
+        1. 调用 API (tools=[retrieve_fact_tool_def])
+        2. 响应 finish_reason == "tool_calls" → 解析参数 → 检索事实
+        3. 拼接 tool result message → 再次调用 API
+        4. 循环直到正常结束或达到 max_rounds
+        
+        Args:
+            prompt: 格式化后的 prompt 字符串
+            max_new_tokens: 最大生成 token 数
+            temperature: 采样温度
+            session_id: 会话 ID
+            max_rounds: 最大 tool_call 循环轮次
+            max_fact_tokens: 事实 token 预算上限
+            
+        Returns:
+            (clean_response, think_stripped, raw_output)
+        """
+        total_fact_tokens = 0
+        messages = self._prompt_to_messages(prompt)
+        
+        for round_idx in range(max_rounds):
+            # 调用 API (带 tools)
+            try:
+                output = await self._call_with_tools(
+                    messages=messages,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    tools=[RETRIEVE_FACT_TOOL_DEF],
+                    **kwargs,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Native tool_calls API call failed (round {round_idx + 1}): {e}, "
+                    f"falling back to post_hoc"
+                )
+                # 降级: 不带 tools 重试
+                output = await self._call_without_tools(
+                    messages=messages,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    **kwargs,
+                )
+                clean_text, think_stripped = strip_think_content(output.text)
+                return clean_text, think_stripped, output
+            
+            response_message = output.metadata.get("raw_message", {})
+            finish_reason = output.metadata.get("finish_reason", "stop")
+            
+            # 正常结束 (非 tool_calls)
+            if finish_reason != "tool_calls":
+                clean_text, think_stripped = strip_think_content(output.text)
+                return clean_text, think_stripped, output
+            
+            # 解析 tool_calls
+            tool_calls = response_message.get("tool_calls", [])
+            if not tool_calls:
+                clean_text, think_stripped = strip_think_content(output.text)
+                return clean_text, think_stripped, output
+            
+            # 将 assistant message (含 tool_calls) 加入 messages
+            messages.append(response_message)
+            
+            # 逐个处理 tool_calls
+            for tc in tool_calls:
+                func = tc.get("function", {})
+                if func.get("name") != "retrieve_fact":
+                    # 未知 tool, 返回空结果
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.get("id", ""),
+                        "content": "Unknown tool.",
+                    })
+                    continue
+                
+                try:
+                    args = json.loads(func.get("arguments", "{}"))
+                except json.JSONDecodeError:
+                    args = {}
+                
+                trace_id = args.get("trace_id", "")
+                offset = args.get("offset", 0)
+                limit = args.get("limit", 5)
+                
+                if not trace_id:
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.get("id", ""),
+                        "content": "Error: trace_id is required.",
+                    })
+                    continue
+                
+                # 检索事实
+                fact_response = self._retrieve_fact_for_rag(trace_id, session_id)
+                fact_text = self._format_fact_result(fact_response)
+                fact_tokens = estimate_tokens_fast(fact_text)
+                total_fact_tokens += fact_tokens
+                
+                # 拼接 tool result
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.get("id", ""),
+                    "content": fact_text,
+                })
+                
+                logger.info(
+                    f"Native tool_calls round {round_idx + 1}: "
+                    f"trace_id={trace_id}, fact_tokens={fact_tokens}, "
+                    f"total_fact_tokens={total_fact_tokens}"
+                )
+            
+            # 检查 fact token 预算
+            if total_fact_tokens > max_fact_tokens:
+                logger.info(
+                    f"Native tool_calls: fact token budget exhausted "
+                    f"({total_fact_tokens} > {max_fact_tokens})"
+                )
+                # 最后一轮: 不带 tools, 让模型正常回答
+                final_output = await self._call_without_tools(
+                    messages=messages,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    **kwargs,
+                )
+                clean_text, think_stripped = strip_think_content(final_output.text)
+                return clean_text, think_stripped, final_output
+        
+        # 达到 max_rounds, 强制最后一轮不带 tools
+        logger.info(
+            f"Native tool_calls: max rounds reached ({max_rounds}), "
+            f"forcing final generation without tools"
+        )
+        final_output = await self._call_without_tools(
+            messages=messages,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            **kwargs,
+        )
+        clean_text, think_stripped = strip_think_content(final_output.text)
+        return clean_text, think_stripped, final_output
+
     def search_memories(
         self,
         query: str,

@@ -29,6 +29,10 @@ class ModelOutput:
     attentions: Optional[Tuple[torch.Tensor, ...]] = None
     kv_cache: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None
     
+    # Logprobs (for entropy-gated retrieval)
+    # List of per-token top-k log probabilities: [[logp1, logp2, ...], ...]
+    logprobs: Optional[List[List[float]]] = None
+    
     # Metrics
     latency_ms: float = 0.0
     input_tokens: int = 0

@@ -658,6 +658,60 @@ class SGLangAdapter(BaseModelAdapter):
         return stop_strings
     
     # ================================================================
+    # Logprobs 解析 (v8.0 熵门控)
+    # ================================================================
+    
+    @staticmethod
+    def _parse_sglang_logprobs(meta_info: dict) -> Optional[List[List[float]]]:
+        """
+        从 SGLang meta_info 中提取 logprobs 并转换为 EntropyMonitor 格式.
+        
+        SGLang logprobs 格式 (meta_info 中):
+            - "output_token_logprobs": List[float]  — 每个生成 token 的 log prob
+            - "output_top_logprobs": List[Dict[int, float]] — 每个 token 的 top-k log probs
+            
+        转换为:
+            List[List[float]] — 每个 token 的 top-k log probabilities
+            
+        如果只有 output_token_logprobs (无 top-k), 则每个 token 返回 [logp] 单元素列表.
+        """
+        if not meta_info:
+            return None
+        
+        # 优先使用 top-k logprobs
+        top_logprobs = meta_info.get("output_top_logprobs")
+        if top_logprobs and isinstance(top_logprobs, list):
+            result = []
+            for token_top in top_logprobs:
+                if isinstance(token_top, dict):
+                    # Dict[token_id, logprob] → List[float]
+                    lps = []
+                    for _tid, lp in token_top.items():
+                        if hasattr(lp, 'logprob'):
+                            lps.append(lp.logprob)
+                        elif isinstance(lp, (int, float)):
+                            lps.append(float(lp))
+                        else:
+                            try:
+                                lps.append(float(lp))
+                            except (TypeError, ValueError):
+                                continue
+                    if lps:
+                        result.append(lps)
+                elif isinstance(token_top, (list, tuple)):
+                    # 已经是 list 格式
+                    result.append([float(x) for x in token_top if isinstance(x, (int, float))])
+            if result:
+                return result
+        
+        # 回退: 使用单一 token logprobs
+        token_logprobs = meta_info.get("output_token_logprobs")
+        if token_logprobs and isinstance(token_logprobs, list):
+            return [[float(lp)] for lp in token_logprobs if isinstance(lp, (int, float))]
+        
+        return None
+    
+    # ================================================================
     # 核心推理接口
     # ================================================================
     
@@ -952,12 +1006,23 @@ class SGLangAdapter(BaseModelAdapter):
         else:
             formatted_prompt = prompt
         
+        # ============ logprobs 支持 (v8.0 熵门控) ============
+        # 熵门控路径 (_execute_entropy_gated) 传递 logprobs=k,
+        # 需要将此参数转发到 SGLang sampling_params.
+        # SGLang 原生支持:
+        #   return_logprob=True  — 启用 logprob 返回
+        #   top_logprobs_num=k   — 返回 top-k log probs
+        logprobs_k = kwargs.get('logprobs', None)
+        
         sampling_params = {
             "temperature": temperature,
             "top_p": top_p,
             "max_new_tokens": max_new_tokens,
             "stop": self._get_stop_strings(),
         }
+        if logprobs_k is not None:
+            sampling_params["return_logprob"] = True
+            sampling_params["top_logprobs_num"] = logprobs_k
         
         output = self._call_engine_generate(formatted_prompt, sampling_params)
         
@@ -965,9 +1030,15 @@ class SGLangAdapter(BaseModelAdapter):
         
         output_text, meta_info = self._parse_engine_output(output)
         
+        # ============ 提取 logprobs (v8.0) ============
+        parsed_logprobs = None
+        if logprobs_k is not None:
+            parsed_logprobs = self._parse_sglang_logprobs(meta_info)
+        
         return ModelOutput(
             text=output_text,
             tokens=meta_info.get("output_ids", []),
+            logprobs=parsed_logprobs,
             latency_ms=(end_time - start_time) * 1000,
             input_tokens=meta_info.get("prompt_tokens", 0),
             output_tokens=meta_info.get("completion_tokens", 0),
@@ -1080,12 +1151,18 @@ class SGLangAdapter(BaseModelAdapter):
         else:
             formatted_prompt = prompt
         
+        # ============ logprobs 支持 (v8.0 熵门控) ============
+        logprobs_k = kwargs.get('logprobs', None)
+        
         sampling_params = {
             "temperature": temperature,
             "top_p": top_p,
             "max_new_tokens": max_new_tokens,
             "stop": self._get_stop_strings(),
         }
+        if logprobs_k is not None:
+            sampling_params["return_logprob"] = True
+            sampling_params["top_logprobs_num"] = logprobs_k
         
         output = await self._call_engine_generate_async(formatted_prompt, sampling_params)
         
@@ -1107,9 +1184,15 @@ class SGLangAdapter(BaseModelAdapter):
                 f"raw_output_repr={repr(output)[:500]}"
             )
         
+        # ============ 提取 logprobs (v8.0) ============
+        parsed_logprobs = None
+        if logprobs_k is not None:
+            parsed_logprobs = self._parse_sglang_logprobs(meta_info)
+        
         return ModelOutput(
             text=output_text,
             tokens=meta_info.get("output_ids", []),
+            logprobs=parsed_logprobs,
             latency_ms=latency_ms,
             input_tokens=meta_info.get("prompt_tokens", 0),
             output_tokens=meta_info.get("completion_tokens", 0),
