@@ -4,7 +4,7 @@
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Version](https://img.shields.io/badge/version-4.0.0-green.svg)]()
+[![Version](https://img.shields.io/badge/version-8.0.0-green.svg)]()
 
 [English](README.md) | 简体中文
 
@@ -52,6 +52,7 @@ DKI 通过配置驱动适配器读取上层应用数据库
 
 -   **🧠 注意力 Hook 注入**：通过 PyTorch Hook 在注意力层级注入 K/V，而非 prompt token
 -   **🔀 Recall v4 记忆召回**：多信号检索 + 动态摘要 + 事实补充（主策略），stable 混合注入自动回退
+-   **🧪 熵门控元认知检索 (v8.0)**：生成过程中监测 Shannon 熵以检测模型不确定性 → 自主记忆检索 → prompt 级事实注入。类比人类"知道感" (Feeling of Knowing, FOK)
 -   **🔧 配置驱动适配器**：SQLAlchemy 动态表映射，无需上层应用实现接口
 -   **🔐 用户级隔离**：HMAC 签名缓存键 + UserIsolationContext + 推理后 K/V 清理
 -   **🎚️ 记忆影响缩放（MIS）**：连续的 α ∈ [0, 1] 强度控制
@@ -191,15 +192,15 @@ DKI v4.1 新增对**闭源模型**（OpenAI、DeepSeek API、GLM API、Moonshot 
 
 **核心设计决策**：
 
-| 方面 | 设计 |
-| ---- | ---- |
-| K/V 注入 | 不可用（无法访问模型内部） |
-| 路由 | 自动强制走 RAG（prompt 拼接） |
-| Chat API | `ClosedSourceAdapter.generate()` → OpenAI 兼容 HTTP API |
-| 配置 | 仅需修改 `config.yaml`，无需改代码 |
-| 集成 | 与开源模型相同：`create_plugin()` / `DKIMiddleware` / `EnhancedDKIPlugin` |
-| 流式 | 支持（SSE, Server-Sent Events） |
-| 降级 | 三级降级：RAG → DKI（会降级）→ 纯 LLM |
+| 方面     | 设计                                                                      |
+| -------- | ------------------------------------------------------------------------- |
+| K/V 注入 | 不可用（无法访问模型内部）                                                |
+| 路由     | 自动强制走 RAG（prompt 拼接）                                             |
+| Chat API | `ClosedSourceAdapter.generate()` → OpenAI 兼容 HTTP API                   |
+| 配置     | 仅需修改 `config.yaml`，无需改代码                                        |
+| 集成     | 与开源模型相同：`create_plugin()` / `DKIMiddleware` / `EnhancedDKIPlugin` |
+| 流式     | 支持（SSE, Server-Sent Events）                                           |
+| 降级     | 三级降级：RAG → DKI（会降级）→ 纯 LLM                                     |
 
 **配置示例**：
 
@@ -331,8 +332,10 @@ dki:
 │  Phase 3: 模型适配 + 推理                                                │
 │  ┌─────────────────────────────────────────────────────────────────┐    │
 │  │  [History 后缀] + [可信+推理限定提示] + [偏好 K/V 注入] + [Query] │    │
-│  │  → LLM 推理 → 检测 retrieve_fact 调用                            │    │
-│  │  → 事实补充 (支持分块 offset+limit) → 继续推理                    │    │
+│  │  → LLM 推理                                                      │    │
+│  │  → 事实检索: entropy_gated (v8.0, 开源默认)                       │    │
+│  │    | inline_intercept | native_tool_calls | post_hoc              │    │
+│  │  → 事实补充 → 继续推理/重新生成                                    │    │
 │  └─────────────────────────────────────────────────────────────────┘    │
 │                                                                         │
 │  优势:                                                                  │
@@ -344,6 +347,8 @@ dki:
 │  │  ✅ 偏好仍通过 K/V 注入 (复用现有基础设施)                        │    │
 │  │  ✅ 默认抽取式摘要 (无需额外 LLM 调用)                           │    │
 │  │  ✅ retrieve_fact 支持按需细节恢复                               │    │
+│  │  ✅ 熵门控检索: 不确定性驱动的自主记忆召回,                      │    │
+│  │     无需 function call 开销 (v8.0)                               │    │
 │  └─────────────────────────────────────────────────────────────────┘    │
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
@@ -379,6 +384,14 @@ dki:
             enabled: true
             max_rounds: 3
             max_fact_tokens: 800
+            # v8.0: 事实检索方法
+            # post_hoc | inline_intercept | entropy_gated | native_tool_calls | auto
+            fact_retrieve_method: "post_hoc"
+            inline_intercept_max_param_tokens: 64
+            inline_intercept_max_rounds: 3
+            # entropy_gated 模式专属配置 (v8.0)
+            entropy_probe_tokens: 64          # Stage 1 探测生成 max tokens
+            entropy_logprobs_k: 5             # logprobs 返回 top-k 数
 ```
 
 **回退机制**:
@@ -628,6 +641,7 @@ REST API 端点：
 DKI/
 ├── config/                              # 配置文件目录
 │   ├── config.yaml                      # ⭐ 主配置文件
+│   ├── config_env.yaml                  # ⭐ 环境变量驱动配置 (动态切换模型)
 │   ├── adapter_config.example.yaml      # ⭐ 适配器配置示例
 │   ├── memory_trigger.yaml              # Memory Trigger 配置
 │   └── reference_resolver.yaml          # Reference Resolver 配置
@@ -635,109 +649,195 @@ DKI/
 ├── dki/                                 # 核心代码目录
 │   ├── __init__.py                      # v4.0 入口 (create_plugin, DKIMiddleware)
 │   │
-│   ├── integration/                     # ⭐ v4.0 集成层 (新)
+│   ├── integration/                     # ⭐ v4.0 集成层
 │   │   ├── __init__.py                  # 集成层入口
 │   │   ├── factory.py                   # ⭐ create_plugin() 工厂函数
 │   │   ├── middleware.py                # ⭐ DKIMiddleware (FastAPI)
 │   │   └── enhanced_plugin.py           # ⭐ EnhancedDKIPlugin (路由+消息管理)
 │   │
 │   ├── core/                            # ⭐ 核心模块
-│   │   ├── __init__.py
 │   │   ├── dki_plugin.py                # ⭐ DKI 插件核心 (入口)
 │   │   ├── dki_system.py                # DKI 系统封装 (实验用)
 │   │   ├── rag_system.py                # RAG 系统 (异步+流式, v4.0)
 │   │   ├── conversation_router.py       # ⭐ RAG/DKI 动态路由 (v4.0)
 │   │   ├── plugin_manager.py            # 多实例管理 (v4.0)
+│   │   ├── plugin_interface.py          # 插件接口定义
 │   │   ├── exceptions.py                # ⭐ 结构化异常体系 (v4.0)
 │   │   ├── rate_limiter.py              # 限流/熔断 (v4.0)
 │   │   ├── memory_router.py             # 基于 FAISS 的向量检索
 │   │   ├── embedding_service.py         # 嵌入计算服务
+│   │   ├── entropy_gated_injection.py   # 熵门控注入
+│   │   ├── function_call_logger.py      # Function Call 日志记录
+│   │   ├── text_utils.py                # 文本工具 (token 估算等)
+│   │   ├── architecture.py              # 架构定义
 │   │   │
-│   │   ├── injection/                   # 注入策略
-│   │   │   └── full_attention_injector.py  # Full Attention (研究, 已弃用)
+│   │   ├── plugin/                      # ⭐ 注入执行引擎
+│   │   │   ├── injection_executor.py    # 注入执行器 (Recall/Stable/降级)
+│   │   │   ├── injection_planner.py     # 注入计划器
+│   │   │   └── injection_plan.py        # 注入计划数据结构
+│   │   │
+│   │   ├── injection/                   # 注入策略 (研究用, 已弃用)
+│   │   │   ├── full_attention_injector.py     # Full Attention
+│   │   │   └── engram_inspired_injector.py    # Engram 启发策略
 │   │   │
 │   │   ├── recall/                      # ⭐ Recall v4 记忆召回
-│   │   │   └── ...
+│   │   │   ├── recall_config.py         # 召回配置数据结构
+│   │   │   ├── multi_signal_recall.py   # 多信号融合召回
+│   │   │   ├── suffix_builder.py        # 后缀组装器
+│   │   │   ├── fact_retriever.py        # 事实检索器
+│   │   │   └── prompt_formatter.py      # 提示格式化器 (多模型适配)
 │   │   │
 │   │   └── components/                  # 核心算法组件
-│   │       ├── memory_influence_scaling.py    # MIS
-│   │       ├── query_conditioned_projection.py  # QCP
+│   │       ├── memory_influence_scaling.py    # MIS (记忆影响缩放)
+│   │       ├── query_conditioned_projection.py  # QCP (查询条件投影)
 │   │       ├── dual_factor_gating.py          # 双因子门控
 │   │       ├── memory_trigger.py              # 记忆触发检测
 │   │       ├── reference_resolver.py          # 指代解析器
 │   │       ├── tiered_kv_cache.py             # L1/L2/L3/L4 分层缓存
-│   │       └── ...
+│   │       ├── session_kv_cache.py            # 会话级 KV 缓存
+│   │       ├── hybrid_injector.py             # 混合注入器
+│   │       ├── position_remapper.py           # 位置重映射
+│   │       └── attention_budget.py            # 注意力预算管理
+│   │
+│   ├── api/                             # ⭐ REST API 路由
+│   │   ├── routes.py                    # 路由注册
+│   │   ├── dki_routes.py                # DKI 聊天路由 (chat/stream)
+│   │   ├── dki_service.py               # DKI 服务层
+│   │   ├── auth_routes.py               # 认证路由
+│   │   ├── preference_routes.py         # 偏好管理路由
+│   │   ├── session_routes.py            # 会话管理路由
+│   │   ├── stats_routes.py              # 统计路由
+│   │   ├── monitoring_routes.py         # 监控路由
+│   │   ├── visualization_routes.py      # 可视化路由
+│   │   ├── models.py                    # API 数据模型
+│   │   └── dependencies.py              # 依赖注入
 │   │
 │   ├── adapters/                        # 外部数据适配器
+│   │   ├── base.py                      # 适配器基类
 │   │   ├── config_driven_adapter.py     # ⭐ 配置驱动适配器 (核心)
-│   │   ├── postgresql_adapter.py        # PostgreSQL
-│   │   ├── mysql_adapter.py             # MySQL
-│   │   └── ...
+│   │   └── example_adapter.py           # 示例适配器
 │   │
 │   ├── models/                          # LLM 模型适配器
 │   │   ├── factory.py                   # 模型工厂 (支持命名空间)
 │   │   ├── base.py                      # 基础适配器 (同步/异步/流式)
+│   │   ├── hf_compat.py                 # HuggingFace 兼容层
 │   │   ├── vllm_adapter.py              # vLLM 适配器 (流式)
 │   │   ├── sglang_adapter.py            # SGLang 适配器 (流式)
 │   │   ├── llama_adapter.py             # LLaMA 适配器 (流式)
 │   │   ├── deepseek_adapter.py          # DeepSeek 适配器 (流式)
-│   │   ├── glm_adapter.py              # GLM 适配器 (流式)
-│   │   └── closed_source_adapter.py    # ☁️ 闭源 API 适配器 (v4.1)
+│   │   ├── glm_adapter.py               # GLM 适配器 (流式)
+│   │   └── closed_source_adapter.py     # ☁️ 闭源 API 适配器 (v4.1)
 │   │
 │   ├── cache/                           # 缓存系统
 │   │   ├── preference_cache.py          # 偏好缓存管理 (L1+L2)
 │   │   ├── redis_client.py              # Redis 分布式缓存
-│   │   └── non_vectorized_handler.py    # 动态向量处理
+│   │   ├── non_vectorized_handler.py    # 动态向量处理
+│   │   └── user_isolation.py            # 用户隔离 (HMAC 签名)
+│   │
+│   ├── database/                        # 数据库层
+│   │   ├── connection.py                # 数据库连接管理
+│   │   ├── models.py                    # ORM 模型定义
+│   │   └── repository.py               # 数据仓库
 │   │
 │   ├── config/                          # 配置加载
 │   │   └── config_loader.py             # YAML 配置加载器 (热重载)
 │   │
 │   ├── attention/                       # FlashAttention 集成
-│   │   └── ...
+│   │   ├── backend.py                   # FA3/FA2 后端自动检测
+│   │   ├── config.py                    # FlashAttention 配置
+│   │   ├── kv_injection.py              # K/V 注入优化
+│   │   └── profiler.py                  # 性能分析
+│   │
+│   ├── web/                             # Web 应用入口
+│   │   └── app.py                       # FastAPI 应用 (API + 静态文件)
+│   │
+│   ├── hybrid/                          # 混合插件
+│   │   └── plugin_loader.py             # 插件加载器
+│   │
+│   ├── example_app/                     # 示例应用 (独立运行)
+│   │   ├── app.py                       # FastAPI 示例应用
+│   │   ├── main.py                      # 启动入口
+│   │   └── service.py                   # 业务服务层
 │   │
 │   └── experiment/                      # 实验系统
-│       └── ...
+│       ├── runner.py                    # 实验运行器
+│       ├── metrics.py                   # 评估指标
+│       ├── data_generator.py            # 数据生成器
+│       └── sqlite_adapter.py            # 实验数据库适配器
 │
 ├── demo/                                # ⭐ 示例应用
 │   ├── app.py                           # FastAPI 应用 (使用集成层)
+│   ├── config.py                        # Demo 配置
+│   ├── dki_bridge.py                    # DKI 桥接层
 │   ├── api/                             # API 路由
 │   │   ├── auth.py                      # 认证 (登录/注册/密码管理)
-│   │   └── chat.py                      # 聊天 (普通+流式)
+│   │   ├── chat.py                      # 聊天 (普通+流式)
+│   │   ├── messages.py                  # 消息管理
+│   │   ├── preferences.py               # 偏好管理
+│   │   ├── sessions.py                  # 会话管理
+│   │   └── deps.py                      # 依赖注入
 │   └── store/                           # 数据持久化
 │       ├── base.py                      # IChatStore 接口
-│       └── base_impl.py                 # SQLite/PostgreSQL 实现
+│       ├── factory.py                   # Store 工厂
+│       ├── models.py                    # ORM 模型
+│       ├── connection.py                # 连接管理
+│       ├── base_impl.py                 # SQLite 基础实现
+│       ├── sqlite_store.py              # SQLite Store
+│       ├── postgres_store.py            # PostgreSQL Store
+│       ├── async_postgres_store.py      # 异步 PostgreSQL Store
+│       ├── pgvector_store.py            # pgvector 向量搜索 Store
+│       ├── async_pgvector_store.py      # 异步 pgvector Store
+│       ├── async_base_impl.py           # 异步基础实现
+│       └── bm25_mixin.py               # BM25 搜索混入
 │
 ├── ui/                                  # Vue3 示例前端
 │   └── src/
 │       ├── views/
 │       │   ├── ChatView.vue             # 聊天 (流式+锚点+滚动)
 │       │   ├── LoginView.vue            # 登录/注册
-│       │   └── ProfileView.vue          # 用户资料管理
+│       │   ├── ProfileView.vue          # 用户资料管理
+│       │   ├── PreferencesView.vue      # 偏好管理
+│       │   ├── SessionsView.vue         # 会话历史
+│       │   ├── StatsView.vue            # 系统统计
+│       │   └── InjectionVizView.vue     # 注入可视化
 │       ├── components/
-│       │   └── SettingsDialog.vue       # 设置 (含流式开关)
+│       │   ├── SettingsDialog.vue       # 设置 (含流式开关)
+│       │   ├── ChatInput.vue            # 聊天输入组件
+│       │   └── MessageItem.vue          # 消息条目组件
 │       └── stores/
-│           └── settings.ts              # 设置状态 (含 streamingEnabled)
+│           ├── settings.ts              # 设置状态 (含 streamingEnabled)
+│           ├── auth.ts                  # 认证状态
+│           ├── chat.ts                  # 聊天状态
+│           └── preferences.ts           # 偏好状态
 │
 ├── tests/                               # 测试
-│   └── unit/
-│       ├── test_integration_layer.py    # 集成层测试 (v4.0)
-│       ├── test_p0p1_exceptions.py      # 异常体系测试
-│       ├── test_p1_rate_limiter.py      # 限流/熔断测试
-│       ├── test_p1_config_reload.py     # 配置热重载测试
-│       ├── test_user_management.py      # 用户管理测试
-│       ├── test_streaming_chat.py       # 流式聊天测试
-│       ├── test_rag_system_v6.py        # RAG 系统测试
+│   ├── unit/                            # 单元测试
+│   │   ├── test_integration_layer.py    # 集成层测试 (v4.0)
+│   │   ├── test_p0p1_exceptions.py      # 异常体系测试
+│   │   ├── test_p1_rate_limiter.py      # 限流/熔断测试
+│   │   ├── test_streaming_chat.py       # 流式聊天测试
+│   │   ├── test_rag_system_v6.py        # RAG 系统测试
+│   │   ├── test_inline_intercept.py     # Inline Intercept 测试
+│   │   ├── test_native_tool_calls.py    # Native Tool Calls 测试
+│   │   ├── test_entropy_gated.py        # 熵门控检索测试 (v8.0)
+│   │   ├── test_adapter_logprobs.py     # 适配器 logprobs 测试 (v8.0)
+│   │   └── ...
+│   ├── integration/                     # 集成测试
+│   │   └── ...
+│   ├── behavior/                        # 行为测试
+│   │   └── ...
+│   └── fixtures/                        # 测试夹具
 │       └── ...
 │
 ├── scripts/                             # 脚本
 │   ├── setup.bat / setup.sh             # 安装脚本
 │   ├── init_db.sql                      # SQLite 数据库初始化
 │   ├── init_db_postgresql.sql           # PostgreSQL 数据库初始化
+│   ├── start_dki_with_model.sh          # 动态模型启动 (配合 config_env.yaml)
 │   └── start_vllm_with_tools.sh         # vLLM Function Calling 启动
 │
 ├── docs/                                # 文档
 │   ├── DKI_AGA_Complete_Deployment_Guide.md  # 完整部署指南
-│   ├── 文件上传与Skills支持方案.md             # 文件上传方案 (v4.0)
 │   └── ...
 │
 ├── examples/                            # 示例
@@ -762,12 +862,13 @@ DKI/
 | 结构化异常           | ✅ 完成   | 三级降级链                                      |
 | 限流/熔断            | ✅ 完成   | 外置配置、热重载                                |
 | Recall v4 记忆召回   | ✅ 完成   | 多信号检索 + 动态摘要 + 事实补充                |
+| 熵门控检索 (v8.0)    | ✅ 完成   | Shannon 熵监测 + 自主记忆召回                   |
 | 配置驱动适配器       | ✅ 完成   | SQLAlchemy 动态表映射                           |
 | Redis 分布式缓存     | ✅ 完成   | L1+L2 缓存                                      |
 | FlashAttention       | ✅ 完成   | FA3/FA2 自动检测                                |
 | 用户管理             | ✅ 完成   | 注册/登录/密码修改/找回                         |
 | Vue3 示例 UI         | ✅ 完成   | 聊天/流式/锚点/偏好/统计                        |
-| 闭源模型支持         | ✅ 完成   | OpenAI/DeepSeek/GLM API 自动 RAG 路由 (v4.1)  |
+| 闭源模型支持         | ✅ 完成   | OpenAI/DeepSeek/GLM API 自动 RAG 路由 (v4.1)    |
 | 单元测试             | ✅ 完成   | 核心组件测试覆盖                                |
 | 注意力热力图         | 🔄 规划中 | 调试用注意力权重可视化                          |
 | 文件上传/Skills      | 🔄 规划中 | 文本文件上传和技能支持                          |
@@ -815,6 +916,10 @@ dki:
         fact_call:
             enabled: true
             max_rounds: 3
+            # v8.0: entropy_gated | inline_intercept | post_hoc | native_tool_calls | auto
+            fact_retrieve_method: "post_hoc"
+            entropy_probe_tokens: 64
+            entropy_logprobs_k: 5
 
     hybrid_injection:
         enabled: true
@@ -950,6 +1055,9 @@ A: 提供适配器配置文件，调用 `create_plugin()` 创建插件，然后�
 **Q: DKI 支持 GPT-4、DeepSeek API 等闭源模型吗？**  
 A: 支持（v4.1+）。在 `config.yaml` 中设置 `default_engine: "closed_source"` 并配置 API key 和 API 地址即可。DKI 会自动检测闭源模型并将所有请求通过 RAG 路由（prompt 拼接 + API 调用）。集成 API（`create_plugin()`、`dki.chat()`）完全不变——无需修改代码。注意：闭源模型不支持 K/V 注入，因为无法访问模型内部。
 
+**Q: 什么是熵门控元认知检索 (v8.0)？**  
+A: 使用开源模型时，DKI 在短"探测"生成（64 tokens）过程中监测生成 token 的 Shannon 熵。如果检测到高熵尖峰（表明模型不确定性），系统会自主从记忆中检索相关事实，并将其注入 prompt 进行完整重新生成。这类似于人类的"知道感"（Feeling of Knowing, FOK）— 模型识别到自身缺乏信息并自触发记忆检索。通过 `config.yaml` 中的 `fact_retrieve_method: "entropy_gated"` 配置。
+
 **Q: 生产环境部署建议？**  
 A:
 
@@ -969,4 +1077,4 @@ MIT 许可证 - 详见 LICENSE 文件
 
 ---
 
-**DKI v4.0** - 在注意力层级重新思考记忆增强
+**DKI v8.0** - 认知对齐的记忆增强与熵门控元认知检索

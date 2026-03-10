@@ -4,7 +4,7 @@
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Version](https://img.shields.io/badge/version-4.0.0-green.svg)]()
+[![Version](https://img.shields.io/badge/version-8.0.0-green.svg)]()
 
 [简体中文](README_CN.md) | English
 
@@ -52,6 +52,7 @@ This focused scope enables:
 
 -   **🧠 Attention Hook Injection**: Injects K/V at attention level via PyTorch Hooks, not prompt tokens
 -   **🔀 Recall v4 Memory Recall**: Multi-signal retrieval + dynamic summary + fact supplementation (primary), stable hybrid injection as automatic fallback
+-   **🧪 Entropy-Gated Metacognitive Retrieval (v8.0)**: Shannon entropy monitoring during generation detects model uncertainty → autonomous memory retrieval → prompt-level fact injection. Analogous to human "feeling of knowing" (FOK)
 -   **🔧 Configuration-Driven Adapter**: SQLAlchemy dynamic table mapping, no interface implementation required
 -   **🔐 User-Level Isolation**: HMAC-signed cache keys + UserIsolationContext + post-inference K/V cleanup
 -   **🎚️ Memory Influence Scaling (MIS)**: Continuous α ∈ [0, 1] control
@@ -331,8 +332,10 @@ dki:
 │  Phase 3: Model-Adaptive Assembly + Inference                           │
 │  ┌─────────────────────────────────────────────────────────────────┐    │
 │  │  [History Suffix] + [Trust+Reasoning Constraints] + [Pref K/V]  │    │
-│  │  + [Query] → LLM Inference → Detect retrieve_fact call          │    │
-│  │  → Fact supplementation (chunked offset+limit) → Continue       │    │
+│  │  + [Query] → LLM Inference                                      │    │
+│  │  → Fact retrieval: entropy_gated (v8.0, default for open-source)│    │
+│  │    | inline_intercept | native_tool_calls | post_hoc            │    │
+│  │  → Fact supplementation → Continue/Regenerate                   │    │
 │  └─────────────────────────────────────────────────────────────────┘    │
 │                                                                         │
 │  Advantages:                                                            │
@@ -344,6 +347,8 @@ dki:
 │  │  ✅ Preferences still via K/V injection (reuses existing infra) │    │
 │  │  ✅ Summary is extractive by default (no extra LLM call)        │    │
 │  │  ✅ retrieve_fact enables on-demand detail recovery             │    │
+│  │  ✅ Entropy-gated retrieval: uncertainty-driven autonomous      │    │
+│  │     memory recall without function call overhead (v8.0)         │    │
 │  └─────────────────────────────────────────────────────────────────┘    │
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
@@ -379,6 +384,14 @@ dki:
             enabled: true
             max_rounds: 3
             max_fact_tokens: 800
+            # v8.0: Fact retrieval method
+            # post_hoc | inline_intercept | entropy_gated | native_tool_calls | auto
+            fact_retrieve_method: "post_hoc"
+            inline_intercept_max_param_tokens: 64
+            inline_intercept_max_rounds: 3
+            # entropy_gated mode config (v8.0)
+            entropy_probe_tokens: 64 # Stage 1 probe generation max tokens
+            entropy_logprobs_k: 5 # logprobs top-k count
 ```
 
 **Fallback Mechanism**:
@@ -628,6 +641,7 @@ REST API Endpoints:
 DKI/
 ├── config/                              # Configuration files
 │   ├── config.yaml                      # ⭐ Main configuration
+│   ├── config_env.yaml                  # ⭐ Environment variable driven config
 │   ├── adapter_config.example.yaml      # ⭐ Adapter config example
 │   ├── memory_trigger.yaml              # Memory Trigger config
 │   └── reference_resolver.yaml          # Reference Resolver config
@@ -635,7 +649,7 @@ DKI/
 ├── dki/                                 # Core code directory
 │   ├── __init__.py                      # v4.0 entry (create_plugin, DKIMiddleware)
 │   │
-│   ├── integration/                     # ⭐ v4.0 Integration Layer (new)
+│   ├── integration/                     # ⭐ v4.0 Integration Layer
 │   │   ├── __init__.py                  # Integration entry
 │   │   ├── factory.py                   # ⭐ create_plugin() factory
 │   │   ├── middleware.py                # ⭐ DKIMiddleware (FastAPI)
@@ -647,10 +661,32 @@ DKI/
 │   │   ├── rag_system.py                # RAG System (async+streaming, v4.0)
 │   │   ├── conversation_router.py       # ⭐ RAG/DKI dynamic routing (v4.0)
 │   │   ├── plugin_manager.py            # Multi-instance management (v4.0)
+│   │   ├── plugin_interface.py          # Plugin interface definition
 │   │   ├── exceptions.py                # ⭐ Structured exception hierarchy (v4.0)
 │   │   ├── rate_limiter.py              # Rate limiting/circuit breaking (v4.0)
 │   │   ├── memory_router.py             # FAISS-based vector retrieval
+│   │   ├── embedding_service.py         # Embedding computation service
+│   │   ├── entropy_gated_injection.py   # Entropy-gated injection
+│   │   ├── function_call_logger.py      # Function call logging
+│   │   ├── text_utils.py                # Text utilities (token estimation)
+│   │   ├── architecture.py              # Architecture definition
+│   │   │
+│   │   ├── plugin/                      # ⭐ Injection execution engine
+│   │   │   ├── injection_executor.py    # Injection executor (Recall/Stable/fallback)
+│   │   │   ├── injection_planner.py     # Injection planner
+│   │   │   └── injection_plan.py        # Injection plan data structures
+│   │   │
+│   │   ├── injection/                   # Injection strategies (research, deprecated)
+│   │   │   ├── full_attention_injector.py     # Full Attention
+│   │   │   └── engram_inspired_injector.py    # Engram-inspired strategy
+│   │   │
 │   │   ├── recall/                      # ⭐ Recall v4 memory recall
+│   │   │   ├── recall_config.py         # Recall configuration data structures
+│   │   │   ├── multi_signal_recall.py   # Multi-signal fusion recall
+│   │   │   ├── suffix_builder.py        # Suffix assembler
+│   │   │   ├── fact_retriever.py        # Fact retriever
+│   │   │   └── prompt_formatter.py      # Prompt formatter (multi-model)
+│   │   │
 │   │   └── components/                  # Core algorithm components
 │   │       ├── memory_influence_scaling.py    # MIS
 │   │       ├── query_conditioned_projection.py  # QCP
@@ -658,68 +694,146 @@ DKI/
 │   │       ├── memory_trigger.py              # Memory trigger detection
 │   │       ├── reference_resolver.py          # Reference resolver
 │   │       ├── tiered_kv_cache.py             # L1/L2/L3/L4 tiered cache
-│   │       └── ...
+│   │       ├── session_kv_cache.py            # Session-level KV cache
+│   │       ├── hybrid_injector.py             # Hybrid injector
+│   │       ├── position_remapper.py           # Position remapping
+│   │       └── attention_budget.py            # Attention budget management
+│   │
+│   ├── api/                             # ⭐ REST API routes
+│   │   ├── routes.py                    # Route registration
+│   │   ├── dki_routes.py                # DKI chat routes (chat/stream)
+│   │   ├── dki_service.py               # DKI service layer
+│   │   ├── auth_routes.py               # Auth routes
+│   │   ├── preference_routes.py         # Preference management routes
+│   │   ├── session_routes.py            # Session management routes
+│   │   ├── stats_routes.py              # Statistics routes
+│   │   ├── monitoring_routes.py         # Monitoring routes
+│   │   ├── visualization_routes.py      # Visualization routes
+│   │   ├── models.py                    # API data models
+│   │   └── dependencies.py              # Dependency injection
 │   │
 │   ├── adapters/                        # External data adapters
+│   │   ├── base.py                      # Adapter base class
 │   │   ├── config_driven_adapter.py     # ⭐ Config-driven adapter (core)
-│   │   ├── postgresql_adapter.py        # PostgreSQL
-│   │   ├── mysql_adapter.py             # MySQL
-│   │   └── ...
+│   │   └── example_adapter.py           # Example adapter
 │   │
 │   ├── models/                          # LLM model adapters
 │   │   ├── factory.py                   # Model factory (namespace support)
 │   │   ├── base.py                      # Base adapter (sync/async/streaming)
+│   │   ├── hf_compat.py                 # HuggingFace compatibility layer
 │   │   ├── vllm_adapter.py              # vLLM adapter (streaming)
 │   │   ├── sglang_adapter.py            # SGLang adapter (streaming)
 │   │   ├── llama_adapter.py             # LLaMA adapter (streaming)
 │   │   ├── deepseek_adapter.py          # DeepSeek adapter (streaming)
-│   │   ├── glm_adapter.py              # GLM adapter (streaming)
-│   │   └── closed_source_adapter.py    # ☁️ Closed-source API adapter (v4.1)
+│   │   ├── glm_adapter.py               # GLM adapter (streaming)
+│   │   └── closed_source_adapter.py     # ☁️ Closed-source API adapter (v4.1)
 │   │
 │   ├── cache/                           # Cache system
 │   │   ├── preference_cache.py          # Preference cache (L1+L2)
 │   │   ├── redis_client.py              # Redis distributed cache
-│   │   └── non_vectorized_handler.py    # Dynamic vector processing
+│   │   ├── non_vectorized_handler.py    # Dynamic vector processing
+│   │   └── user_isolation.py            # User isolation (HMAC signing)
+│   │
+│   ├── database/                        # Database layer
+│   │   ├── connection.py                # Database connection management
+│   │   ├── models.py                    # ORM model definitions
+│   │   └── repository.py               # Data repository
 │   │
 │   ├── config/                          # Configuration loading
 │   │   └── config_loader.py             # YAML config loader (hot-reload)
 │   │
 │   ├── attention/                       # FlashAttention integration
+│   │   ├── backend.py                   # FA3/FA2 backend auto-detection
+│   │   ├── config.py                    # FlashAttention configuration
+│   │   ├── kv_injection.py              # K/V injection optimization
+│   │   └── profiler.py                  # Performance profiling
+│   │
+│   ├── web/                             # Web application entry
+│   │   └── app.py                       # FastAPI app (API + static files)
+│   │
+│   ├── hybrid/                          # Hybrid plugins
+│   │   └── plugin_loader.py             # Plugin loader
+│   │
+│   ├── example_app/                     # Example application (standalone)
+│   │   ├── app.py                       # FastAPI example app
+│   │   ├── main.py                      # Startup entry
+│   │   └── service.py                   # Business service layer
+│   │
 │   └── experiment/                      # Experiment system
+│       ├── runner.py                    # Experiment runner
+│       ├── metrics.py                   # Evaluation metrics
+│       ├── data_generator.py            # Data generator
+│       └── sqlite_adapter.py            # Experiment database adapter
 │
 ├── demo/                                # ⭐ Example application
 │   ├── app.py                           # FastAPI app (uses integration layer)
+│   ├── config.py                        # Demo configuration
+│   ├── dki_bridge.py                    # DKI bridge layer
 │   ├── api/                             # API routes
 │   │   ├── auth.py                      # Auth (login/register/password)
-│   │   └── chat.py                      # Chat (regular + streaming)
+│   │   ├── chat.py                      # Chat (regular + streaming)
+│   │   ├── messages.py                  # Message management
+│   │   ├── preferences.py               # Preference management
+│   │   ├── sessions.py                  # Session management
+│   │   └── deps.py                      # Dependency injection
 │   └── store/                           # Data persistence
 │       ├── base.py                      # IChatStore interface
-│       └── base_impl.py                 # SQLite/PostgreSQL implementation
+│       ├── factory.py                   # Store factory
+│       ├── models.py                    # ORM models
+│       ├── connection.py                # Connection management
+│       ├── base_impl.py                 # SQLite base implementation
+│       ├── sqlite_store.py              # SQLite Store
+│       ├── postgres_store.py            # PostgreSQL Store
+│       ├── async_postgres_store.py      # Async PostgreSQL Store
+│       ├── pgvector_store.py            # pgvector vector search Store
+│       ├── async_pgvector_store.py      # Async pgvector Store
+│       ├── async_base_impl.py           # Async base implementation
+│       └── bm25_mixin.py               # BM25 search mixin
 │
 ├── ui/                                  # Vue3 Example Frontend
 │   └── src/
 │       ├── views/
 │       │   ├── ChatView.vue             # Chat (streaming+anchors+scroll)
 │       │   ├── LoginView.vue            # Login/Register
-│       │   └── ProfileView.vue          # User profile management
+│       │   ├── ProfileView.vue          # User profile management
+│       │   ├── PreferencesView.vue      # Preference management
+│       │   ├── SessionsView.vue         # Session history
+│       │   ├── StatsView.vue            # System statistics
+│       │   └── InjectionVizView.vue     # Injection visualization
 │       ├── components/
-│       │   └── SettingsDialog.vue       # Settings (streaming toggle)
+│       │   ├── SettingsDialog.vue       # Settings (streaming toggle)
+│       │   ├── ChatInput.vue            # Chat input component
+│       │   └── MessageItem.vue          # Message item component
 │       └── stores/
-│           └── settings.ts              # Settings state (streamingEnabled)
+│           ├── settings.ts              # Settings state (streamingEnabled)
+│           ├── auth.ts                  # Auth state
+│           ├── chat.ts                  # Chat state
+│           └── preferences.ts           # Preferences state
 │
 ├── tests/                               # Tests
-│   └── unit/
-│       ├── test_integration_layer.py    # Integration layer tests (v4.0)
-│       ├── test_p0p1_exceptions.py      # Exception hierarchy tests
-│       ├── test_p1_rate_limiter.py      # Rate limiting tests
-│       ├── test_streaming_chat.py       # Streaming chat tests
-│       ├── test_rag_system_v6.py        # RAG system tests
+│   ├── unit/                            # Unit tests
+│   │   ├── test_integration_layer.py    # Integration layer tests (v4.0)
+│   │   ├── test_p0p1_exceptions.py      # Exception hierarchy tests
+│   │   ├── test_p1_rate_limiter.py      # Rate limiting tests
+│   │   ├── test_streaming_chat.py       # Streaming chat tests
+│   │   ├── test_rag_system_v6.py        # RAG system tests
+│   │   ├── test_inline_intercept.py     # Inline intercept tests
+│   │   ├── test_native_tool_calls.py    # Native tool calls tests
+│   │   ├── test_entropy_gated.py        # Entropy-gated retrieval tests (v8.0)
+│   │   ├── test_adapter_logprobs.py     # Adapter logprobs tests (v8.0)
+│   │   └── ...
+│   ├── integration/                     # Integration tests
+│   │   └── ...
+│   ├── behavior/                        # Behavior tests
+│   │   └── ...
+│   └── fixtures/                        # Test fixtures
 │       └── ...
 │
 ├── scripts/                             # Scripts
 │   ├── setup.bat / setup.sh             # Setup scripts
 │   ├── init_db.sql                      # SQLite database init
 │   ├── init_db_postgresql.sql           # PostgreSQL database init
+│   ├── start_dki_with_model.sh          # Dynamic model startup (with config_env.yaml)
 │   └── start_vllm_with_tools.sh         # vLLM Function Calling startup
 │
 ├── docs/                                # Documentation
@@ -735,26 +849,27 @@ DKI/
 
 ## 📊 Project Status
 
-| Module                         | Status     | Description                                          |
-| ------------------------------ | ---------- | ---------------------------------------------------- |
-| DKI Core Plugin                | ✅ Done    | K/V injection, hybrid strategy, gating               |
-| v4.0 Integration Layer         | ✅ Done    | create_plugin, DKIMiddleware, EnhancedDKIPlugin      |
-| Dynamic Routing                | ✅ Done    | RAG/DKI 5-dimension auto-switching                   |
-| Message Management             | ✅ Done    | Message + preference persistence                     |
-| Streaming Generation           | ✅ Done    | All model adapters support async streaming           |
-| Structured Exceptions          | ✅ Done    | Three-tier degradation chain                         |
-| Rate Limiting/Circuit Breaking | ✅ Done    | Externalized config, hot-reload                      |
-| Recall v4 Memory Recall        | ✅ Done    | Multi-signal retrieval + dynamic summary + fact call |
-| Config-Driven Adapter          | ✅ Done    | SQLAlchemy dynamic table mapping                     |
-| Redis Distributed Cache        | ✅ Done    | L1+L2 cache                                          |
-| FlashAttention                 | ✅ Done    | FA3/FA2 auto-detection                               |
-| User Management                | ✅ Done    | Register/login/password change/recovery              |
-| Vue3 Example UI                | ✅ Done    | Chat/streaming/anchors/preferences/stats             |
-| Closed-Source Model Support    | ✅ Done    | Auto RAG routing for OpenAI/DeepSeek/GLM APIs (v4.1) |
-| Unit Tests                     | ✅ Done    | Core component test coverage                         |
-| Attention Heatmap              | 🔄 Planned | Debug attention weight visualization                 |
-| File Upload/Skills             | 🔄 Planned | Text file upload and skill support                   |
-| LangChain/LlamaIndex           | 📋 TBD     | Ecosystem integration                                |
+| Module                         | Status     | Description                                           |
+| ------------------------------ | ---------- | ----------------------------------------------------- |
+| DKI Core Plugin                | ✅ Done    | K/V injection, hybrid strategy, gating                |
+| v4.0 Integration Layer         | ✅ Done    | create_plugin, DKIMiddleware, EnhancedDKIPlugin       |
+| Dynamic Routing                | ✅ Done    | RAG/DKI 5-dimension auto-switching                    |
+| Message Management             | ✅ Done    | Message + preference persistence                      |
+| Streaming Generation           | ✅ Done    | All model adapters support async streaming            |
+| Structured Exceptions          | ✅ Done    | Three-tier degradation chain                          |
+| Rate Limiting/Circuit Breaking | ✅ Done    | Externalized config, hot-reload                       |
+| Recall v4 Memory Recall        | ✅ Done    | Multi-signal retrieval + dynamic summary + fact call  |
+| Entropy-Gated Retrieval (v8.0) | ✅ Done    | Shannon entropy monitoring + autonomous memory recall |
+| Config-Driven Adapter          | ✅ Done    | SQLAlchemy dynamic table mapping                      |
+| Redis Distributed Cache        | ✅ Done    | L1+L2 cache                                           |
+| FlashAttention                 | ✅ Done    | FA3/FA2 auto-detection                                |
+| User Management                | ✅ Done    | Register/login/password change/recovery               |
+| Vue3 Example UI                | ✅ Done    | Chat/streaming/anchors/preferences/stats              |
+| Closed-Source Model Support    | ✅ Done    | Auto RAG routing for OpenAI/DeepSeek/GLM APIs (v4.1)  |
+| Unit Tests                     | ✅ Done    | Core component test coverage                          |
+| Attention Heatmap              | 🔄 Planned | Debug attention weight visualization                  |
+| File Upload/Skills             | 🔄 Planned | Text file upload and skill support                    |
+| LangChain/LlamaIndex           | 📋 TBD     | Ecosystem integration                                 |
 
 ## ⚙️ Configuration
 
@@ -798,6 +913,10 @@ dki:
         fact_call:
             enabled: true
             max_rounds: 3
+            # v8.0: entropy_gated | inline_intercept | post_hoc | native_tool_calls | auto
+            fact_retrieve_method: "post_hoc"
+            entropy_probe_tokens: 64
+            entropy_logprobs_k: 5
 
     hybrid_injection:
         enabled: true
@@ -933,6 +1052,9 @@ A: Provide an adapter config file, call `create_plugin()` to create the plugin, 
 **Q: Can DKI work with closed-source models like GPT-4 or DeepSeek API?**  
 A: Yes (v4.1+). Set `default_engine: "closed_source"` in `config.yaml` with your API key and base URL. DKI automatically detects the closed-source model and routes all requests through RAG (prompt concatenation + API call). The integration API (`create_plugin()`, `dki.chat()`) remains identical — no code changes needed. Note: K/V injection is not available for closed-source models since model internals are inaccessible.
 
+**Q: What is Entropy-Gated Metacognitive Retrieval (v8.0)?**  
+A: When using open-source models, DKI monitors the Shannon entropy of generated tokens during a short "probe" generation (64 tokens). If a high-entropy spike is detected (indicating model uncertainty), the system autonomously retrieves relevant facts from memory and injects them into the prompt for a full regeneration. This is analogous to the human "feeling of knowing" (FOK) — the model recognizes it lacks information and self-triggers memory retrieval. Configure via `fact_retrieve_method: "entropy_gated"` in `config.yaml`.
+
 **Q: Production deployment recommendations?**  
 A:
 
@@ -956,4 +1078,4 @@ Contributions are welcome! Please read our contributing guidelines first.
 
 ---
 
-**DKI v4.0** - Rethinking Memory Augmentation at the Attention Level
+**DKI v8.0** - Cognitive-Aligned Memory Augmentation with Entropy-Gated Metacognitive Retrieval
