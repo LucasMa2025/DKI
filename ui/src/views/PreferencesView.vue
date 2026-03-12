@@ -256,8 +256,14 @@ const preferences = computed(() => preferencesStore.preferences)
 const activePreferences = computed(() => preferencesStore.activePreferences)
 const preferencesByCategory = computed(() => preferencesStore.preferencesByCategory)
 
+// 预设分类 + 已有分类合并 (确保即使没有偏好也有可选项, 且支持自由输入)
+const defaultCategories = ['General', 'Work', 'Style', 'Technical', 'Domain', 'Personal']
+
 const existingCategories = computed(() => {
-  return Object.keys(preferencesByCategory.value).filter(c => c !== 'Uncategorized')
+  const fromPrefs = Object.keys(preferencesByCategory.value).filter(c => c !== 'Uncategorized')
+  // 合并预设 + 已有, 去重
+  const merged = new Set([...defaultCategories, ...fromPrefs])
+  return Array.from(merged)
 })
 
 const filteredPreferences = computed(() => {

@@ -46,6 +46,10 @@
         <el-tooltip content="对话导航" v-if="userAnchors.length > 0">
           <el-button :icon="List" text @click="showAnchorPanel = !showAnchorPanel" />
         </el-tooltip>
+        <!-- 复制整个会话 -->
+        <el-tooltip content="复制整个对话" v-if="messages.length > 0">
+          <el-button :icon="DocumentCopy" text @click="handleCopySession" />
+        </el-tooltip>
         <el-tooltip content="DKI Debug Info" v-if="settingsStore.dkiDebugMode">
           <el-button :icon="InfoFilled" text @click="showDebugPanel = !showDebugPanel" />
         </el-tooltip>
@@ -124,6 +128,19 @@
                 />
                 <div v-else class="plain-content">{{ message.content }}</div>
               </template>
+            </div>
+            
+            <!-- 复制单条消息按钮 -->
+            <div class="message-actions" v-if="message.content">
+              <el-tooltip content="复制" placement="top">
+                <el-button
+                  :icon="CopyDocument"
+                  text
+                  size="small"
+                  class="copy-btn"
+                  @click="handleCopyMessage(message)"
+                />
+              </el-tooltip>
             </div>
             
             <!-- DKI Metadata Badge -->
@@ -288,15 +305,14 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, nextTick, watch, onMounted, onUnmounted } from 'vue'
-import { Delete, Edit, InfoFilled, Promotion, ArrowUp, ArrowDown, List, Close } from '@element-plus/icons-vue'
+import { ref, computed, nextTick, watch, onUnmounted } from 'vue'
+import { Delete, Edit, InfoFilled, Promotion, ArrowUp, ArrowDown, List, Close, CopyDocument, DocumentCopy } from '@element-plus/icons-vue'
 import { ElMessageBox, ElMessage } from 'element-plus'
 import { useChatStore } from '@/stores/chat'
 import { useAuthStore } from '@/stores/auth'
 import { useSettingsStore } from '@/stores/settings'
 import { renderMarkdown } from '@/utils/markdown'
-import { api } from '@/services/api'
-import type { ChatRequest } from '@/types'
+import type { ChatRequest, ChatMessage } from '@/types'
 import dayjs from 'dayjs'
 
 const chatStore = useChatStore()
@@ -338,8 +354,8 @@ const lastDkiMetadata = computed(() => {
 // 对话锚点: 提取所有用户消息的前 5-20 个字作为预览
 const userAnchors = computed(() => {
   return messages.value
-    .filter(m => m.role === 'user' && m.content)
-    .map(m => {
+    .filter((m: ChatMessage) => m.role === 'user' && m.content)
+    .map((m: ChatMessage) => {
       const text = m.content.trim().replace(/\s+/g, ' ')
       const maxLen = 20
       const preview = text.length > maxLen ? text.slice(0, maxLen) + '...' : text
@@ -429,6 +445,9 @@ async function handleSendStream(content: string) {
     chatStore.currentSessionId = session.id
   }
   
+  // ★ 保存 sessionId 到局部变量, 防止异步过程中 currentSessionId 被切换
+  const sessionId = chatStore.currentSessionId!
+  
   // 添加用户消息到本地
   const userMessage = {
     id: `temp-${Date.now()}`,
@@ -502,6 +521,9 @@ async function handleSendStream(content: string) {
     let buffer = ''
     chatStore.loading = false  // 停止 loading 动画, 开始流式显示
     
+    // v5.9: 正确解析 SSE event + data 对
+    let currentEventType = 'token'  // 默认事件类型
+    
     while (true) {
       const { done, value } = await reader.read()
       if (done) break
@@ -514,7 +536,8 @@ async function handleSendStream(content: string) {
       
       for (const line of lines) {
         if (line.startsWith('event: ')) {
-          // 事件类型行, 下一行是 data
+          // 记录事件类型, 下一行 data 使用
+          currentEventType = line.slice(7).trim()
           continue
         }
         if (line.startsWith('data: ')) {
@@ -523,42 +546,73 @@ async function handleSendStream(content: string) {
             const data = JSON.parse(dataStr)
             const lastMsg = chatStore.messages[chatStore.messages.length - 1]
             
-            if (data.content !== undefined && lastMsg?.role === 'assistant') {
-              // token 事件
-              lastMsg.content += data.content
-              scrollToBottom()
-            } else if (data.text !== undefined) {
-              // done 事件
-              if (lastMsg?.role === 'assistant') {
-                lastMsg.content = data.text
+            if (currentEventType === 'token') {
+              // 正常输出内容
+              if (data.content !== undefined && lastMsg?.role === 'assistant') {
+                lastMsg.content += data.content
+                scrollToBottom()
               }
-            } else if (data.error) {
-              // error 事件
+            } else if (currentEventType === 'thinking') {
+              // v5.9: 思考过程 — 以折叠块显示
+              if (data.content !== undefined && lastMsg?.role === 'assistant') {
+                // 如果尚未添加思考标记, 添加折叠块开头
+                if (!lastMsg._thinkingStarted) {
+                  lastMsg.content += '\n<details><summary>💭 思考过程</summary>\n\n'
+                  lastMsg._thinkingStarted = true
+                }
+                lastMsg.content += data.content
+                scrollToBottom()
+              }
+            } else if (currentEventType === 'done') {
+              // ★ done 事件: 用过滤后的干净文本替换
               if (lastMsg?.role === 'assistant') {
+                lastMsg.content = data.text || lastMsg.content
+                // 清除思考状态标记
+                delete lastMsg._thinkingStarted
+              }
+            } else if (currentEventType === 'metadata') {
+              // 元数据事件, 可选处理
+            } else if (currentEventType === 'error') {
+              if (lastMsg?.role === 'assistant') {
+                lastMsg.content = `❌ 流式生成错误: ${data.error}`
+              }
+            } else {
+              // 兼容旧格式: 无 event 行时的 data
+              if (data.content !== undefined && lastMsg?.role === 'assistant') {
+                lastMsg.content += data.content
+                scrollToBottom()
+              } else if (data.text !== undefined && lastMsg?.role === 'assistant') {
+                lastMsg.content = data.text
+              } else if (data.error && lastMsg?.role === 'assistant') {
                 lastMsg.content = `❌ 流式生成错误: ${data.error}`
               }
             }
           } catch {
             // 忽略解析错误
           }
+          // 重置事件类型为默认 (每个 event+data 对消费后重置)
+          currentEventType = 'token'
         }
       }
     }
     
     // 更新会话信息
-    const session = chatStore.sessions.find(s => s.id === chatStore.currentSessionId)
+    const session = chatStore.sessions.find((s: { id: string }) => s.id === sessionId)
     if (session) {
       session.preview = content.slice(0, 50)
       session.messageCount = chatStore.messages.length
       session.updatedAt = new Date().toISOString()
     }
     
-    // 自动命名新会话
-    if (isNewSession && chatStore.currentSessionId) {
-      const autoTitle = chatStore.generateSessionTitle
-        ? (chatStore as any).generateSessionTitle(content)
-        : content.slice(0, 30)
-      chatStore.renameSession(chatStore.currentSessionId, autoTitle).catch(() => {})
+    // ★ 自动命名新会话 (使用局部 sessionId, 避免竞态)
+    if (isNewSession && sessionId) {
+      const autoTitle = chatStore.generateSessionTitle(content)
+      try {
+        await chatStore.renameSession(sessionId, autoTitle)
+        console.log(`[ChatView] Auto-renamed session ${sessionId}: "${autoTitle}"`)
+      } catch (e) {
+        console.warn('[ChatView] Auto-rename session failed:', sessionId, e)
+      }
     }
     
   } catch (e) {
@@ -625,6 +679,62 @@ async function handleClearChat() {
   })
   
   chatStore.clearMessages()
+}
+
+// ============ 复制功能 ============
+
+/** 复制单条消息内容 */
+function handleCopyMessage(message: { role: string; content: string }) {
+  const text = message.content || ''
+  navigator.clipboard.writeText(text).then(() => {
+    ElMessage.success('已复制到剪贴板')
+  }).catch(() => {
+    // fallback: textarea 方式
+    fallbackCopy(text)
+  })
+}
+
+/** 复制整个会话 */
+function handleCopySession() {
+  if (messages.value.length === 0) return
+  
+  const title = currentSession.value?.title || 'Chat'
+  const lines: string[] = [`# ${title}`, '']
+  
+  for (const msg of messages.value) {
+    const role = msg.role === 'user'
+      ? (authStore.user?.username || '用户')
+      : 'DKI Assistant'
+    const time = msg.timestamp ? dayjs(msg.timestamp).format('YYYY-MM-DD HH:mm') : ''
+    const header = time ? `**${role}** (${time})` : `**${role}**`
+    lines.push(header)
+    lines.push(msg.content || '')
+    lines.push('')  // 空行分隔
+  }
+  
+  const text = lines.join('\n')
+  navigator.clipboard.writeText(text).then(() => {
+    ElMessage.success(`已复制 ${messages.value.length} 条消息`)
+  }).catch(() => {
+    fallbackCopy(text)
+  })
+}
+
+/** 剪贴板 fallback (兼容 HTTP 环境) */
+function fallbackCopy(text: string) {
+  const ta = document.createElement('textarea')
+  ta.value = text
+  ta.style.position = 'fixed'
+  ta.style.left = '-9999px'
+  document.body.appendChild(ta)
+  ta.select()
+  try {
+    document.execCommand('copy')
+    ElMessage.success('已复制到剪贴板')
+  } catch {
+    ElMessage.error('复制失败，请手动复制')
+  }
+  document.body.removeChild(ta)
 }
 
 // 清理流式连接
@@ -919,6 +1029,29 @@ watch(
   line-height: 1.6;
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+// ============ 消息复制按钮 ============
+.message-actions {
+  display: flex;
+  gap: 4px;
+  margin-top: 4px;
+  opacity: 0;
+  transition: opacity 0.2s ease;
+  
+  .copy-btn {
+    font-size: 12px;
+    color: var(--text-muted);
+    padding: 2px 6px;
+    
+    &:hover {
+      color: var(--primary-color);
+    }
+  }
+}
+
+.message-wrapper:hover .message-actions {
+  opacity: 1;
 }
 
 .dki-metadata {
