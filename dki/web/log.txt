@@ -1,0 +1,41 @@
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+INFO:     39.130.51.43:49195 - "GET / HTTP/1.1" 200 OK
+2026-03-12 14:01:14.281 | DEBUG    | dki.core.dki_plugin:chat:1058 - Adapter data loaded: 0 preferences, 0 relevant history messages (recent=0, retrieval_mode=unknown)
+2026-03-12 14:01:14.282 | DEBUG    | dki.core.plugin.injection_planner:build_plan:442 - Plan built: strategy=recall_v4, recall=, inject=True, pref_α=0.40, prefs=0, history=0
+INFO:     39.130.51.43:49364 - "POST /api/chat HTTP/1.1" 200 OK
+INFO:     39.130.51.43:49367 - "GET /v1/dki/visualization/latest HTTP/1.1" 200 OK
+2026-03-12 14:01:39.183 | DEBUG    | dki.database.repository:create:628 - Created preference: pref_c7abab5c375e44e8 for user demo_user
+2026-03-12 14:01:39.186 | INFO     | dki.web.app:add_preference:848 - Added preference for user demo_user: 推理过程: 严谨,存疑澄清
+语言风格: 细腻温暖
+我的名字: lucas
+我的喜好: 编程,使用语言...
+INFO:     39.130.51.43:49381 - "POST /api/preference HTTP/1.1" 200 OK
+2026-03-12 14:01:39.242 | INFO     | dki.core.rag_system:__init__:319 - RAG System initialized (v7.1: async + streaming + preference cache, history_compression=truncate)
+2026-03-12 14:01:39.564 | INFO     | dki.core.embedding_service:load:60 - Loading embedding model: sentence-transformers/all-MiniLM-L6-v2
+Loading weights: 100%|██████████| 103/103 [00:00<00:00, 11489.10it/s]
+BertModel LOAD REPORT from: sentence-transformers/all-MiniLM-L6-v2
+Key                     | Status     |  | 
+------------------------+------------+--+-
+embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED    :can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+2026-03-12 14:01:45.118 | INFO     | dki.core.embedding_service:load:66 - Embedding model loaded, dim=384
+2026-03-12 14:01:45.140 | DEBUG    | dki.database.repository:create:53 - Created session: session_7o1jjnqa9
+2026-03-12 14:01:45.141 | DEBUG    | dki.database.repository:create:141 - Created memory: mem_f3a21164ce6b4331
+2026-03-12 14:01:45.159 | INFO     | dki.core.memory_router:_init_index:74 - FAISS index initialized, dim=384
+2026-03-12 14:01:45.160 | DEBUG    | dki.core.memory_router:add_memory:122 - Added memory: mem_f3a21164ce6b4331
+2026-03-12 14:01:45.160 | DEBUG    | dki.core.dki_system:add_memory:596 - Added memory: mem_f3a21164ce6b4331
+2026-03-12 14:01:45.164 | INFO     | dki.core.memory_router:_init_index:74 - FAISS index initialized, dim=384
+2026-03-12 14:01:45.164 | DEBUG    | dki.core.memory_router:add_memory:122 - Added memory: mem_f3a21164ce6b4331
+2026-03-12 14:01:45.164 | DEBUG    | dki.core.rag_system:add_memory:470 - Added memory: mem_f3a21164ce6b4331 (skip_db=True)
+INFO:     39.130.51.43:49381 - "POST /api/memory HTTP/1.1" 200 OK
+2026-03-12 14:02:07.979 | DEBUG    | dki.core.dki_plugin:_get_cached_preferences:742 - Preference text cache hit for user demo_user
+2026-03-12 14:02:07.979 | DEBUG    | dki.core.dki_plugin:chat:1058 - Adapter data loaded: 0 preferences, 0 relevant history messages (recent=0, retrieval_mode=unknown)
+2026-03-12 14:02:07.979 | DEBUG    | dki.core.plugin.injection_planner:build_plan:442 - Plan built: strategy=recall_v4, recall=, inject=True, pref_α=0.40, prefs=0, history=0
+INFO:     39.130.51.43:49406 - "POST /api/chat HTTP/1.1" 200 OK
+2026-03-12 14:02:21.592 | DEBUG    | dki.core.dki_plugin:_get_cached_preferences:742 - Preference text cache hit for user demo_user
+2026-03-12 14:02:21.592 | DEBUG    | dki.core.dki_plugin:chat:1058 - Adapter data loaded: 0 preferences, 0 relevant history messages (recent=0, retrieval_mode=unknown)
+2026-03-12 14:02:21.592 | DEBUG    | dki.core.plugin.injection_planner:build_plan:442 - Plan built: strategy=recall_v4, recall=, inject=True, pref_α=0.40, prefs=0, history=0
+INFO:     39.130.51.43:49539 - "POST /api/chat HTTP/1.1" 200 OK

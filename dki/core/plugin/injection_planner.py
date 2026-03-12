@@ -769,7 +769,14 @@ class InjectionPlanner:
         self,
         messages: List[AdapterChatMessage],
     ) -> str:
-        """格式化历史消息为后缀提示词"""
+        """
+        格式化历史消息为后缀提示词 (stable 回退路径)
+        
+        v7.3 改进:
+        - 按时间戳排序 (确保时间正序)
+        - 成对注入: 确保 user 问题和 assistant 回复成对出现
+        - 添加时间戳前缀, 便于 LLM 理解对话时间线
+        """
         if not messages:
             return ""
         
@@ -780,25 +787,79 @@ class InjectionPlanner:
             prefix = self.HISTORY_PREFIX_EN
             suffix = self.HISTORY_SUFFIX_EN
         
-        lines = []
-        for msg in messages:
+        # v7.3: 按时间戳排序
+        sorted_msgs = sorted(
+            messages,
+            key=lambda m: (
+                m.timestamp.isoformat() if hasattr(m.timestamp, 'isoformat') 
+                else str(getattr(m, 'timestamp', ''))
+            ),
+        )
+        
+        # v7.4: 移除末尾无 assistant 回复的 user 消息
+        # 用户当前查询已在 prompt 最后, 历史中不应重复
+        while sorted_msgs and getattr(sorted_msgs[-1], 'role', '') == 'user':
+            sorted_msgs.pop()
+        
+        # v7.3: 成对组织 — 确保 user+assistant 成对出现
+        paired_lines = []
+        i = 0
+        while i < len(sorted_msgs):
+            msg = sorted_msgs[i]
             content = msg.content
             
             # 过滤包含注入标记的 assistant 消息 (防止递归注入)
             if msg.role == "assistant":
                 if any(marker in content for marker in self._INJECTION_MARKERS):
+                    i += 1
                     continue
             
             if self.language == "cn":
                 role_label = "用户" if msg.role == "user" else "助手"
             else:
                 role_label = "User" if msg.role == "user" else "Assistant"
-            lines.append(f"{role_label}: {content}")
+            
+            # v7.3: 时间戳前缀
+            ts_str = ""
+            if hasattr(msg, 'timestamp') and msg.timestamp:
+                try:
+                    if hasattr(msg.timestamp, 'strftime'):
+                        ts_str = msg.timestamp.strftime("%Y-%m-%d %H:%M")
+                    else:
+                        ts_str = str(msg.timestamp)
+                except Exception:
+                    pass
+            ts_prefix = f"[{ts_str}] " if ts_str else ""
+            
+            paired_lines.append(f"{ts_prefix}{role_label}: {content}")
+            
+            # v7.3: 如果当前是 user 消息, 检查下一条是否是对应的 assistant 回复
+            if msg.role == "user" and i + 1 < len(sorted_msgs):
+                next_msg = sorted_msgs[i + 1]
+                if next_msg.role == "assistant":
+                    next_content = next_msg.content
+                    if not any(marker in next_content for marker in self._INJECTION_MARKERS):
+                        next_ts_str = ""
+                        if hasattr(next_msg, 'timestamp') and next_msg.timestamp:
+                            try:
+                                if hasattr(next_msg.timestamp, 'strftime'):
+                                    next_ts_str = next_msg.timestamp.strftime("%Y-%m-%d %H:%M")
+                                else:
+                                    next_ts_str = str(next_msg.timestamp)
+                            except Exception:
+                                pass
+                        next_ts_prefix = f"[{next_ts_str}] " if next_ts_str else ""
+                        next_role = "助手" if self.language == "cn" else "Assistant"
+                        paired_lines.append(f"{next_ts_prefix}{next_role}: {next_content}")
+                        i += 2  # 跳过已处理的 assistant 消息
+                        continue
+            
+            i += 1
         
-        if not lines:
+        if not paired_lines:
             return ""
         
-        return prefix + "\n".join(lines) + suffix
+        return prefix + "\n\n".join(paired_lines) + suffix
     
     def _compute_alpha_profile(
         self,

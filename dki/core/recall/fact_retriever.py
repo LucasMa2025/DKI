@@ -95,7 +95,7 @@ class FactRetriever:
                     offset=offset,
                     has_more=False,
                 )
-
+            logger.info(f"FactRetriever: trace_id={trace_id}, session_id={session_id}, message={message}")
             content = getattr(message, "content", str(message))
             role = getattr(message, "role", "unknown")
             timestamp = str(getattr(message, "created_at", ""))

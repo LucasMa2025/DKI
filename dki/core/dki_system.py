@@ -741,34 +741,60 @@ class DKISystem:
         except Exception as e:
             logger.warning(f"Failed to load preferences from DB for user {user_id}: {e}")
     
+    # ============ v8.0: 中文停用词表 (jieba BM25 过滤) ============
+    _CHINESE_STOPWORDS: set = {
+        '的', '了', '在', '是', '我', '有', '和', '就', '不', '人', '都', '一',
+        '一个', '上', '也', '很', '到', '说', '要', '去', '你', '会', '着',
+        '没有', '看', '好', '自己', '这', '他', '她', '它', '们', '那', '些',
+        '什么', '怎么', '为什么', '可以', '没', '把', '被', '让', '给', '从',
+        '但', '但是', '而', '而且', '如果', '因为', '所以', '虽然', '还是',
+        '已经', '还', '又', '再', '比较', '更', '最', '这个', '那个', '哪个',
+        '这些', '那些', '哪些', '吗', '呢', '吧', '啊', '呀', '嗯', '哦',
+        '哈', '嘿', '哎', '唉', '喂', '嗨', '嘛', '么', '啦', '哇',
+        '请', '请问', '谢谢', '好的', '知道', '明白', '对', '嗯嗯',
+        '不是', '可能', '应该', '需要', '能', '能够', '想', '觉得',
+        '然后', '之后', '以后', '以前', '之前', '现在', '时候',
+        '这样', '那样', '怎样', '这么', '那么', '多', '少', '大', '小',
+        '其实', '只是', '就是', '不过', '当然', '真的', '确实',
+        '比如', '例如', '关于', '对于', '通过', '进行', '使用',
+        '一下', '一些', '一点', '一样', '一起', '一直',
+    }
+
     def get_session_history(
         self,
         session_id: str,
         max_messages: int = 10,
         user_id: Optional[str] = None,
+        query: Optional[str] = None,
     ) -> SessionHistory:
         """
         Get session history for hybrid injection, with cross-session support.
+        
+        v8.0: jieba 分词 + BM25 相关性召回 + 成对消息构造
+        - 使用 jieba 分词 + BM25 对历史消息进行相关性排序
+        - 无语义词语排除 (中文停用词 + 单字符过滤)
+        - 消息成对构造 (User : AI), 带明确 role 标记
+        - 保留时间戳
+        - 排除最后的用户查询问题 (避免与当前输入重复)
         
         v6.1: 支持跨会话记忆
         - 首先获取当前会话的历史消息
         - 如果提供了 user_id, 还会补充该用户其他会话的历史消息
         - 跨会话消息放在当前会话消息之前 (按时间顺序)
         
-        History is:
-        - Longer (can be 100-500 tokens)
-        - Dynamic (changes each turn)
-        - Injected as suffix prompt with trust-establishing guidance
-        
         Args:
             session_id: Session identifier
             max_messages: Maximum messages to retrieve
             user_id: User identifier (optional, for cross-session retrieval)
+            query: Current user query (for BM25 relevance ranking)
             
         Returns:
-            SessionHistory object
+            SessionHistory object with paired messages
         """
         history = SessionHistory(session_id=session_id)
+        
+        # 收集所有候选消息 (带元数据)
+        all_raw_messages = []
         
         with self.db_manager.session_scope() as db:
             conv_repo = ConversationRepository(db)
@@ -776,37 +802,310 @@ class DKISystem:
             # v6.1: 先添加跨会话历史 (旧的先加, 时间顺序排列)
             if user_id:
                 try:
-                    cross_session_limit = max_messages // 2  # 跨会话消息占一半配额
+                    cross_session_limit = max_messages // 2
                     cross_msgs = conv_repo.get_recent_by_user_cross_session(
                         user_id=user_id,
                         current_session_id=session_id,
                         limit=cross_session_limit,
                     )
                     for msg in cross_msgs:
-                        history.add_message(
-                            role=msg.role,
-                            content=msg.content,
-                            timestamp=msg.created_at.timestamp() if msg.created_at else None,
-                        )
+                        all_raw_messages.append({
+                            'role': msg.role,
+                            'content': msg.content,
+                            'timestamp': msg.created_at.timestamp() if msg.created_at else None,
+                            'created_at': msg.created_at,
+                            'source': 'cross_session',
+                        })
                     if cross_msgs:
                         logger.info(
-                            f"Cross-session history: added {len(cross_msgs)} messages "
+                            f"Cross-session history: loaded {len(cross_msgs)} messages "
                             f"from previous sessions for user {user_id}"
                         )
                 except Exception as e:
                     logger.warning(f"Cross-session history retrieval failed (non-critical): {e}")
             
-            # 当前会话的历史消息
-            messages = conv_repo.get_recent(session_id, limit=max_messages)
+            # 当前会话的历史消息 (多取一些, BM25 筛选后再截断)
+            fetch_limit = max(max_messages * 3, 30)
+            messages = conv_repo.get_recent(session_id, limit=fetch_limit)
             
             for msg in messages:
-                history.add_message(
-                    role=msg.role,
-                    content=msg.content,
-                    timestamp=msg.created_at.timestamp() if msg.created_at else None,
-                )
+                all_raw_messages.append({
+                    'role': msg.role,
+                    'content': msg.content,
+                    'timestamp': msg.created_at.timestamp() if msg.created_at else None,
+                    'created_at': msg.created_at,
+                    'source': 'current_session',
+                })
+        
+        if not all_raw_messages:
+            return history
+        
+        # ============ v8.0-1: 排除末尾的用户查询 (避免与当前输入重复) ============
+        all_raw_messages = self._remove_trailing_user_queries(all_raw_messages)
+        
+        if not all_raw_messages:
+            return history
+        
+        # ============ v8.0-2: jieba + BM25 相关性排序 (有 query 时) ============
+        if query and len(all_raw_messages) > max_messages:
+            all_raw_messages = self._bm25_rank_history(
+                query=query,
+                messages=all_raw_messages,
+                max_results=max_messages,
+            )
+        else:
+            # 无 query 时, 取最近的 max_messages 条
+            all_raw_messages = all_raw_messages[-max_messages:]
+        
+        # ============ v8.0-3: 成对构造 (User : AI) ============
+        paired_messages = self._pair_history_messages(all_raw_messages)
+        
+        # ============ v8.0-4: 添加到 SessionHistory (带时间戳和 role) ============
+        for msg in paired_messages:
+            history.add_message(
+                role=msg['role'],
+                content=msg['content'],
+                timestamp=msg.get('timestamp'),
+            )
+        
+        logger.info(
+            f"[get_session_history v8.0] session={session_id}, "
+            f"raw_candidates={len(all_raw_messages)}, "
+            f"paired_output={len(paired_messages)}, "
+            f"bm25_used={'yes' if query else 'no'}"
+        )
         
         return history
+    
+    @staticmethod
+    def _remove_trailing_user_queries(
+        messages: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """
+        v8.0: 从末尾移除连续的 user 消息 (最后的用户查询)
+        
+        用户当前查询已在 prompt 最后作为独立输入,
+        历史消息中不应包含最后的用户问题 (避免重复)。
+        从末尾向前扫描, 移除连续的 role='user' 消息, 遇到 assistant 停止。
+        """
+        if not messages:
+            return messages
+        
+        cut_index = len(messages)
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get('role') == 'user':
+                cut_index = i
+            else:
+                break
+        
+        if cut_index < len(messages):
+            removed = len(messages) - cut_index
+            logger.debug(
+                f"get_session_history: removed {removed} trailing user "
+                f"query message(s) from history"
+            )
+            return messages[:cut_index]
+        
+        return messages
+    
+    def _bm25_rank_history(
+        self,
+        query: str,
+        messages: List[Dict[str, Any]],
+        max_results: int = 10,
+    ) -> List[Dict[str, Any]]:
+        """
+        v8.0: 使用 jieba 分词 + BM25 对历史消息进行相关性排序
+        
+        策略:
+        1. jieba 分词 (精确模式)
+        2. 排除停用词和无语义词 (中文停用词表 + 单字符过滤)
+        3. BM25Okapi 计算文档相关性
+        4. 保留 top-k 相关消息, 同时保证最近 2 轮 (4 条) 兜底
+        5. 按原始时间顺序排列结果
+        
+        Args:
+            query: 当前用户查询
+            messages: 候选消息列表
+            max_results: 最大返回条数
+            
+        Returns:
+            按时间排序的相关消息列表
+        """
+        try:
+            import jieba
+            from rank_bm25 import BM25Okapi
+        except ImportError:
+            logger.warning(
+                "jieba or rank_bm25 not available, falling back to recency-based history"
+            )
+            return messages[-max_results:]
+        
+        if len(messages) <= max_results:
+            return messages
+        
+        # 对查询进行分词 + 停用词过滤
+        query_tokens = self._jieba_tokenize_filtered(query)
+        if not query_tokens:
+            logger.debug("BM25 history: query tokens empty after filtering, using recency")
+            return messages[-max_results:]
+        
+        # 构建 BM25 语料库
+        corpus = []
+        valid_indices = []
+        for i, msg in enumerate(messages):
+            content = msg.get('content', '')
+            if not content.strip():
+                continue
+            tokens = self._jieba_tokenize_filtered(content)
+            if tokens:
+                corpus.append(tokens)
+                valid_indices.append(i)
+        
+        if not corpus:
+            return messages[-max_results:]
+        
+        # 构建 BM25 索引并计算分数
+        try:
+            bm25 = BM25Okapi(corpus)
+            scores = bm25.get_scores(query_tokens)
+        except Exception as e:
+            logger.warning(f"BM25 history ranking failed: {e}, using recency")
+            return messages[-max_results:]
+        
+        # 将分数映射回原始消息索引
+        scored_indices = []
+        for j, idx in enumerate(valid_indices):
+            scored_indices.append((idx, float(scores[j])))
+        
+        # 保证最近 2 轮 (最后 4 条消息) 始终入选 (兜底)
+        recent_count = min(4, len(messages))
+        recent_indices = set(range(len(messages) - recent_count, len(messages)))
+        
+        # BM25 排序: 取 top 候选
+        scored_indices.sort(key=lambda x: x[1], reverse=True)
+        
+        selected_indices = set(recent_indices)  # 兜底的近期消息
+        bm25_budget = max_results - len(selected_indices)
+        
+        for idx, score in scored_indices:
+            if len(selected_indices) >= max_results:
+                break
+            if idx not in selected_indices and score > 0:
+                selected_indices.add(idx)
+                bm25_budget -= 1
+        
+        # 如果仍未满, 从最近的消息补充
+        if len(selected_indices) < max_results:
+            for i in range(len(messages) - 1, -1, -1):
+                if len(selected_indices) >= max_results:
+                    break
+                selected_indices.add(i)
+        
+        # 按原始时间顺序排列
+        result = [messages[i] for i in sorted(selected_indices)]
+        
+        logger.debug(
+            f"BM25 history ranking: {len(messages)} candidates -> "
+            f"{len(result)} selected, query_tokens={query_tokens[:5]}, "
+            f"recent_guaranteed={recent_count}"
+        )
+        
+        return result
+    
+    def _jieba_tokenize_filtered(self, text: str) -> List[str]:
+        """
+        v8.0: jieba 分词 + 停用词/无语义词过滤
+        
+        过滤规则:
+        1. 移除单字符 token (通常为虚词、标点)
+        2. 移除中文停用词表中的词
+        3. 移除纯标点/符号
+        """
+        try:
+            import jieba
+        except ImportError:
+            return []
+        
+        tokens = list(jieba.cut(text))
+        filtered = []
+        for t in tokens:
+            t = t.strip()
+            if len(t) <= 1:
+                continue  # 单字符过滤
+            if t in self._CHINESE_STOPWORDS:
+                continue  # 停用词过滤
+            # 排除纯标点/符号
+            if re.match(r'^[\W_]+$', t):
+                continue
+            filtered.append(t)
+        return filtered
+    
+    @staticmethod
+    def _pair_history_messages(
+        messages: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """
+        v8.0: 将消息成对组织 (User : AI)
+        
+        策略:
+        1. 按时间顺序扫描, 相邻的 user → assistant 自然配对
+        2. 孤立的 user 消息 (无后续 assistant) 保留但标记
+        3. 孤立的 assistant 消息 (无前置 user) 保留但标记
+        4. 确保每对消息都有明确的 role 标记
+        5. 保留时间戳
+        
+        成对规则:
+        - 如果 messages[i].role == 'user' 且 messages[i+1].role == 'assistant',
+          则 (messages[i], messages[i+1]) 构成一对
+        - 配对的消息一起保留或一起丢弃 (不拆散)
+        
+        Returns:
+            成对组织的消息列表 (保持时间序, 每条带 role 标记)
+        """
+        if not messages:
+            return messages
+        
+        paired = []
+        i = 0
+        while i < len(messages):
+            msg = messages[i]
+            role = msg.get('role', 'user')
+            
+            if role == 'user' and i + 1 < len(messages):
+                next_msg = messages[i + 1]
+                next_role = next_msg.get('role', 'user')
+                
+                if next_role == 'assistant':
+                    # 成对: user + assistant
+                    paired.append({
+                        'role': 'user',
+                        'content': msg.get('content', ''),
+                        'timestamp': msg.get('timestamp'),
+                    })
+                    paired.append({
+                        'role': 'assistant',
+                        'content': next_msg.get('content', ''),
+                        'timestamp': next_msg.get('timestamp'),
+                    })
+                    i += 2
+                    continue
+            
+            # 孤立消息: 仍保留 (可能是跨会话拼接导致的不完整对)
+            # 但 assistant 消息不应孤立出现在开头
+            if role == 'assistant' and not paired:
+                # 跳过开头孤立的 assistant 消息
+                i += 1
+                continue
+            
+            paired.append({
+                'role': role,
+                'content': msg.get('content', ''),
+                'timestamp': msg.get('timestamp'),
+            })
+            i += 1
+        
+        return paired
     
     def chat(
         self,
@@ -1034,7 +1333,10 @@ class DKISystem:
                 # Get session history (无论 history.enabled 配置, 仍尝试获取历史)
                 # 修复: 之前 history.enabled=false 导致 HybridDKIInjector 跳过历史
                 # 但这里应直接获取历史, 通过 chat template 注入
-                history = self.get_session_history(session_id, user_id=user_id)
+                # v8.0: 传入 query 以启用 jieba + BM25 相关性排序
+                history = self.get_session_history(
+                    session_id, user_id=user_id, query=original_query
+                )
                 
                 # Prepare hybrid input (用于元数据: 偏好文本、token 统计)
                 # 注意: hybrid_result.history_tokens 可能为 0 (因 config.history_enabled=false)
@@ -1074,7 +1376,11 @@ class DKISystem:
                         _hybrid_fallback_hist_tokens = len(_hist_text) // 2
                     
                     _hybrid_fallback_hist_messages = [
-                        {"role": getattr(m, 'role', 'user'), "content": getattr(m, 'content', '')}
+                        {
+                            "role": getattr(m, 'role', 'user'),
+                            "content": getattr(m, 'content', ''),
+                            "timestamp": getattr(m, 'timestamp', None),
+                        }
                         for m in history.messages
                     ]
                     
@@ -1598,12 +1904,13 @@ class DKISystem:
         
         system_content = "\n\n".join(system_parts) if system_parts else ""
         
-        # ============ 2. 历史 messages: 按原始角色还原 ============
+        # ============ 2. 历史 messages: 按原始角色还原 (v8.0: 带时间戳) ============
         history_messages = []
         for item in items:
             role = getattr(item, 'role', None) or 'user'
             content = getattr(item, 'content', str(item))
             item_type = getattr(item, 'type', 'message')
+            timestamp = getattr(item, 'timestamp', None)
             
             # v5.7: 移除历史消息中的 <think> 推理内容 (防御性)
             # 数据库存储时已清理, 但旧数据或外部数据可能仍含 think 内容
@@ -1623,6 +1930,10 @@ class DKISystem:
             # 跳过清理后为空的消息
             if not content or not content.strip():
                 continue
+            
+            # v8.0: 在 content 前添加时间戳标记
+            if timestamp:
+                content = f"[{timestamp}] {content}"
             
             history_messages.append({"role": role, "content": content})
         
@@ -1732,16 +2043,18 @@ class DKISystem:
         
         system_content = "\n\n".join(system_parts) if system_parts else ""
         
-        # ============ 2. 历史消息还原为独立 messages ============
+        # ============ 2. 历史消息还原为独立 messages (v8.0: 带时间戳) ============
         history_messages = []
         if history and hasattr(history, 'messages'):
             for msg in history.messages:
                 if isinstance(msg, dict):
                     role = msg.get('role', 'user')
                     content = msg.get('content', '')
+                    timestamp = msg.get('timestamp')
                 else:
                     role = getattr(msg, 'role', 'user')
                     content = getattr(msg, 'content', str(msg))
+                    timestamp = getattr(msg, 'timestamp', None)
                 
                 if role not in ('user', 'assistant', 'system'):
                     role = 'user'
@@ -1751,7 +2064,23 @@ class DKISystem:
                     content, _ = strip_think_content(content)
                 
                 if content and content.strip():
-                    history_messages.append({"role": role, "content": content})
+                    # v8.0: 在 content 前添加时间戳标记 (供模型参考时间上下文)
+                    ts_prefix = ""
+                    if timestamp:
+                        try:
+                            from datetime import datetime
+                            if isinstance(timestamp, (int, float)):
+                                dt = datetime.fromtimestamp(timestamp)
+                                ts_prefix = f"[{dt.strftime('%Y-%m-%d %H:%M')}] "
+                            elif isinstance(timestamp, str):
+                                ts_prefix = f"[{timestamp}] "
+                        except Exception:
+                            pass
+                    
+                    history_messages.append({
+                        "role": role,
+                        "content": f"{ts_prefix}{content}" if ts_prefix else content,
+                    })
         
         # ============ 2.5 Token 预算修剪 (v5.6) ============
         # 确保用户当前输入永远不被截断, 必要时从最旧历史开始修剪

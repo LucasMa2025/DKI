@@ -186,14 +186,21 @@ class SuffixBuilder:
         """
         Phase 1: 完整收集所有消息, 不做任何压缩决策
         
+        v7.3 改进:
+        - 收集 timestamp 字段 (来自 ChatMessage.timestamp)
+        - 按时间戳排序 (确保时间正序)
+        - 成对处理: 确保 user 问题和 assistant 回复成对出现
+        
         每条消息记录:
         - msg_id: 消息 ID (用于溯源)
         - content: 清理后的原文 (已移除 <think>)
         - role: 角色
         - tokens: 原文 token 数
+        - timestamp: 消息时间戳 (ISO 格式字符串)
+        - pair_id: 配对 ID (同一轮 user-assistant 共享)
         
         Returns:
-            收集到的消息列表 (含 token 统计)
+            收集到的消息列表 (含 token 统计, 按时间排序, 成对组织)
         """
         collected = []
 
@@ -205,6 +212,28 @@ class SuffixBuilder:
                 or getattr(msg, "message_id", None)
                 or str(id(msg))
             )
+            
+            # v7.3: 提取时间戳
+            timestamp = getattr(msg, "timestamp", None)
+            if timestamp is None:
+                timestamp = getattr(msg, "created_at", None)
+            # 统一转为 ISO 字符串
+            ts_str = ""
+            ts_sort_key = ""
+            if timestamp is not None:
+                try:
+                    if hasattr(timestamp, 'isoformat'):
+                        ts_str = timestamp.strftime("%Y-%m-%d %H:%M")
+                        ts_sort_key = timestamp.isoformat()
+                    else:
+                        ts_str = str(timestamp)
+                        ts_sort_key = str(timestamp)
+                except Exception:
+                    ts_str = str(timestamp)
+                    ts_sort_key = str(timestamp)
+            
+            # v7.3: 提取 parent_id (用于配对)
+            parent_id = getattr(msg, "parent_id", None)
 
             # 移除 assistant 消息中的 <think> 推理内容
             if role == 'assistant' and content:
@@ -221,9 +250,110 @@ class SuffixBuilder:
                 'content': content,
                 'role': role,
                 'tokens': msg_tokens,
+                'timestamp': ts_str,
+                'ts_sort_key': ts_sort_key,
+                'parent_id': parent_id,
             })
 
+        # v7.3: 按时间戳排序 (确保时间正序)
+        collected.sort(key=lambda m: m.get('ts_sort_key', ''))
+        
+        # v7.3: 成对处理 — 确保 user 问题和 assistant 回复成对出现
+        collected = self._ensure_paired_messages(collected)
+        
+        # v7.4: 移除末尾无配对的 user 消息
+        # 用户当前查询已在 prompt 最后, 历史中不应重复
+        collected = self._remove_trailing_unpaired_user(collected)
+
         return collected
+    
+    @staticmethod
+    def _remove_trailing_unpaired_user(
+        messages: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """
+        v7.4: 移除末尾没有 assistant 回复的 user 消息
+        
+        用户当前查询已在 prompt 最后作为独立输入, 不需要在历史中重复。
+        从末尾向前扫描, 移除连续的 role="user" 消息, 遇到 assistant 停止。
+        """
+        if not messages:
+            return messages
+        
+        cut_index = len(messages)
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get('role') == 'user':
+                cut_index = i
+            else:
+                break
+        
+        if cut_index < len(messages):
+            removed = len(messages) - cut_index
+            logger.debug(
+                f"SuffixBuilder: removed {removed} trailing unpaired "
+                f"user message(s) from collected history"
+            )
+            return messages[:cut_index]
+        
+        return messages
+
+    def _ensure_paired_messages(
+        self,
+        messages: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """
+        v7.3: 确保消息成对出现 (user 问题 + assistant 回复)
+        
+        策略:
+        1. 如果 assistant 消息有 parent_id, 通过 parent_id 找到对应的 user 消息
+        2. 否则按时间序列, 相邻的 user→assistant 自然配对
+        3. 为每对消息分配相同的 pair_id
+        4. 孤立的 assistant 消息 (无对应 user) 仍然保留, 但标记无配对
+        
+        Returns:
+            成对组织的消息列表 (保持时间序)
+        """
+        if not messages:
+            return messages
+        
+        # 构建 msg_id → message 索引
+        id_to_msg = {m['msg_id']: m for m in messages}
+        paired_ids = set()
+        pair_counter = 0
+        
+        # Pass 1: 通过 parent_id 配对
+        for m in messages:
+            if m['role'] == 'assistant' and m.get('parent_id'):
+                parent_id = str(m['parent_id'])
+                if parent_id in id_to_msg:
+                    pair_counter += 1
+                    pair_id = f"pair_{pair_counter}"
+                    id_to_msg[parent_id]['pair_id'] = pair_id
+                    m['pair_id'] = pair_id
+                    paired_ids.add(parent_id)
+                    paired_ids.add(m['msg_id'])
+        
+        # Pass 2: 按时间序列配对未配对的消息 (相邻 user→assistant)
+        for i in range(len(messages) - 1):
+            curr = messages[i]
+            next_msg = messages[i + 1]
+            if (curr['msg_id'] not in paired_ids
+                    and next_msg['msg_id'] not in paired_ids
+                    and curr['role'] == 'user'
+                    and next_msg['role'] == 'assistant'):
+                pair_counter += 1
+                pair_id = f"pair_{pair_counter}"
+                curr['pair_id'] = pair_id
+                next_msg['pair_id'] = pair_id
+                paired_ids.add(curr['msg_id'])
+                paired_ids.add(next_msg['msg_id'])
+        
+        # Pass 3: 标记未配对的消息
+        for m in messages:
+            if m['msg_id'] not in paired_ids:
+                m.setdefault('pair_id', None)
+        
+        return messages
 
     # ================================================================
     # Phase 2: 全局预算分配
@@ -273,6 +403,8 @@ class SuffixBuilder:
                     role=m['role'],
                     token_count=m['tokens'],
                     confidence="high",
+                    timestamp=m.get('timestamp', ''),
+                    pair_id=m.get('pair_id'),
                 ))
             logger.debug(
                 f"Global budget: all {len(items)} msgs fit "
@@ -310,6 +442,8 @@ class SuffixBuilder:
                     role=m['role'],
                     token_count=m['tokens'],
                     confidence="high",
+                    timestamp=m.get('timestamp', ''),
+                    pair_id=m.get('pair_id'),
                 ))
                 used += m['tokens']
             logger.debug(
@@ -337,6 +471,8 @@ class SuffixBuilder:
                     role=m['role'],
                     token_count=m['tokens'],
                     confidence="high",
+                    timestamp=m.get('timestamp', ''),
+                    pair_id=m.get('pair_id'),
                 )))
                 long_used += m['tokens']
             else:
@@ -357,6 +493,8 @@ class SuffixBuilder:
                         role=m['role'],
                         token_count=summary_tokens,
                         confidence="medium",
+                        timestamp=m.get('timestamp', ''),
+                        pair_id=m.get('pair_id'),
                         facts_covered=facts_covered,
                         facts_missing=facts_missing,
                     )))
@@ -377,6 +515,8 @@ class SuffixBuilder:
             role=m['role'],
             token_count=m['tokens'],
             confidence="high",
+            timestamp=m.get('timestamp', ''),
+            pair_id=m.get('pair_id'),
         )) for idx, m in short_msgs]
         all_indexed.extend(long_items)
         

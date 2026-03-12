@@ -108,6 +108,10 @@ class ExperimentRequest(BaseModel):
     modes: List[str] = ["dki", "rag", "baseline"]
     datasets: List[str] = ["persona_chat", "memory_qa"]
     max_samples: int = 50
+    # v8.0: entropy-gated 相关配置
+    fact_retrieve_method: str = "auto"  # auto | entropy_gated | inline_intercept | post_hoc
+    force_alpha: float = 0.4
+    max_new_tokens: int = 2048
 
 
 # Create FastAPI app
@@ -440,82 +444,36 @@ def create_app() -> FastAPI:
         
         try:
             if actual_mode == "dki":
-                # ============ SGLang 兼容性: 优先使用 DKIPlugin (async) ============
-                # DKISystem.chat() 是同步方法, 内部调用 model.forward_with_kv_injection().
-                # SGLang 的同步 generate() 内部使用 loop.run_until_complete(),
-                # 在 uvicorn async 上下文中调用会导致 "event loop is already running" 错误.
+                # ============ DKISystem 路径 (sync, 通过线程池执行) ============
+                # DKISystem.chat() 是同步方法, 自带完整的:
+                #   - 偏好加载 (_load_user_preferences_from_db → SQLite user_preferences 表)
+                #   - 历史检索 (get_session_history → SQLite conversations 表)
+                #   - 对话记录存储 (_log_conversation → SQLite conversations 表)
+                #   - 可视化数据 (hybrid_injection metadata 包含 preference_text, final_input 等)
                 #
-                # 解决方案: 如果 DKIPlugin 已初始化, 优先使用 DKIPlugin.chat() (async),
-                # 它内部使用 async_forward_with_kv_injection() 绕过事件循环冲突.
-                # 仅在 DKIPlugin 不可用时才回退到 DKISystem + run_in_executor.
+                # 注意: DKIPlugin 在实验系统中通过 create_plugin + ConfigDrivenAdapter 集成
+                # (使用独立的 dki.experiment.store, 操作独立的 dki.db),
+                # app.py 的 /api/chat 不应使用 DKIPlugin 路径, 因为:
+                #   1. app.py 中的 DKIPlugin 使用 ExampleAdapter (内存适配器), 偏好/历史数据为空
+                #   2. DKIPlugin 不负责对话存储, 会导致历史丢失
+                #   3. DKISystem 已通过 run_in_executor 安全运行在 async 上下文中
                 import asyncio
                 from concurrent.futures import ThreadPoolExecutor
                 
-                _dki_plugin_instance = _systems.get('dki_plugin')
-                _is_plugin = (
-                    _dki_plugin_instance is not None
-                    and hasattr(_dki_plugin_instance, 'chat')
-                    and asyncio.iscoroutinefunction(_dki_plugin_instance.chat)
-                )
-                
-                if _is_plugin:
-                    # DKIPlugin 路径 (async, SGLang 安全)
-                    _plugin_response = await _dki_plugin_instance.chat(
+                dki = get_dki_system()
+                _loop = asyncio.get_running_loop()
+                _dki_executor = ThreadPoolExecutor(max_workers=2)
+                response = await _loop.run_in_executor(
+                    _dki_executor,
+                    lambda: dki.chat(
                         query=request.query,
-                        user_id=resolved_user_id,
                         session_id=session_id,
+                        user_id=resolved_user_id,
                         force_alpha=request.force_alpha,
                         max_new_tokens=request.max_new_tokens,
                         temperature=request.temperature,
                     )
-                    # 转换 DKIPluginResponse → DKIResponse 兼容格式
-                    # DKIPluginResponse 有 .text, .input_tokens, .output_tokens, .metadata
-                    from dki.core.dki_system import DKIResponse
-                    from dki.core.components.dual_factor_gating import GatingDecision
-                    _meta = _plugin_response.metadata
-                    response = DKIResponse(
-                        text=_plugin_response.text,
-                        memories_used=[],
-                        gating_decision=GatingDecision(
-                            should_inject=_meta.injection_enabled,
-                            alpha=_meta.alpha,
-                            memories=[],
-                        ),
-                        latency_ms=_meta.latency_ms,
-                        input_tokens=_plugin_response.input_tokens,
-                        output_tokens=_plugin_response.output_tokens,
-                        cache_hit=_meta.preference_cache_hit,
-                        cache_tier=_meta.preference_cache_tier or "none",
-                        metadata={
-                            "hybrid_injection": {
-                                "enabled": _meta.injection_enabled,
-                                "preference_alpha": _meta.alpha,
-                                "preference_tokens": _meta.preference_tokens,
-                                "history_tokens": _meta.history_tokens,
-                                "preference_text": getattr(_meta, 'preference_text', ''),
-                                "history_suffix_text": getattr(_meta, 'history_suffix_text', ''),
-                                "history_messages": getattr(_meta, 'history_messages', []),
-                                "final_input": getattr(_meta, 'final_input', request.query),
-                            },
-                        },
-                    )
-                else:
-                    # DKISystem 降级路径 (sync, 通过线程池执行)
-                    # 注意: SGLang 引擎在此路径下可能仍有事件循环问题
-                    dki = get_dki_system()
-                    _loop = asyncio.get_running_loop()
-                    _dki_executor = ThreadPoolExecutor(max_workers=2)
-                    response = await _loop.run_in_executor(
-                        _dki_executor,
-                        lambda: dki.chat(
-                            query=request.query,
-                            session_id=session_id,
-                            user_id=resolved_user_id,
-                            force_alpha=request.force_alpha,
-                            max_new_tokens=request.max_new_tokens,
-                            temperature=request.temperature,
-                        )
-                    )
+                )
                 
                 # Record visualization data
                 try:
@@ -837,6 +795,14 @@ def create_app() -> FastAPI:
             dki = get_dki_system()
             dki.clear_preference_cache(resolved_user_id)
             
+            # 同时清除 DKIPlugin 的偏好文本缓存 (用于 /v1/dki/chat 端点)
+            # 注意: /api/chat 使用 DKISystem 路径 (直接从 SQLite 读取偏好),
+            # 但 /v1/dki/chat 使用 DKIPlugin 路径, 需要清除其独立的 TTL 缓存
+            _dki_plugin_instance = _systems.get('dki_plugin')
+            if _dki_plugin_instance and hasattr(_dki_plugin_instance, 'invalidate_preference_text_cache'):
+                _dki_plugin_instance.invalidate_preference_text_cache(resolved_user_id)
+                logger.debug(f"Invalidated DKIPlugin preference cache for user {resolved_user_id}")
+            
             logger.info(f"Added preference for user {resolved_user_id}: {request.content[:50]}...")
             
             return {
@@ -886,9 +852,13 @@ def create_app() -> FastAPI:
                 for p in prefs:
                     pref_repo.delete(p.id)
             
-            # Clear cache
+            # Clear cache (DKISystem + DKIPlugin)
             dki = get_dki_system()
             dki.clear_preference_cache(user_id)
+            
+            _dki_plugin_instance = _systems.get('dki_plugin')
+            if _dki_plugin_instance and hasattr(_dki_plugin_instance, 'invalidate_preference_text_cache'):
+                _dki_plugin_instance.invalidate_preference_text_cache(user_id)
             
             return {"message": f"Cleared all preferences for {user_id}", "count": len(prefs)}
         except Exception as e:
@@ -1129,12 +1099,17 @@ def create_app() -> FastAPI:
     
     @app.post("/api/experiment/generate-data")
     async def generate_experiment_data():
-        """Generate experiment data (including long sessions)."""
+        """Generate experiment data (including long sessions, ablation, context-constrained)."""
         try:
             generator = ExperimentDataGenerator("./data")
             generator.generate_all(include_long_sessions=True)
             generator.generate_alpha_sensitivity_data()
-            return {"status": "success", "message": "Experiment data generated (including long sessions)"}
+            generator.generate_ablation_data()
+            generator.generate_context_constrained_data()
+            return {
+                "status": "success",
+                "message": "Experiment data generated (v8.0: long sessions + ablation + α-sensitivity + context-constrained)",
+            }
         except Exception as e:
             logger.error(f"Generate data error: {e}")
             raise HTTPException(status_code=500, detail=str(e))
@@ -1156,6 +1131,10 @@ def create_app() -> FastAPI:
                 modes=request.modes,
                 datasets=request.datasets,
                 max_samples=request.max_samples,
+                # v8.0: entropy-gated 配置
+                fact_retrieve_method=request.fact_retrieve_method,
+                force_alpha=request.force_alpha,
+                max_new_tokens=request.max_new_tokens,
             )
             results = runner.run_experiment(config)
             return results
@@ -1305,6 +1284,138 @@ def create_app() -> FastAPI:
             logger.error(f"LongMemEval needle experiment error: {e}")
             raise HTTPException(status_code=500, detail=str(e))
     
+    # ================================================================
+    # v8.0: 消融 / α-敏感性 / Context-Constrained 实验端点
+    # 对齐论文 Table 2, Table 3, Table 4
+    # ================================================================
+
+    class AblationRequest(BaseModel):
+        """消融实验请求 — 对齐论文 Table 3"""
+        max_samples: int = 30
+        force_alpha: float = 0.4
+        fact_retrieve_method: str = "entropy_gated"
+
+    class AlphaSensitivityRequest(BaseModel):
+        """α 敏感性实验请求 — 对齐论文 Table 4"""
+        alpha_values: List[float] = [0.0, 0.3, 0.4, 0.5, 0.6, 0.7, 1.0]
+        max_samples: int = 30
+        fact_retrieve_method: str = "entropy_gated"
+
+    class ContextConstrainedRequest(BaseModel):
+        """上下文约束实验请求 — 对齐论文 Table 2"""
+        memory_lengths: List[int] = [1000, 1500, 2000, 2500, 3000, 3500]
+        max_samples: int = 30
+        force_alpha: float = 0.4
+        fact_retrieve_method: str = "entropy_gated"
+
+    @app.post("/api/experiment/run-ablation")
+    async def run_ablation_study(request: AblationRequest):
+        """
+        运行消融实验 — 对齐论文 Table 3 (v8.0)
+        
+        7 种配置:
+        - full_dki: 完整 DKI (Recall v4 + entropy-gated)
+        - wo_fact_call: 去除 Fact Call
+        - wo_multi_signal: 去除多信号召回
+        - wo_kv_injection: 去除 K/V 注入
+        - stable_fallback_only: 仅 Stable 策略
+        - rag_baseline: RAG 对照
+        - vanilla_llm: 无记忆基线
+        
+        预估时间 (L20 48G, 14B model):
+        - 30 samples × 7 modes: ~1.5 hours
+        """
+        try:
+            rag = get_rag_system()
+            runner = ExperimentRunner(
+                dki_plugin=_systems.get('dki_plugin'),
+                rag_system=rag,
+                model_adapter=rag.model,
+            )
+            results = runner.run_ablation_study(setup_users=True)
+            return {
+                "status": "success",
+                "benchmark": "ablation_study",
+                "summary": results.get('summary', {}),
+                "config": {
+                    "max_samples": request.max_samples,
+                    "force_alpha": request.force_alpha,
+                    "fact_retrieve_method": request.fact_retrieve_method,
+                },
+            }
+        except Exception as e:
+            logger.error(f"Ablation study error: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post("/api/experiment/run-alpha-sensitivity")
+    async def run_alpha_sensitivity(request: AlphaSensitivityRequest):
+        """
+        运行 α 敏感性实验 — 对齐论文 Table 4 (v8.0)
+        
+        测试不同注入强度 α 对性能的影响:
+        α ∈ [0.0, 0.3, 0.4, 0.5, 0.6, 0.7, 1.0]
+        
+        预估时间 (L20 48G, 14B model):
+        - 30 samples × 7 alpha values: ~1 hour
+        """
+        try:
+            rag = get_rag_system()
+            runner = ExperimentRunner(
+                dki_plugin=_systems.get('dki_plugin'),
+                rag_system=rag,
+                model_adapter=rag.model,
+            )
+            results = runner.run_alpha_sensitivity(setup_users=True)
+            return {
+                "status": "success",
+                "benchmark": "alpha_sensitivity",
+                "summary": results.get('summary', {}),
+                "config": {
+                    "alpha_values": request.alpha_values,
+                    "max_samples": request.max_samples,
+                    "fact_retrieve_method": request.fact_retrieve_method,
+                },
+            }
+        except Exception as e:
+            logger.error(f"Alpha sensitivity error: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post("/api/experiment/run-context-constrained")
+    async def run_context_constrained(request: ContextConstrainedRequest):
+        """
+        运行上下文约束实验 — 对齐论文 Table 2 (v8.0)
+        
+        测试不同 memory 长度下 DKI vs RAG 的性能:
+        memory_lengths ∈ [1000, 1500, 2000, 2500, 3000, 3500] tokens
+        
+        验证 DKI 在长上下文压力下的优势。
+        
+        预估时间 (L20 48G, 14B model):
+        - 30 samples × 6 lengths × 3 modes: ~2 hours
+        """
+        try:
+            rag = get_rag_system()
+            runner = ExperimentRunner(
+                dki_plugin=_systems.get('dki_plugin'),
+                rag_system=rag,
+                model_adapter=rag.model,
+            )
+            results = runner.run_context_constrained(setup_users=True)
+            return {
+                "status": "success",
+                "benchmark": "context_constrained",
+                "summary": results.get('summary', {}),
+                "config": {
+                    "memory_lengths": request.memory_lengths,
+                    "max_samples": request.max_samples,
+                    "force_alpha": request.force_alpha,
+                    "fact_retrieve_method": request.fact_retrieve_method,
+                },
+            }
+        except Exception as e:
+            logger.error(f"Context constrained error: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
     @app.get("/api/experiments")
     async def list_experiments():
         """List all experiments."""

@@ -163,9 +163,16 @@ class GenericFormatter(PromptFormatter):
         return "\n".join(lines)
 
     def format_message_item(self, item: HistoryItem) -> str:
-        """格式化原文消息"""
+        """
+        格式化原文消息
+        
+        v7.3: 增加时间戳显示, 格式:
+        [2025-03-12 22:00] 用户: xxx
+        [2025-03-12 22:00] 助手: xxx
+        """
         role_label = self._role_label(item.role)
-        return f"{role_label}: {item.content}"
+        ts_prefix = f"[{item.timestamp}] " if getattr(item, 'timestamp', None) else ""
+        return f"{ts_prefix}{role_label}: {item.content}"
 
     def format_constraint_instruction(self, trace_ids: List[str], position: str = "above") -> str:
         """

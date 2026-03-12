@@ -258,6 +258,10 @@ class HistoryItem:
     
     type="summary": content 是 summary 文本, trace_id 用于 function call 溯源
     type="message": content 是原始消息, trace_id 同样可用于溯源
+    
+    v7.3: 新增 timestamp 和 pair_id 字段
+    - timestamp: 消息原始时间戳, 用于注入时显示时间参考
+    - pair_id: 配对 ID, 同一轮对话的 user/assistant 共享相同 pair_id
     """
     type: str              # "summary" | "message"
     content: str           # 文本内容 (summary 文本 或 原始消息)
@@ -265,6 +269,10 @@ class HistoryItem:
     role: Optional[str] = None     # "user" | "assistant"
     token_count: int = 0   # token 数
     confidence: str = "high"  # "high" (原文) | "medium" (summary) | "low"
+    # v7.3: 时间戳 (ISO 格式字符串 或 datetime)
+    timestamp: Optional[str] = None
+    # v7.3: 配对 ID (同一轮 user-assistant 共享)
+    pair_id: Optional[str] = None
     # 结构化认知标记 (补充建议: 机器可读)
     facts_covered: List[str] = field(default_factory=list)
     facts_missing: List[str] = field(default_factory=list)

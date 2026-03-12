@@ -55,6 +55,11 @@ from dki.core.text_utils import (
     estimate_tokens_fast,
     detect_vague_reference,
     build_clarification_instruction,
+    init_think_filter,
+    get_think_filter,
+    create_stream_filter,
+    create_stream_detector,
+    get_show_thinking,
 )
 
 from dki.adapters.base import (
@@ -147,6 +152,13 @@ class InjectionMetadata:
     # v7.0: 向量检索能力信息
     retrieval_mode: str = "unknown"  # bm25_only | bm25_embedding | keyword | unknown
     
+    # v9.0: 注入明文详情 (供上层应用 / 实验系统获取)
+    # 之前通过 _last_injection_detail hack 暴露, 现在作为正式 metadata 字段
+    preference_text: Optional[str] = None
+    history_suffix_text: Optional[str] = None
+    history_messages: Optional[List[Dict[str, str]]] = None
+    final_input: Optional[str] = None
+    
     # Alpha Profile (v3.0)
     alpha_profile: Optional[Dict[str, Any]] = None
     
@@ -198,6 +210,13 @@ class InjectionMetadata:
             },
             "retrieval_mode": self.retrieval_mode,
             "safety_violations": self.safety_violations or [],
+            # v9.0: 注入明文详情
+            "injection_detail": {
+                "preference_text": self.preference_text,
+                "history_suffix_text": self.history_suffix_text,
+                "history_messages": self.history_messages or [],
+                "final_input": self.final_input,
+            },
         }
 
 
@@ -306,6 +325,20 @@ class DKIPlugin:
         self.data_adapter = user_data_adapter
         self.config = config or ConfigLoader().config
         self.language = language
+        
+        # ============ v5.8: 初始化思考内容过滤器 (外置正则) ============
+        think_filter_config = None
+        if hasattr(self.config, 'dki') and hasattr(self.config.dki, 'think_filter'):
+            tf_obj = self.config.dki.think_filter
+            if isinstance(tf_obj, dict):
+                think_filter_config = tf_obj
+            elif hasattr(tf_obj, 'model_dump'):
+                think_filter_config = tf_obj.model_dump()
+            elif hasattr(tf_obj, 'dict'):
+                think_filter_config = tf_obj.dict()
+            elif hasattr(tf_obj, '__dict__'):
+                think_filter_config = vars(tf_obj)
+        init_think_filter(think_filter_config)
         
         # DKI 组件 (延迟初始化)
         self._mis: Optional[MemoryInfluenceScaling] = None
@@ -505,6 +538,22 @@ class DKIPlugin:
             pass
         return 5
     
+    def _get_stream_buffer_max(self) -> int:
+        """
+        v5.8: 获取流式过滤缓冲区最大字符数
+        
+        从配置 dki.think_filter.stream_buffer_max_chars 读取, 默认 500
+        """
+        try:
+            if hasattr(self.config, 'dki') and hasattr(self.config.dki, 'think_filter'):
+                tf = self.config.dki.think_filter
+                if isinstance(tf, dict):
+                    return tf.get('stream_buffer_max_chars', 500)
+                return getattr(tf, 'stream_buffer_max_chars', 500)
+        except Exception:
+            pass
+        return 500
+    
     def _merge_recent_and_recalled(
         self,
         recent_messages: List[AdapterChatMessage],
@@ -512,12 +561,15 @@ class DKIPlugin:
     ) -> List[AdapterChatMessage]:
         """
         v7.2: 合并近轮对话与 BM25 召回结果
+        v7.3: 合并后按时间排序, 确保成对注入
+        v7.4: 过滤末尾无 assistant 回复的 user 消息
+              (用户当前查询已在 prompt 最后, 不需要在历史中重复)
         
-        策略: 近轮优先, 去重, 按时间排序
+        策略: 近轮优先, 去重, 按时间排序, 成对补全, 过滤孤立末尾 user
         - recent_messages: 按时间正序 (最旧在前), 确保多轮连贯
         - recalled_messages: 按 BM25 相关性排序, 可能来自任意会话
         
-        合并后: 近轮消息在前 (保持时间序), BM25 补充在后 (去重)
+        合并后: 按时间正序排列 (近轮 + BM25 混合, 去重)
         """
         seen_ids = set()
         merged = []
@@ -540,13 +592,67 @@ class DKIPlugin:
                 merged.append(msg)
                 bm25_added += 1
         
+        # v7.3: 合并后按时间戳排序 (确保时间正序)
+        merged.sort(
+            key=lambda m: (
+                m.timestamp.isoformat() if hasattr(getattr(m, 'timestamp', None), 'isoformat')
+                else str(getattr(m, 'timestamp', ''))
+            )
+        )
+        
+        # v7.4: 过滤末尾无 assistant 回复的 user 消息
+        # 用户当前查询已经写入 DB 但尚无 assistant 回复, 会被 get_recent_messages 拉出
+        # 这条消息已在 prompt 最后作为独立查询, 历史中不应重复
+        merged = self._remove_trailing_unpaired_user(merged)
+        
         if bm25_added > 0:
             logger.debug(
                 f"Merged history: {len(recent_messages)} recent + "
-                f"{bm25_added} BM25 recalled = {len(merged)} total"
+                f"{bm25_added} BM25 recalled = {len(merged)} total "
+                f"(sorted by timestamp)"
             )
         
         return merged
+    
+    @staticmethod
+    def _remove_trailing_unpaired_user(
+        messages: List[AdapterChatMessage],
+    ) -> List[AdapterChatMessage]:
+        """
+        v7.4: 从末尾移除没有 assistant 回复的 user 消息
+        
+        原因:
+        - Demo 流程: 先写入 user 消息 → 再调用 DKI Plugin
+        - get_recent_messages 会拉出刚写入的 user 消息 (无 assistant 回复)
+        - 该消息已在 prompt 最后作为用户当前输入, 历史中重复注入会导致:
+          1. 浪费 context budget
+          2. 模型混淆 (同一问题出现两次)
+        
+        策略:
+        - 从列表末尾向前扫描, 移除连续的 role="user" 消息
+        - 一旦遇到 role="assistant" 停止 (之前的 user 消息是有配对的)
+        """
+        if not messages:
+            return messages
+        
+        # 从末尾向前扫描
+        cut_index = len(messages)
+        for i in range(len(messages) - 1, -1, -1):
+            role = getattr(messages[i], 'role', 'user')
+            if role == 'user':
+                cut_index = i
+            else:
+                break  # 遇到 assistant, 停止
+        
+        if cut_index < len(messages):
+            removed_count = len(messages) - cut_index
+            logger.debug(
+                f"Removed {removed_count} trailing unpaired user message(s) "
+                f"from history (already in current query)"
+            )
+            return messages[:cut_index]
+        
+        return messages
     
     def _resolve_context_window(self) -> int:
         """
@@ -1520,6 +1626,12 @@ class DKIPlugin:
             
             if has_stream:
                 # 使用模型的流式生成
+                # v5.9: 使用 StreamThinkDetector 检测思考内容
+                #   - 思考内容通过 type="thinking" 事件发送
+                #   - 正常内容通过 type="token" 事件发送
+                #   - 客户端根据 show_thinking 配置决定是否显示
+                detector = create_stream_detector(buffer_max_chars=200)
+                show_thinking = get_show_thinking()
                 full_text = ""
                 input_tokens = 0
                 output_tokens = 0
@@ -1537,8 +1649,12 @@ class DKIPlugin:
                     )
                     async for chunk in stream:
                         token_text = chunk if isinstance(chunk, str) else getattr(chunk, 'text', str(chunk))
-                        full_text += token_text
-                        yield {"type": "token", "content": token_text}
+                        # v5.9: 通过 StreamThinkDetector 检测
+                        for evt_type, evt_text in detector.feed(token_text):
+                            if evt_type == "token":
+                                yield {"type": "token", "content": evt_text}
+                            elif evt_type == "thinking" and show_thinking:
+                                yield {"type": "thinking", "content": evt_text}
                 elif hasattr(self.model, 'stream_generate'):
                     for chunk in self.model.stream_generate(
                         prompt=prompt,
@@ -1547,10 +1663,22 @@ class DKIPlugin:
                         **kwargs,
                     ):
                         token_text = chunk if isinstance(chunk, str) else getattr(chunk, 'text', str(chunk))
-                        full_text += token_text
-                        yield {"type": "token", "content": token_text}
+                        # v5.9: 通过 StreamThinkDetector 检测
+                        for evt_type, evt_text in detector.feed(token_text):
+                            if evt_type == "token":
+                                yield {"type": "token", "content": evt_text}
+                            elif evt_type == "thinking" and show_thinking:
+                                yield {"type": "thinking", "content": evt_text}
                 
-                clean_text, _ = strip_think_content(full_text)
+                # v5.9: 释放缓冲区残留内容
+                for evt_type, evt_text in detector.flush():
+                    if evt_type == "token":
+                        yield {"type": "token", "content": evt_text}
+                    elif evt_type == "thinking" and show_thinking:
+                        yield {"type": "thinking", "content": evt_text}
+                
+                # v5.9: 最终使用全量正则清理 (确保存储的文本干净)
+                clean_text = detector.get_clean_text()
                 metadata.latency_ms = (time.time() - start_time) * 1000
                 
                 # 流式模式下估算 token (修复 token 统计为 0 的问题)
@@ -1659,6 +1787,12 @@ class DKIPlugin:
                     "summary_count": plan.summary_count,
                     "message_count": plan.message_count,
                 }
+        
+        # v9.0: 写入 InjectionMetadata 正式字段 (供上层应用 / 实验系统使用)
+        metadata.preference_text = preference_text or None
+        metadata.history_suffix_text = history_suffix_text or None
+        metadata.history_messages = history_messages if history_messages else None
+        metadata.final_input = final_input or None
         
         # 记录可视化数据
         try:
