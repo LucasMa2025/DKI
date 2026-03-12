@@ -88,10 +88,75 @@ class TestRecallFactCallConfig:
         assert cfg.max_rounds == 3
         assert cfg.max_fact_tokens == 800
         assert cfg.batch_size == 5
+        # v7.2: 新增外置配置项默认值
+        assert cfg.fact_retrieve_method == "post_hoc"
+        assert cfg.inline_intercept_max_param_tokens == 64
+        assert cfg.inline_intercept_max_rounds == 3
 
     def test_disabled(self):
         cfg = RecallFactCallConfig(enabled=False)
         assert cfg.enabled is False
+
+    def test_fact_retrieve_method_values(self):
+        """测试 fact_retrieve_method 各种取值"""
+        for method in ("post_hoc", "inline_intercept", "native_tool_calls", "auto"):
+            cfg = RecallFactCallConfig(fact_retrieve_method=method)
+            assert cfg.fact_retrieve_method == method
+
+    def test_inline_intercept_custom_params(self):
+        """测试 inline_intercept 参数自定义"""
+        cfg = RecallFactCallConfig(
+            fact_retrieve_method="inline_intercept",
+            inline_intercept_max_param_tokens=128,
+            inline_intercept_max_rounds=5,
+        )
+        assert cfg.fact_retrieve_method == "inline_intercept"
+        assert cfg.inline_intercept_max_param_tokens == 128
+        assert cfg.inline_intercept_max_rounds == 5
+
+    def test_from_dict_with_new_fields(self):
+        """测试 RecallConfig.from_dict 正确透传新增字段"""
+        d = {
+            "fact_call": {
+                "enabled": True,
+                "max_rounds": 2,
+                "max_fact_tokens": 1500,
+                "batch_size": 10,
+                "fact_retrieve_method": "inline_intercept",
+                "inline_intercept_max_param_tokens": 96,
+                "inline_intercept_max_rounds": 4,
+            }
+        }
+        cfg = RecallConfig.from_dict(d)
+        assert cfg.fact_call.fact_retrieve_method == "inline_intercept"
+        assert cfg.fact_call.inline_intercept_max_param_tokens == 96
+        assert cfg.fact_call.inline_intercept_max_rounds == 4
+
+    def test_from_dict_without_new_fields_uses_defaults(self):
+        """测试 from_dict 不含新字段时使用默认值"""
+        d = {
+            "fact_call": {
+                "enabled": True,
+                "max_rounds": 3,
+            }
+        }
+        cfg = RecallConfig.from_dict(d)
+        assert cfg.fact_call.fact_retrieve_method == "post_hoc"
+        assert cfg.fact_call.inline_intercept_max_param_tokens == 64
+        assert cfg.fact_call.inline_intercept_max_rounds == 3
+
+    def test_from_dict_ignores_unknown_fields(self):
+        """测试 from_dict 忽略未知字段 (不报错)"""
+        d = {
+            "fact_call": {
+                "enabled": True,
+                "unknown_future_field": 42,
+                "fact_retrieve_method": "auto",
+            }
+        }
+        cfg = RecallConfig.from_dict(d)
+        assert cfg.fact_call.fact_retrieve_method == "auto"
+        assert not hasattr(cfg.fact_call, "unknown_future_field")
 
 
 class TestRecallScoreWeights:
@@ -162,6 +227,9 @@ class TestRecallConfig:
                 "max_rounds": 5,
                 "max_fact_tokens": 1000,
                 "batch_size": 10,
+                "fact_retrieve_method": "auto",
+                "inline_intercept_max_param_tokens": 128,
+                "inline_intercept_max_rounds": 5,
             },
             "score_weights": {
                 "keyword_weight": 0.5,
@@ -182,6 +250,9 @@ class TestRecallConfig:
         assert cfg.summary.strategy == "llm"
         assert cfg.fact_call.max_rounds == 5
         assert cfg.fact_call.batch_size == 10
+        assert cfg.fact_call.fact_retrieve_method == "auto"
+        assert cfg.fact_call.inline_intercept_max_param_tokens == 128
+        assert cfg.fact_call.inline_intercept_max_rounds == 5
         assert cfg.score_weights.keyword_weight == 0.5
         assert cfg.prompt_formatter == "deepseek"
 

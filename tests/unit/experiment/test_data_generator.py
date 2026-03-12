@@ -191,8 +191,8 @@ class TestExperimentDataGenerator:
         """α 敏感度数据生成"""
         data = self.generator.generate_alpha_sensitivity_data(n_samples=5)
         
-        # 5 samples × 6 alpha values = 30
-        assert len(data) == 30
+        # v8.0: 5 samples × 7 alpha values = 35 (对齐论文 Table 4)
+        assert len(data) == 35
         
         for sample in data:
             assert 'id' in sample
@@ -202,11 +202,12 @@ class TestExperimentDataGenerator:
             assert 0.0 <= sample['alpha'] <= 1.0
 
     def test_alpha_sensitivity_all_values(self):
-        """应包含所有 α 值"""
+        """应包含所有 α 值 (v8.0: 对齐论文 Table 4)"""
         data = self.generator.generate_alpha_sensitivity_data(n_samples=1)
         
         alphas = sorted(set(d['alpha'] for d in data))
-        expected = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+        # v8.0: [0.0, 0.3, 0.4, 0.5, 0.6, 0.7, 1.0]
+        expected = [0.0, 0.3, 0.4, 0.5, 0.6, 0.7, 1.0]
         assert alphas == expected
 
     def test_alpha_sensitivity_saves_file(self):
@@ -270,9 +271,11 @@ class TestExperimentDataGenerator:
         """消融实验应包含所有模式"""
         data = self.generator.generate_ablation_data(n_samples=1)
         
+        # v8.0: 对齐论文 Table 3 的 7 种消融配置
         expected_modes = [
-            "full_dki", "no_gating", "no_history",
-            "no_preference_kv", "rag_baseline", "no_memory",
+            "full_dki", "wo_fact_call", "wo_multi_signal",
+            "wo_kv_injection", "stable_fallback_only",
+            "rag_baseline", "vanilla_llm",
         ]
         assert data[0]['ablation_modes'] == expected_modes
 

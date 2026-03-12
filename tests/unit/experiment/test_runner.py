@@ -44,7 +44,7 @@ class TestExperimentConfig:
         assert config.max_samples == 100
         assert config.max_new_tokens == 2048  # v6.4: 从 256 提升到 2048
         assert config.temperature == 0.7
-        assert config.alpha_values == [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+        assert config.alpha_values == [0.0, 0.3, 0.4, 0.5, 0.6, 0.7, 1.0]
 
     def test_custom_values(self):
         config = ExperimentConfig(
@@ -69,7 +69,7 @@ class TestExperimentConfig:
         assert d['name'] == "dict_test"
         assert d['modes'] == ["rag", "dki", "baseline"]
         assert d['max_new_tokens'] == 2048  # v6.4: 从 256 提升到 2048
-        assert d['alpha_values'] == [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+        assert d['alpha_values'] == [0.0, 0.3, 0.4, 0.5, 0.6, 0.7, 1.0]
 
     def test_to_dict_roundtrip(self):
         """to_dict 结果应可用于重建"""

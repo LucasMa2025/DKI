@@ -225,11 +225,12 @@ class TestGenerateContextConstrainedData:
         assert len(data) == 3 * 5  # 3 lengths × 5 samples
 
     def test_default_memory_lengths(self):
-        """默认应生成 7 种 memory 长度"""
+        """默认应生成 6 种 memory 长度 (v8.0: 对齐论文 Table 2)"""
         data = self.generator.generate_context_constrained_data(
             n_samples_per_length=2,
         )
-        expected_lengths = {500, 1000, 1500, 2000, 2500, 3000, 3500}
+        # v8.0: 从 [500, 1000, 1500, 2000, 2500, 3000, 3500] 缩减为 [1000, 1500, 2000, 2500, 3000, 3500]
+        expected_lengths = {1000, 1500, 2000, 2500, 3000, 3500}
         actual_lengths = set(d['memory_length_tokens'] for d in data)
         assert actual_lengths == expected_lengths
 
