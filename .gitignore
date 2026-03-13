@@ -82,7 +82,7 @@ logs/
 data/
 examples/
 experiment_results/
-
+/.vs/
 /.vs/DKI/FileContentIndex/72386703-af8a-4066-9569-25f5424aa94c.vsidx
 /.vs/DKI/FileContentIndex/844c2d21-a03c-436a-99d8-8716b7472068.vsidx
 /.vs/DKI/v17/.wsuo
