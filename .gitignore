@@ -1,0 +1,90 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+ENV/
+env/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data files
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# Experiment results
+experiment_results/
+*.json
+
+# Logs
+logs/
+*.log
+
+# Model cache
+.cache/
+huggingface/
+transformers_cache/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Config overrides (keep default config)
+config/config.local.yaml
+.env
+.env.*
+
+# Pytest
+.pytest_cache/
+.coverage
+htmlcov/
+coverage_report/
+
+# MyPy
+.mypy_cache/
+
+# Temp Documents
+docs/
+logs/
+data/
+examples/
+experiment_results/
+
+/.vs/DKI/FileContentIndex/72386703-af8a-4066-9569-25f5424aa94c.vsidx
+/.vs/DKI/FileContentIndex/844c2d21-a03c-436a-99d8-8716b7472068.vsidx
+/.vs/DKI/v17/.wsuo
+/.vs/slnx.sqlite-journal
+/.vs/DKI/FileContentIndex/8721570e-09ec-4422-9a99-fcd28aee160f.vsidx
