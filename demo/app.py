@@ -42,6 +42,7 @@ from demo.api.chat import create_chat_router
 from demo.api.sessions import create_session_router
 from demo.api.preferences import create_preference_router
 from demo.api.messages import create_message_router
+from dki.api.stats_routes import create_stats_router
 
 
 def create_demo_app(
@@ -286,6 +287,10 @@ def create_demo_app(
             result["status"] = "partial"
         
         return result
+    
+    # 统计数据 (/api/stats, /api/stats/dki, /api/stats/cache)
+    # 注意: stats_routes 中的 /api/health 会被上方已注册的 /api/health 覆盖 (FastAPI 先注册优先)
+    app.include_router(create_stats_router())
     
     # ============ Static Files (Vue3 前端) ============
     

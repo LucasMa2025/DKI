@@ -38,7 +38,7 @@ class ChatSendRequest(BaseModel):
     session_id: Optional[str] = Field(None, description="会话标识")
     model: Optional[str] = None
     temperature: float = Field(0.7, ge=0, le=2)
-    max_tokens: int = Field(2048, ge=1, le=8192)
+    max_tokens: int = Field(4096, ge=1, le=16384)
     force_alpha: Optional[float] = Field(None, ge=0, le=1)
     use_hybrid: bool = True
 
@@ -231,13 +231,18 @@ def create_chat_router() -> APIRouter:
         dki_plugin = Depends(get_dki_plugin),
     ):
         """
-        ★ 流式对话端点 (SSE)
+        ★ 流式对话端点 (SSE) — v5.9
         
         返回 Server-Sent Events 流:
-        - event: token  → data: {"content": "..."}
+        - event: token    → data: {"content": "..."}     正常输出内容
+        - event: thinking → data: {"content": "..."}     思考过程 (客户端可折叠/隐藏)
         - event: metadata → data: {DKI 元数据}
-        - event: done   → data: {"text": "完整文本"}
-        - event: error  → data: {"error": "错误信息"}
+        - event: done     → data: {"text": "过滤后干净文本", ...}
+        - event: error    → data: {"error": "错误信息"}
+        
+        注意: done 事件中的 text 是经过 strip_think_content 过滤后的干净文本,
+        用于存储到数据库; token 事件中的 content 是实时输出的正常内容;
+        thinking 事件中的 content 是模型的思考过程, 客户端可选择展示或隐藏。
         """
         _async = is_async_store(store)
         verified_user_id = user["id"]
@@ -280,8 +285,9 @@ def create_chat_router() -> APIRouter:
             )
         
         async def event_generator() -> AsyncIterator[str]:
-            """SSE 事件生成器"""
-            full_text = ""
+            """SSE 事件生成器 (v5.9)"""
+            # clean_text: 过滤后的干净文本 (来自 done 事件)
+            clean_text = ""
             try:
                 # 检查 DKI Plugin 是否支持流式
                 if not hasattr(dki_plugin, 'chat_stream'):
@@ -294,7 +300,7 @@ def create_chat_router() -> APIRouter:
                         max_new_tokens=request.max_tokens,
                         temperature=request.temperature,
                     )
-                    full_text = response.text
+                    clean_text = response.text
                     yield f"event: token\ndata: {json.dumps({'content': response.text}, ensure_ascii=False)}\n\n"
                     
                     meta = response.metadata
@@ -313,39 +319,41 @@ def create_chat_router() -> APIRouter:
                         
                         if chunk_type == "token":
                             content = chunk.get("content", "")
-                            full_text += content
                             yield f"event: token\ndata: {json.dumps({'content': content}, ensure_ascii=False)}\n\n"
+                        
+                        elif chunk_type == "thinking":
+                            # v5.9: 思考内容通过独立事件发送
+                            content = chunk.get("content", "")
+                            yield f"event: thinking\ndata: {json.dumps({'content': content}, ensure_ascii=False)}\n\n"
                         
                         elif chunk_type == "metadata":
                             yield f"event: metadata\ndata: {json.dumps(chunk, ensure_ascii=False)}\n\n"
                         
                         elif chunk_type == "done":
-                            full_text = chunk.get("text", full_text)
-                            yield f"event: done\ndata: {json.dumps({'text': full_text, 'input_tokens': chunk.get('input_tokens', 0), 'output_tokens': chunk.get('output_tokens', 0)}, ensure_ascii=False)}\n\n"
+                            # ★ done 事件中的 text 是过滤后的干净文本
+                            clean_text = chunk.get("text", "")
+                            yield f"event: done\ndata: {json.dumps({'text': clean_text, 'input_tokens': chunk.get('input_tokens', 0), 'output_tokens': chunk.get('output_tokens', 0)}, ensure_ascii=False)}\n\n"
                         
                         elif chunk_type == "error":
                             yield f"event: error\ndata: {json.dumps({'error': chunk.get('error', 'Unknown error')}, ensure_ascii=False)}\n\n"
                             return
                 
-                # 写入助手回复
-                if full_text:
+                # ★ 写入助手回复: 使用过滤后的干净文本
+                if clean_text:
                     if _async:
                         await store.a_add_message(
                             session_id=session_id,
                             user_id=verified_user_id,
                             role="assistant",
-                            content=full_text,
+                            content=clean_text,
                         )
                     else:
                         store.add_message(
                             session_id=session_id,
                             user_id=verified_user_id,
                             role="assistant",
-                            content=full_text,
+                            content=clean_text,
                         )
-                
-                # 发送完成事件
-                yield f"event: done\ndata: {json.dumps({'text': full_text}, ensure_ascii=False)}\n\n"
                 
             except Exception as e:
                 logger.error(f"DKI stream error: {e}")
