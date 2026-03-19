@@ -221,7 +221,6 @@ class TestWebAppEndpoints:
              patch("dki.web.app.DatabaseManager") as MockDBManager, \
              patch("dki.web.app.DKISystem") as MockDKI, \
              patch("dki.web.app.RAGSystem") as MockRAG, \
-             patch("dki.web.app.ExampleAdapter") as MockExampleAdapter, \
              patch("dki.web.app.init_dependencies"), \
              patch("dki.web.app.cleanup_dependencies"), \
              patch("dki.web.app.set_dki_plugin"), \
@@ -230,9 +229,6 @@ class TestWebAppEndpoints:
             mock_config = MagicMock()
             mock_config.database.path = ":memory:"
             MockConfigLoader.return_value.config = mock_config
-            
-            mock_adapter = MagicMock()
-            MockExampleAdapter.return_value = mock_adapter
             
             from dki.web.app import create_app
             app = create_app()

@@ -12,6 +12,7 @@ DKI Recall v4 — 多信号召回器
 - F1-1: 认知态模式选择 (Epistemic Mode) → 动态权重预设
 - F1-2: 信号置信度门控 (Signal Confidence Gating) → 低置信度信号退出
 - F1-3: 统一 min-max 归一化 (Score Normalization)
+- P0 修复: recency 分数参与 final_score 融合 (指数时间衰减)
 - 补充固定近期轮数
 
 P1 BM25 设计说明:
@@ -19,13 +20,18 @@ P1 BM25 设计说明:
 - 两者互补: TF-IDF 对短查询敏感, BM25 对长查询和词频分布更鲁棒
 - BM25 使用 jieba 分词作为 tokenizer, 与关键词信号共享分词结果
 - BM25 独立参与信号融合 (有自己的权重和置信度门控)
+- P1 优化: keyword 和 BM25 共享同一次 DB 拉取, 避免重复 IO
+- P1 优化: BM25 索引按 (session_id, last_msg_id) 缓存, 避免每次重建
 
 Author: AGI Demo Project
-Version: 4.2.0
+Version: 4.4.0
 """
 
 import math
+import time
+from collections import OrderedDict
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
@@ -154,7 +160,15 @@ class MultiSignalRecall:
     4. 向量相似度: MemoryRouter → 语义匹配
     
     合并: 归一化分数加权融合 + 去重 + 补充近期轮次
+    
+    P1 优化:
+    - keyword 和 BM25 共享同一次 DB 拉取 (避免双倍 IO)
+    - BM25 索引按 (session_id, last_msg_id) 缓存 (避免每次重建)
+    - P0 修复: recency 分数参与 final_score 融合
     """
+
+    # BM25 索引缓存容量 (LRU)
+    _BM25_CACHE_MAXSIZE = 32
 
     def __init__(
         self,
@@ -168,11 +182,15 @@ class MultiSignalRecall:
         self._memory_router = memory_router
         self._conversation_repo = conversation_repo
 
+        # P1: BM25 索引 LRU 缓存 key=(session_id, last_msg_id)
+        self._bm25_cache: OrderedDict = OrderedDict()
+
         self._stats = {
             "recalls": 0,
             "keyword_total_hits": 0,
             "bm25_total_hits": 0,
             "vector_total_hits": 0,
+            "bm25_cache_hits": 0,
         }
 
     def recall(
@@ -183,19 +201,23 @@ class MultiSignalRecall:
         db_session: Optional[Any] = None,
         max_results: int = 50,
         query_context: Optional[Any] = None,
+        retrieval_mode: str = "unknown",
     ) -> RecallResult:
         """
         执行多信号召回
         
         1. 指代解析 → 确定范围
-        2. 关键词+权重检索
-        3. BM25 全文检索 (P1)
-        4. 向量相似度检索
-        5. F1-1: 认知态模式选择 → 动态权重
-        6. F1-3: 统一 min-max 归一化
-        7. F1-2: 信号置信度门控 → 低置信度退出
-        8. 加权融合排序
-        9. 补充固定近期轮数
+        2. 共享 DB 拉取 (P1: keyword + BM25 复用同一次查询)
+        3. 关键词+权重检索
+        4. BM25 全文检索 (P1: LRU 索引缓存)
+        5. 向量相似度检索
+        6. F1-1: 认知态模式选择 → 动态权重
+        7. P0: recency 时间衰减分数计算
+        8. F1-3: 统一 min-max 归一化 (含 recency)
+        9. F1-2: 信号置信度门控 → 低置信度退出
+        10. 加权融合排序 (含 recency 分量)
+        11. 补充固定近期轮次
+        12. 跨会话历史召回 (BM25 相关性过滤)
         
         Args:
             query: 用户查询
@@ -204,6 +226,7 @@ class MultiSignalRecall:
             db_session: 数据库 session
             max_results: 最大结果数
             query_context: QueryContext (可选, 用于 F1-1 认知态模式选择)
+            retrieval_mode: 检索模式 (bm25_only | bm25_embedding | keyword | unknown)
         """
         self._stats["recalls"] += 1
         result = RecallResult()
@@ -221,22 +244,50 @@ class MultiSignalRecall:
             except Exception as e:
                 logger.warning(f"Reference resolver error: {e}")
 
-        # ============ 2. 关键词+权重检索 ============
-        keyword_scored: Dict[str, float] = {}  # msg_id -> raw_score
-        keyword_query_terms = 0   # 查询关键词数 (用于 F1-2 置信度)
-        keyword_hit_terms = 0     # 命中关键词数
+        # ============ 2. P1: 共享 DB 拉取 (keyword + BM25 复用) ============
+        # 避免 keyword 和 BM25 各自独立拉取同一 session 的消息 (双倍 IO)
+        shared_messages: Optional[List[Any]] = None
+        if (self._conversation_repo
+                and (self.config.signals.keyword_enabled or self.config.signals.bm25_enabled)
+                and JIEBA_AVAILABLE):
+            try:
+                raw = (
+                    self._conversation_repo.get_by_session(
+                        session_id=session_id,
+                        db_session=db_session,
+                    ) if db_session
+                    else self._conversation_repo.get_by_session(session_id=session_id)
+                )
+                max_messages = recall_turns * 2
+                shared_messages = raw[-max_messages:] if raw and len(raw) > max_messages else (raw or [])
+            except Exception:
+                try:
+                    raw = self._conversation_repo.get_by_session(session_id=session_id)
+                    max_messages = recall_turns * 2
+                    shared_messages = raw[-max_messages:] if raw and len(raw) > max_messages else (raw or [])
+                except Exception as e:
+                    logger.warning(f"Shared DB fetch failed: {e}")
+                    shared_messages = []
+
+        # ============ 3. 关键词+权重检索 ============
+        keyword_scored: Dict[str, float] = {}
+        keyword_query_terms = 0
+        keyword_hit_terms = 0
         if (self.config.signals.keyword_enabled
                 and JIEBA_AVAILABLE
                 and self._conversation_repo):
-            keyword_scored, keyword_query_terms, keyword_hit_terms = self._keyword_recall_with_confidence(
-                query, session_id, db_session,
-                max_turns=recall_turns,
+            keyword_scored, keyword_query_terms, keyword_hit_terms = (
+                self._keyword_recall_with_confidence(
+                    query, session_id, db_session,
+                    max_turns=recall_turns,
+                    shared_messages=shared_messages,
+                )
             )
             result.keyword_hits = len(keyword_scored)
             self._stats["keyword_total_hits"] += len(keyword_scored)
 
-        # ============ 3. BM25 全文检索 (P1) ============
-        bm25_scored: Dict[str, float] = {}  # msg_id -> raw_score
+        # ============ 4. BM25 全文检索 (P1: LRU 缓存) ============
+        bm25_scored: Dict[str, float] = {}
         if (self.config.signals.bm25_enabled
                 and BM25_AVAILABLE
                 and JIEBA_AVAILABLE
@@ -244,12 +295,13 @@ class MultiSignalRecall:
             bm25_scored = self._bm25_recall(
                 query, session_id, db_session,
                 max_turns=recall_turns,
+                shared_messages=shared_messages,
             )
             result.bm25_hits = len(bm25_scored)
             self._stats["bm25_total_hits"] += len(bm25_scored)
 
-        # ============ 4. 向量相似度检索 ============
-        vector_scored: Dict[str, float] = {}  # msg_id -> raw_score
+        # ============ 5. 向量相似度检索 ============
+        vector_scored: Dict[str, float] = {}
         if self.config.signals.vector_enabled and self._memory_router:
             vector_scored = self._vector_recall(
                 query, session_id, user_id
@@ -257,7 +309,7 @@ class MultiSignalRecall:
             result.vector_hits = len(vector_scored)
             self._stats["vector_total_hits"] += len(vector_scored)
 
-        # ============ 5. F1-1: 认知态模式选择 → 动态权重 ============
+        # ============ 6. F1-1: 认知态模式选择 → 动态权重 ============
         em_config = self.config.epistemic_modes
         selected_mode = select_epistemic_mode(
             context=query_context,
@@ -268,42 +320,63 @@ class MultiSignalRecall:
             config=em_config,
             default_weights=self.config.score_weights,
         )
-        
-        # 记录选择的模式
+
+        # BM25-only 模式: 覆盖权重，大幅提升 recency
+        if retrieval_mode == "bm25_only":
+            bm25_cfg = self.config.bm25_only_tuning
+            active_weights = RecallScoreWeights(
+                keyword_weight=bm25_cfg.keyword_weight,
+                bm25_weight=bm25_cfg.bm25_weight,
+                vector_weight=0.0,
+                recency_weight=bm25_cfg.recency_weight,
+            )
+            logger.debug(
+                f"BM25-only mode: overriding weights → "
+                f"kw={bm25_cfg.keyword_weight}, bm25={bm25_cfg.bm25_weight}, "
+                f"recency={bm25_cfg.recency_weight}"
+            )
+
         self._stats.setdefault("epistemic_mode_counts", {})
         self._stats["epistemic_mode_counts"][selected_mode] = (
             self._stats["epistemic_mode_counts"].get(selected_mode, 0) + 1
         )
 
-        # ============ 6. F1-3: 统一 min-max 归一化 ============
+        # ============ 7. P0: recency 时间衰减分数 ============
+        # 收集所有候选消息的时间戳，计算指数衰减分数
+        all_candidate_msgs: Dict[str, Any] = {}
+        for msgs in (shared_messages or []):
+            mid = str(getattr(msgs, "id", None) or getattr(msgs, "message_id", id(msgs)))
+            all_candidate_msgs[mid] = msgs
+        recency_scored = self._compute_recency_scores(all_candidate_msgs)
+
+        # ============ 8. F1-3: 统一 min-max 归一化 (含 recency) ============
         all_msg_ids = (
             set(keyword_scored.keys())
             | set(bm25_scored.keys())
             | set(vector_scored.keys())
+            | set(recency_scored.keys())
         )
         norm_keyword = self._min_max_normalize(keyword_scored)
         norm_bm25 = self._min_max_normalize(bm25_scored)
         norm_vector = self._min_max_normalize(vector_scored)
+        norm_recency = self._min_max_normalize(recency_scored)
 
-        # ============ 7. F1-2: 信号置信度门控 ============
+        # ============ 9. F1-2: 信号置信度门控 ============
         sg_config = self.config.signal_gating
-        
-        # 计算各信号的置信度
+
         kw_confidence = self._compute_keyword_confidence(
             keyword_scored, keyword_query_terms, keyword_hit_terms,
         )
         bm25_confidence = self._compute_bm25_confidence(bm25_scored)
         vec_confidence = self._compute_vector_confidence(vector_scored)
-        # recency 置信度: 如果有 recent_turns 配置，始终活跃
-        rec_confidence = 1.0
-        
-        # 门控: 低置信度信号退出
+        rec_confidence = 1.0  # recency 始终活跃
+
         signals_dropped = 0
         kw_active = True
         bm25_active = True
         vec_active = True
         rec_active = True
-        
+
         if sg_config.enabled:
             if kw_confidence < sg_config.confidence_threshold:
                 kw_active = False
@@ -314,11 +387,14 @@ class MultiSignalRecall:
             if vec_confidence < sg_config.confidence_threshold:
                 vec_active = False
                 signals_dropped += 1
-        
+            # BM25-only 模式下 vector 强制不活跃
+            if retrieval_mode == "bm25_only":
+                vec_active = False
+
         self._stats.setdefault("signal_gating_dropped_total", 0)
         self._stats["signal_gating_dropped_total"] += signals_dropped
 
-        # ============ 8. 加权融合排序 (门控后动态归一化) ============
+        # ============ 10. 加权融合排序 (含 recency 分量, P0 修复) ============
         active_signal_weights = []
         if kw_active:
             active_signal_weights.append(("keyword", active_weights.keyword_weight))
@@ -328,14 +404,13 @@ class MultiSignalRecall:
             active_signal_weights.append(("vector", active_weights.vector_weight))
         if rec_active:
             active_signal_weights.append(("recency", active_weights.recency_weight))
-        
-        # 动态归一化: 参与信号的权重归一化到 1.0
+
         w_sum = sum(w for _, w in active_signal_weights)
         if w_sum <= 0:
             w_sum = 1.0
-        
+
         norm_weights = {name: w / w_sum for name, w in active_signal_weights}
-        
+
         final_scores: Dict[str, float] = {}
         for msg_id in all_msg_ids:
             score = 0.0
@@ -345,9 +420,11 @@ class MultiSignalRecall:
                 score += norm_weights.get("bm25", 0.0) * norm_bm25.get(msg_id, 0.0)
             if vec_active:
                 score += norm_weights.get("vector", 0.0) * norm_vector.get(msg_id, 0.0)
+            if rec_active:
+                # P0 修复: recency 分量正式参与 final_score
+                score += norm_weights.get("recency", 0.0) * norm_recency.get(msg_id, 0.0)
             final_scores[msg_id] = score
 
-        # 按 final_score 降序排序
         sorted_ids = sorted(
             final_scores.keys(),
             key=lambda x: final_scores[x],
@@ -356,7 +433,7 @@ class MultiSignalRecall:
 
         result.scores = {mid: final_scores[mid] for mid in sorted_ids}
 
-        # ============ 9. 获取完整消息对象 ============
+        # ============ 11. 获取完整消息对象 ============
         recalled_messages = []
         if sorted_ids and self._conversation_repo:
             try:
@@ -366,7 +443,7 @@ class MultiSignalRecall:
             except Exception as e:
                 logger.error(f"Failed to fetch recalled messages: {e}")
 
-        # ============ 10. 补充近期轮次 ============
+        # ============ 12. 补充近期轮次 ============
         recent_messages = []
         min_turns = self.config.budget.min_recent_turns
         if min_turns > 0 and self._conversation_repo:
@@ -378,47 +455,58 @@ class MultiSignalRecall:
             except Exception as e:
                 logger.warning(f"Failed to get recent turns: {e}")
 
-        # ============ 11. 合并 (近期优先, 去重) ============
+        # ============ 13. 合并 (近期优先, 去重) ============
         seen_ids = set()
         final_messages = []
 
-        # 近期消息优先 (recency bonus 由门控后权重控制)
         for msg in recent_messages:
-            msg_id = getattr(msg, "id", None) or getattr(msg, "message_id", id(msg))
-            msg_id = str(msg_id)
+            msg_id = str(getattr(msg, "id", None) or getattr(msg, "message_id", id(msg)))
             if msg_id not in seen_ids:
                 seen_ids.add(msg_id)
                 final_messages.append(msg)
-                # 添加时间近度 bonus (使用门控后的 recency 权重)
-                if msg_id in final_scores and rec_active:
-                    final_scores[msg_id] += norm_weights.get("recency", 0.0)
 
-        # 召回消息
         for msg in recalled_messages:
-            msg_id = getattr(msg, "id", None) or getattr(msg, "message_id", id(msg))
-            msg_id = str(msg_id)
+            msg_id = str(getattr(msg, "id", None) or getattr(msg, "message_id", id(msg)))
             if msg_id not in seen_ids:
                 seen_ids.add(msg_id)
                 final_messages.append(msg)
 
-        # ============ 12. 跨会话历史召回 (Cross-Session Memory) ============
+        # ============ 14. 跨会话历史召回 (P2: BM25 相关性过滤) ============
         cross_session_count = 0
         if user_id and self._conversation_repo and hasattr(self._conversation_repo, 'get_cross_session_history'):
             try:
-                cross_session_limit = self.config.budget.cross_session_limit if hasattr(self.config.budget, 'cross_session_limit') else 10
+                bm25_cfg = self.config.bm25_only_tuning
+                cross_session_limit = (
+                    bm25_cfg.cross_session_limit
+                    if retrieval_mode == "bm25_only"
+                    else (
+                        self.config.budget.cross_session_limit
+                        if hasattr(self.config.budget, 'cross_session_limit')
+                        else 10
+                    )
+                )
                 cross_session_msgs = self._conversation_repo.get_cross_session_history(
                     user_id=user_id,
                     current_session_id=session_id,
-                    limit=cross_session_limit,
+                    limit=cross_session_limit * 3,  # 多拉一些，后面过滤
                 )
+                # P2: BM25-only 模式下对跨会话消息做相关性 + 时间衰减过滤
+                if retrieval_mode == "bm25_only" and cross_session_msgs and bm25_scored:
+                    cross_session_msgs = self._filter_cross_session_by_relevance(
+                        cross_session_msgs=cross_session_msgs,
+                        query=query,
+                        bm25_min_score=bm25_cfg.cross_session_min_bm25_score,
+                        decay_rate=bm25_cfg.cross_session_time_decay_rate,
+                        limit=cross_session_limit,
+                    )
+
                 for msg in cross_session_msgs:
-                    msg_id = getattr(msg, "id", None) or getattr(msg, "message_id", id(msg))
-                    msg_id = str(msg_id)
+                    msg_id = str(getattr(msg, "id", None) or getattr(msg, "message_id", id(msg)))
                     if msg_id not in seen_ids:
                         seen_ids.add(msg_id)
                         final_messages.append(msg)
                         cross_session_count += 1
-                
+
                 if cross_session_count > 0:
                     logger.info(
                         f"Cross-session recall: added {cross_session_count} messages "
@@ -428,18 +516,18 @@ class MultiSignalRecall:
                 logger.warning(f"Cross-session recall failed (non-critical): {e}")
 
         result.messages = final_messages
-        # 只保留 final_messages 中出现的 msg_id 的分数
-        final_msg_ids = set()
-        for msg in final_messages:
-            msg_id = getattr(msg, "id", None) or getattr(msg, "message_id", id(msg))
-            final_msg_ids.add(str(msg_id))
+        final_msg_ids = {
+            str(getattr(m, "id", None) or getattr(m, "message_id", id(m)))
+            for m in final_messages
+        }
         result.scores = {k: v for k, v in final_scores.items() if k in final_msg_ids}
 
         logger.debug(
-            f"Recall complete: mode={selected_mode}, "
+            f"Recall complete: mode={selected_mode}, retrieval={retrieval_mode}, "
             f"kw={result.keyword_hits}(active={kw_active}), "
             f"bm25={result.bm25_hits}(active={bm25_active}), "
             f"vec={result.vector_hits}(active={vec_active}), "
+            f"recency_active={rec_active}, "
             f"recent={result.recent_turns_added}, "
             f"cross_session={cross_session_count}, "
             f"gating_dropped={signals_dropped}, "
@@ -579,22 +667,26 @@ class MultiSignalRecall:
         session_id: str,
         db_session: Optional[Any],
         max_turns: int = 10,
+        shared_messages: Optional[List[Any]] = None,
     ) -> Dict[str, float]:
         """
-        BM25 全文检索 (P1)
+        BM25 全文检索 (P1: LRU 索引缓存 + 共享 DB 拉取)
         
         使用 rank_bm25 (BM25Okapi) 对会话历史进行全文检索。
         与关键词信号互补:
         - jieba TF-IDF: 提取关键词 → 精确匹配 → 侧重"关键词权重"
         - BM25: 全文分词 → 文档相关性排序 → 侧重"整体相关性"
         
-        BM25 对长查询和词频分布更鲁棒, 能捕获 TF-IDF 遗漏的相关消息。
+        P1 优化:
+        - 接受 shared_messages 参数，避免重复 DB 拉取
+        - 按 (session_id, last_msg_id) 缓存 BM25 索引，同一 session 消息未变时复用
         
         Args:
             query: 用户查询
             session_id: 会话 ID
             db_session: 数据库 session (可选)
             max_turns: 最大回溯轮数 (由指代解析决定)
+            shared_messages: 共享的消息列表 (P1: 避免重复 DB 拉取)
             
         Returns:
             msg_id → BM25 score 的字典
@@ -604,77 +696,91 @@ class MultiSignalRecall:
         if not BM25_AVAILABLE or not JIEBA_AVAILABLE:
             return scored
 
-        # 获取会话历史消息
-        try:
-            messages = self._conversation_repo.get_by_session(
-                session_id=session_id,
-                db_session=db_session,
-            ) if db_session else self._conversation_repo.get_by_session(
-                session_id=session_id,
-            )
-        except Exception:
+        # P1: 优先使用共享消息列表
+        if shared_messages is not None:
+            messages = shared_messages
+        else:
             try:
-                messages = self._conversation_repo.get_by_session(
-                    session_id=session_id,
+                raw = (
+                    self._conversation_repo.get_by_session(
+                        session_id=session_id,
+                        db_session=db_session,
+                    ) if db_session
+                    else self._conversation_repo.get_by_session(session_id=session_id)
                 )
-            except Exception as e:
-                logger.warning(f"BM25: Failed to get session messages: {e}")
+            except Exception:
+                try:
+                    raw = self._conversation_repo.get_by_session(session_id=session_id)
+                except Exception as e:
+                    logger.warning(f"BM25: Failed to get session messages: {e}")
+                    return scored
+
+            if not raw:
                 return scored
+
+            max_messages = max_turns * 2
+            messages = raw[-max_messages:] if len(raw) > max_messages else raw
 
         if not messages:
             return scored
 
-        # 限制回溯范围
-        max_messages = max_turns * 2
-        if len(messages) > max_messages:
-            messages = messages[-max_messages:]
+        # P1: BM25 索引 LRU 缓存 — key=(session_id, last_msg_id)
+        last_msg_id = str(
+            getattr(messages[-1], "id", None)
+            or getattr(messages[-1], "message_id", id(messages[-1]))
+        )
+        cache_key = (session_id, last_msg_id)
 
-        # 构建 BM25 语料库: 对每条消息用 jieba 分词
-        corpus: List[List[str]] = []
-        msg_ids: List[str] = []
-        for msg in messages:
-            content = getattr(msg, "content", "")
-            msg_id = str(
-                getattr(msg, "id", None)
-                or getattr(msg, "message_id", id(msg))
-            )
-            if not content.strip():
-                continue
-            # jieba 分词 (精确模式)
-            tokens = list(jieba.cut(content))
-            # 过滤停用词和单字符 (简单过滤, 提升 BM25 质量)
-            tokens = [t.strip() for t in tokens if len(t.strip()) > 1]
-            if tokens:
-                corpus.append(tokens)
-                msg_ids.append(msg_id)
+        if cache_key in self._bm25_cache:
+            bm25, msg_ids = self._bm25_cache[cache_key]
+            self._bm25_cache.move_to_end(cache_key)
+            self._stats["bm25_cache_hits"] += 1
+            logger.debug(f"BM25 index cache hit: session={session_id}, last={last_msg_id}")
+        else:
+            # 构建 BM25 语料库
+            corpus: List[List[str]] = []
+            msg_ids: List[str] = []
+            for msg in messages:
+                content = getattr(msg, "content", "")
+                msg_id = str(
+                    getattr(msg, "id", None)
+                    or getattr(msg, "message_id", id(msg))
+                )
+                if not content.strip():
+                    continue
+                tokens = list(jieba.cut(content))
+                tokens = [t.strip() for t in tokens if len(t.strip()) > 1]
+                if tokens:
+                    corpus.append(tokens)
+                    msg_ids.append(msg_id)
 
-        if not corpus:
-            return scored
+            if not corpus:
+                return scored
 
-        # 构建 BM25 索引
-        try:
-            bm25 = BM25Okapi(corpus)
-        except Exception as e:
-            logger.warning(f"BM25: Failed to build index: {e}")
-            return scored
+            try:
+                bm25 = BM25Okapi(corpus)
+            except Exception as e:
+                logger.warning(f"BM25: Failed to build index: {e}")
+                return scored
 
-        # 对查询进行分词
-        query_tokens = list(jieba.cut(query))
-        query_tokens = [t.strip() for t in query_tokens if len(t.strip()) > 1]
+            # 写入 LRU 缓存
+            self._bm25_cache[cache_key] = (bm25, msg_ids)
+            self._bm25_cache.move_to_end(cache_key)
+            while len(self._bm25_cache) > self._BM25_CACHE_MAXSIZE:
+                self._bm25_cache.popitem(last=False)
 
+        # 对查询分词
+        query_tokens = [t.strip() for t in jieba.cut(query) if len(t.strip()) > 1]
         if not query_tokens:
             return scored
 
-        # 计算 BM25 分数
         try:
             scores = bm25.get_scores(query_tokens)
         except Exception as e:
             logger.warning(f"BM25: Failed to compute scores: {e}")
             return scored
 
-        # 取 top-k 结果
         top_k = self.config.signals.bm25_top_k
-        # 将分数与 msg_id 配对, 按分数降序排序
         scored_pairs = sorted(
             zip(msg_ids, scores),
             key=lambda x: x[1],
@@ -686,7 +792,7 @@ class MultiSignalRecall:
                 scored[msg_id] = float(score)
 
         logger.debug(
-            f"BM25 recall: {len(scored)} hits from {len(corpus)} docs, "
+            f"BM25 recall: {len(scored)} hits from {len(msg_ids)} docs, "
             f"query_tokens={query_tokens[:5]}..."
         )
 
@@ -779,23 +885,23 @@ class MultiSignalRecall:
         统一 min-max 归一化到 [0, 1] (F1-3)
         
         所有信号使用相同的归一化方法:
-        - 单元素: 映射到 1.0
+        - 单元素或所有分数相同: 映射到 0.5 (P2 修复: 避免单命中消息排名虚高)
         - 多元素: (x - min) / (max - min)
         
         优点: 简单、可解释、各信号可比
         """
         if not raw_scores:
             return {}
-        
+
         values = list(raw_scores.values())
         v_min = min(values)
         v_max = max(values)
         spread = v_max - v_min
-        
+
         if spread <= 0:
-            # 所有分数相同 → 全部映射到 1.0
-            return {k: 1.0 for k in raw_scores}
-        
+            # 单元素或所有分数相同 → 映射到中间值 0.5，避免单命中消息排名虚高
+            return {k: 0.5 for k in raw_scores}
+
         return {
             k: (v - v_min) / spread
             for k, v in raw_scores.items()
@@ -811,9 +917,12 @@ class MultiSignalRecall:
         session_id: str,
         db_session: Optional[Any],
         max_turns: int = 10,
+        shared_messages: Optional[List[Any]] = None,
     ) -> Tuple[Dict[str, float], int, int]:
         """
         关键词召回 + 返回置信度所需的元数据 (F1-2)
+        
+        P1 优化: 接受 shared_messages 参数，避免重复 DB 拉取。
         
         Returns:
             (scored, query_terms, hit_terms):
@@ -848,32 +957,36 @@ class MultiSignalRecall:
         query_terms = len(keywords)
         logger.debug(f"Keywords extracted: {keywords}")
 
-        # 从会话历史中匹配关键词
-        try:
-            messages = self._conversation_repo.get_by_session(
-                session_id=session_id,
-                db_session=db_session,
-            ) if db_session else self._conversation_repo.get_by_session(
-                session_id=session_id,
-            )
-        except Exception:
+        # P1: 优先使用共享消息列表，避免重复 DB 拉取
+        if shared_messages is not None:
+            messages = shared_messages
+        else:
             try:
                 messages = self._conversation_repo.get_by_session(
                     session_id=session_id,
+                    db_session=db_session,
+                ) if db_session else self._conversation_repo.get_by_session(
+                    session_id=session_id,
                 )
-            except Exception as e:
-                logger.warning(f"Failed to get session messages: {e}")
+            except Exception:
+                try:
+                    messages = self._conversation_repo.get_by_session(
+                        session_id=session_id,
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to get session messages: {e}")
+                    return scored, query_terms, 0
+
+            if not messages:
                 return scored, query_terms, 0
+
+            max_messages = max_turns * 2
+            if len(messages) > max_messages:
+                messages = messages[-max_messages:]
 
         if not messages:
             return scored, query_terms, 0
 
-        # 限制回溯范围
-        max_messages = max_turns * 2
-        if len(messages) > max_messages:
-            messages = messages[-max_messages:]
-
-        # 对每条消息计算关键词命中分数, 同时追踪命中关键词数
         hit_keyword_set = set()
         for msg in messages:
             content = getattr(msg, "content", "")
@@ -989,6 +1102,158 @@ class MultiSignalRecall:
         except Exception as e:
             logger.warning(f"get_recent_turns failed: {e}")
             return []
+
+    # ================================================================
+    # P0: recency 时间衰减分数
+    # ================================================================
+
+    @staticmethod
+    def _compute_recency_scores(
+        msg_map: Dict[str, Any],
+        decay_rate: float = 0.1,
+    ) -> Dict[str, float]:
+        """
+        P0 修复: 计算每条消息的时间近度分数 (指数衰减)
+        
+        score(msg) = exp(-decay_rate * hours_ago)
+        
+        - 越新的消息分数越高 (趋近 1.0)
+        - 越旧的消息分数越低 (趋近 0.0)
+        - decay_rate=0.1 时: 1 小时前 ≈ 0.90, 24 小时前 ≈ 0.09
+        
+        Args:
+            msg_map: msg_id → 消息对象
+            decay_rate: 每小时衰减率 (默认 0.1)
+            
+        Returns:
+            msg_id → recency_score ∈ [0, 1]
+        """
+        if not msg_map:
+            return {}
+
+        now = datetime.now(timezone.utc)
+        scored: Dict[str, float] = {}
+
+        for msg_id, msg in msg_map.items():
+            ts = getattr(msg, "timestamp", None) or getattr(msg, "created_at", None)
+            if ts is None:
+                scored[msg_id] = 0.5  # 无时间戳时给中间值
+                continue
+
+            try:
+                if isinstance(ts, str):
+                    ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                hours_ago = max(0.0, (now - ts).total_seconds() / 3600.0)
+                scored[msg_id] = math.exp(-decay_rate * hours_ago)
+            except Exception:
+                scored[msg_id] = 0.5
+
+        return scored
+
+    # ================================================================
+    # P2: 跨会话消息相关性过滤
+    # ================================================================
+
+    def _filter_cross_session_by_relevance(
+        self,
+        cross_session_msgs: List[Any],
+        query: str,
+        bm25_min_score: float = 1.0,
+        decay_rate: float = 0.05,
+        limit: int = 5,
+    ) -> List[Any]:
+        """
+        P2: 对跨会话消息做 BM25 相关性 + 时间衰减过滤
+        
+        在 BM25-only 模式下，跨会话消息容易引入噪声（老但关键词撞车）。
+        此方法对候选跨会话消息进行二次评分：
+        - BM25 分数低于阈值的直接丢弃
+        - 剩余消息按 BM25 × 时间衰减综合排序
+        
+        Args:
+            cross_session_msgs: 候选跨会话消息列表
+            query: 当前查询
+            bm25_min_score: BM25 最低分数阈值
+            decay_rate: 每天时间衰减率 (默认 0.05, 即每天衰减 5%)
+            limit: 最终保留条数
+            
+        Returns:
+            过滤并排序后的跨会话消息列表
+        """
+        if not cross_session_msgs or not BM25_AVAILABLE or not JIEBA_AVAILABLE:
+            return cross_session_msgs[:limit]
+
+        # 对跨会话消息构建临时 BM25 索引
+        corpus: List[List[str]] = []
+        msg_ids: List[str] = []
+        for msg in cross_session_msgs:
+            content = getattr(msg, "content", "")
+            msg_id = str(getattr(msg, "id", None) or getattr(msg, "message_id", id(msg)))
+            if not content.strip():
+                continue
+            tokens = [t.strip() for t in jieba.cut(content) if len(t.strip()) > 1]
+            if tokens:
+                corpus.append(tokens)
+                msg_ids.append(msg_id)
+
+        if not corpus:
+            return cross_session_msgs[:limit]
+
+        try:
+            bm25 = BM25Okapi(corpus)
+            query_tokens = [t.strip() for t in jieba.cut(query) if len(t.strip()) > 1]
+            if not query_tokens:
+                return cross_session_msgs[:limit]
+            scores = bm25.get_scores(query_tokens)
+        except Exception as e:
+            logger.warning(f"Cross-session BM25 filter failed: {e}")
+            return cross_session_msgs[:limit]
+
+        # 构建 msg_id → (msg, bm25_score) 映射
+        id_to_msg = {
+            str(getattr(m, "id", None) or getattr(m, "message_id", id(m))): m
+            for m in cross_session_msgs
+        }
+        id_to_bm25 = dict(zip(msg_ids, scores))
+
+        now = datetime.now(timezone.utc)
+        scored_msgs: List[Tuple[float, Any]] = []
+
+        for msg_id, bm25_score in id_to_bm25.items():
+            if bm25_score < bm25_min_score:
+                continue  # 相关性不足，丢弃
+            msg = id_to_msg.get(msg_id)
+            if msg is None:
+                continue
+
+            # 时间衰减 (按天)
+            ts = getattr(msg, "timestamp", None) or getattr(msg, "created_at", None)
+            time_factor = 1.0
+            if ts is not None:
+                try:
+                    if isinstance(ts, str):
+                        ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=timezone.utc)
+                    days_ago = max(0.0, (now - ts).total_seconds() / 86400.0)
+                    time_factor = math.exp(-decay_rate * days_ago)
+                except Exception:
+                    pass
+
+            combined_score = bm25_score * time_factor
+            scored_msgs.append((combined_score, msg))
+
+        # 按综合分数降序排序，取 top-limit
+        scored_msgs.sort(key=lambda x: x[0], reverse=True)
+        result = [m for _, m in scored_msgs[:limit]]
+
+        logger.debug(
+            f"Cross-session filter: {len(cross_session_msgs)} candidates → "
+            f"{len(result)} kept (bm25_min={bm25_min_score}, limit={limit})"
+        )
+        return result
 
     # ================================================================
     # 统计

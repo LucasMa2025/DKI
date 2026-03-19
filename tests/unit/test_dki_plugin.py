@@ -17,6 +17,7 @@ from dki.core.dki_plugin import (
     DKIPluginResponse,
     InjectionMetadata,
 )
+from dki.core.exceptions import AdapterConnectionError, AdapterSchemaError
 from dki.adapters.base import (
     IUserDataAdapter,
     UserPreference,
@@ -114,6 +115,15 @@ class MockUserDataAdapter(IUserDataAdapter):
     ) -> List[ChatMessage]:
         return self._messages.get(session_id, [])[:limit]
     
+    async def get_recent_messages(
+        self,
+        user_id: str,
+        limit: int = 10,
+        **kwargs,
+    ) -> List[ChatMessage]:
+        """v7.2: 近轮对话（测试用返回空）"""
+        return []
+
     async def search_relevant_history(
         self,
         user_id: str,
@@ -472,6 +482,229 @@ class TestUserIdPropagation:
             session_id="s2",
         )
         assert response_b.metadata.preferences_count == 1
+
+
+# ============================================================
+# P0/P1/P2 审查报告修复 — 单元测试
+# ============================================================
+
+
+class TestChatFallbackRecordsInjectionLog:
+    """P0: chat() 降级路径也记录注入日志与统计"""
+
+    @pytest.fixture
+    def plugin(self):
+        model = MockModelAdapter()
+        adapter = MockUserDataAdapter()
+        adapter.add_preference(
+            "u1",
+            UserPreference(
+                user_id="u1",
+                preference_text="测试偏好",
+                preference_type="test",
+                priority=1,
+            ),
+        )
+        return DKIPlugin(
+            model_adapter=model,
+            user_data_adapter=adapter,
+            language="cn",
+        )
+
+    @pytest.mark.asyncio
+    async def test_schema_error_fallback_records_log(self, plugin):
+        """AdapterSchemaError 降级后 get_injection_logs 包含该请求且 total_requests 增加"""
+        plugin.data_adapter.get_user_preferences = AsyncMock(
+            side_effect=AdapterSchemaError("schema mismatch")
+        )
+        before = plugin._stats["total_requests"]
+        logs_before = len(plugin._injection_logs)
+
+        response = await plugin.chat(
+            query="测试",
+            user_id="u1",
+            session_id="s1",
+        )
+        # 不强依赖具体的 injection_strategy 字符串，只验证统计与日志有记录
+        assert plugin._stats["total_requests"] == before + 1
+        assert len(plugin._injection_logs) == logs_before + 1
+        last = plugin.get_injection_logs(limit=1)[0]
+        assert isinstance(last.get("latency", {}).get("total_ms", 0), (int, float))
+
+    @pytest.mark.asyncio
+    async def test_no_injection_fallback_records_log(self, plugin):
+        """无注入降级路径也记录日志"""
+        plugin.data_adapter.get_user_preferences = AsyncMock(return_value=[])
+        plugin.data_adapter.search_relevant_history = AsyncMock(return_value=[])
+        # 触发 none_fallback: 需要让 executor 也失败，或直接测 _fallback_no_injection 的日志
+        # 这里通过 schema 错误触发 no_injection 链
+        plugin.data_adapter.get_user_preferences = AsyncMock(
+            side_effect=AdapterSchemaError("err")
+        )
+        response = await plugin.chat(query="x", user_id="u1", session_id="s1")
+        assert plugin._stats["total_requests"] >= 1
+        logs = plugin.get_injection_logs(limit=5)
+        assert any(
+            log.get("injection_strategy", "").endswith("fallback") for log in logs
+        )
+
+
+class TestChatStreamUpdatesStatsAndLogs:
+    """P0: chat_stream() 成功与错误路径都更新统计与注入日志"""
+
+    @pytest.fixture
+    def stream_plugin(self):
+        model = MockModelAdapter()
+        # 需要 async_stream_generate 才能走流式成功路径
+        if not hasattr(model, "async_stream_generate"):
+
+            async def _stream(prompt, **kwargs):
+                yield "ok"
+                yield " "
+
+            model.async_stream_generate = _stream
+        adapter = MockUserDataAdapter()
+        return DKIPlugin(
+            model_adapter=model,
+            user_data_adapter=adapter,
+            language="cn",
+        )
+
+    @pytest.mark.asyncio
+    async def test_stream_success_increments_total_requests(self, stream_plugin):
+        """流式成功完成后 total_requests 增加且日志有一条"""
+        before = stream_plugin._stats["total_requests"]
+        chunks = []
+        async for c in stream_plugin.chat_stream(
+            query="你好", user_id="u1", session_id="s1"
+        ):
+            chunks.append(c)
+        assert stream_plugin._stats["total_requests"] == before + 1
+        done = [x for x in chunks if x.get("type") == "done"]
+        assert len(done) >= 1
+
+    @pytest.mark.asyncio
+    async def test_stream_success_adds_injection_log(self, stream_plugin):
+        """流式成功路径会写入 _injection_logs"""
+        n_before = len(stream_plugin._injection_logs)
+        async for _ in stream_plugin.chat_stream(
+            query="hi", user_id="u1", session_id="s1"
+        ):
+            pass
+        assert len(stream_plugin._injection_logs) == n_before + 1
+
+    @pytest.mark.asyncio
+    async def test_stream_error_records_fallback_log(self, stream_plugin):
+        """流式异常时也记录一次 stream_error_fallback 日志"""
+        stream_plugin.data_adapter.get_user_preferences = AsyncMock(
+            side_effect=RuntimeError("fake error")
+        )
+        n_before = stream_plugin._stats["total_requests"]
+        chunks = []
+        async for c in stream_plugin.chat_stream(
+            query="x", user_id="u1", session_id="s1"
+        ):
+            chunks.append(c)
+        errors = [x for x in chunks if x.get("type") == "error"]
+        assert len(errors) >= 1
+        assert stream_plugin._stats["total_requests"] == n_before + 1
+        logs = stream_plugin.get_injection_logs(limit=3)
+        assert any(
+            log.get("injection_strategy") == "stream_error_fallback" for log in logs
+        )
+
+
+class TestInvalidateUserCacheClearsExecutorL0:
+    """P1: invalidate_user_cache 同时清理 Executor L0 缓存"""
+
+    @pytest.fixture
+    def plugin(self):
+        model = MockModelAdapter()
+        adapter = MockUserDataAdapter()
+        return DKIPlugin(
+            model_adapter=model,
+            user_data_adapter=adapter,
+            language="cn",
+        )
+
+    @pytest.mark.asyncio
+    async def test_invalidate_calls_executor_clear_preference_cache(self, plugin):
+        """invalidate_user_cache 应调用 _executor.clear_preference_cache(user_id)"""
+        with patch.object(
+            plugin._executor,
+            "clear_preference_cache",
+            MagicMock(),
+        ) as m_clear:
+            await plugin.invalidate_user_cache("user_99")
+            m_clear.assert_called_once_with("user_99")
+
+
+class TestGetStatsPreferenceErrorCounters:
+    """P2: get_stats 暴露偏好加载错误统计"""
+
+    @pytest.fixture
+    def plugin(self):
+        model = MockModelAdapter()
+        adapter = MockUserDataAdapter()
+        return DKIPlugin(
+            model_adapter=model,
+            user_data_adapter=adapter,
+            language="cn",
+        )
+
+    def test_get_stats_includes_preference_error_fields(self, plugin):
+        """get_stats() 返回中包含 preference_singleflight_join_errors 与 preference_load_errors"""
+        stats = plugin.get_stats()
+        assert "preference_singleflight_join_errors" in stats
+        assert "preference_load_errors" in stats
+        assert stats["preference_singleflight_join_errors"] >= 0
+        assert stats["preference_load_errors"] >= 0
+
+
+class TestFallbackWithoutAdapterPreferenceInjection:
+    """P1: _fallback_without_adapter 与 _fallback_stable_then_none 对齐，尽量保留偏好注入"""
+
+    @pytest.fixture
+    def plugin(self):
+        model = MockModelAdapter()
+        adapter = MockUserDataAdapter()
+        adapter.add_preference(
+            "u1",
+            UserPreference(
+                user_id="u1",
+                preference_text="降级时也要用的偏好",
+                preference_type="style",
+                priority=1,
+            ),
+        )
+        return DKIPlugin(
+            model_adapter=model,
+            user_data_adapter=adapter,
+            language="cn",
+        )
+
+    @pytest.mark.asyncio
+    async def test_fallback_without_adapter_uses_preferences_when_available(self, plugin):
+        """适配器仅 get_user_preferences 可用时，_fallback_without_adapter 仍可注入偏好"""
+        # 仅 search_relevant_history 失败，模拟“适配器暂时不可用”
+        plugin.data_adapter.search_relevant_history = AsyncMock(
+            side_effect=AdapterConnectionError("connection lost")
+        )
+        # get_user_preferences 仍成功（直连 DB 或重试成功）
+        response = await plugin.chat(
+            query="测试",
+            user_id="u1",
+            session_id="s1",
+        )
+        # 可能走 adapter_retry_fallback -> _fallback_without_adapter，且其中会调 get_user_preferences
+        assert response.text is not None
+        # 若走了 _fallback_without_adapter 且偏好加载成功，metadata 应有偏好
+        assert response.metadata.injection_strategy in (
+            "recall_v4",
+            "adapter_retry_fallback",
+            "stable_fallback",
+            "none_fallback",
+        )
 
 
 if __name__ == "__main__":

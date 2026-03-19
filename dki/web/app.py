@@ -14,6 +14,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from dataclasses import asdict
 
 from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -211,17 +212,14 @@ def create_app() -> FastAPI:
             logger.warning(f"Failed to connect user adapter: {e}")
         
         # ============ Initialize Redis cache (consistent with production) ============
-        # Load Redis config from config file
-        import yaml
+        # 直接使用 ConfigLoader().config 中解析后的配置（已支持 ${VAR:-default}）
         config_loader = ConfigLoader()
-        try:
-            with open(config_loader._config_path, 'r', encoding='utf-8') as f:
-                raw_config = yaml.safe_load(f) or {}
-        except Exception:
-            raw_config = {}
-        
-        redis_config_data = raw_config.get('redis', {})
-        cache_config_data = raw_config.get('preference_cache', {})
+        cfg = config_loader.config
+        # cfg.redis / cfg.preference_cache 是 dataclass，对应 config_env.yaml 中的 redis / preference_cache
+        redis_cfg_obj = getattr(cfg, "redis", None)
+        cache_cfg_obj = getattr(cfg, "preference_cache", None)
+        redis_config_data = asdict(redis_cfg_obj) if redis_cfg_obj is not None else {}
+        cache_config_data = asdict(cache_cfg_obj) if cache_cfg_obj is not None else {}
         
         # Initialize Redis client
         if REDIS_AVAILABLE and redis_config_data.get('enabled', False):

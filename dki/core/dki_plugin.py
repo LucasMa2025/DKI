@@ -468,6 +468,9 @@ class DKIPlugin:
             "cache_hits": 0,
             "total_latency_ms": 0.0,
             "avg_alpha": 0.0,
+            # P2-5: 偏好加载相关错误统计
+            "preference_singleflight_join_errors": 0,
+            "preference_load_errors": 0,
         }
         
         # 日志输出缓存状态
@@ -489,51 +492,65 @@ class DKIPlugin:
     
     def _detect_retrieval_mode(self) -> str:
         """
-        v7.0: 检测适配器的检索模式
+        v7.0 / v7.5: 检测适配器的检索模式
         
         根据 ConfigDrivenAdapter 的状态判断当前使用的检索策略:
-        - bm25_embedding: 有 vector_index_config → BM25 + Embedding 混合检索
-        - bm25_only: 无 vector_index_config → 仅 BM25 召回
+        - bm25_embedding: 有 vector_index_config + 向量能力 → BM25 + Embedding 混合检索
+        - bm25_only: 有 BM25 能力但无向量能力 → 仅 BM25 召回
         - pgvector: 使用 PostgreSQL 预计算向量
-        - keyword: 简单关键词匹配
+        - keyword: vector_search 完全禁用 (纯 SQL LIKE / 简单关键字匹配)
         - unknown: 非 ConfigDrivenAdapter 或无法判断
+        
+        v7.5 修复:
+        - 只有 vs_config.enabled=False 且确认无 BM25 能力时才标记为 "keyword"
+        - 有 BM25 能力但无向量能力的情况统一标记为 "bm25_only"，不再混入 "keyword"
+        - 保证监控侧能准确按 "是否使用 BM25 全文检索" 分桶
         """
         try:
             from dki.adapters.config_driven_adapter import ConfigDrivenAdapter
-            
+
             if not isinstance(self.data_adapter, ConfigDrivenAdapter):
                 return "unknown"
-            
+
             adapter = self.data_adapter
             vs_config = adapter.adapter_config.vector_search
-            
+
+            # 检查是否有 BM25 能力 (ConfigDrivenAdapter 通常通过 _bm25_only_mode 标记)
+            has_bm25 = getattr(adapter, '_bm25_only_mode', False) or getattr(adapter, '_bm25_enabled', False)
+
             if not vs_config.enabled:
+                # vector_search 完全禁用: 只有确认无 BM25 时才是纯 keyword
+                if has_bm25:
+                    return "bm25_only"
                 return "keyword"
-            
-            # 检查是否有向量能力
+
+            # vector_search 启用
             if vs_config.has_vector_capability:
-                if vs_config.type.value == "pgvector":
+                if getattr(vs_config, 'type', None) and str(getattr(vs_config.type, 'value', '')).lower() == "pgvector":
                     return "pgvector"
                 return "bm25_embedding"
-            
-            # 无向量能力但 type=dynamic → BM25-only
-            if getattr(adapter, '_bm25_only_mode', False):
-                return "bm25_only"
-            
+
+            # vector_search 启用但无向量能力 → BM25-only
             return "bm25_only"
-            
+
         except Exception:
             return "unknown"
     
-    def _get_max_recent_turns(self) -> int:
+    def _get_max_recent_turns(self, retrieval_mode: str = "unknown") -> int:
         """
-        v7.2: 获取近轮对话的最大轮次数
+        v7.2 / v7.5: 获取近轮对话的最大轮次数
         
-        从配置 dki.recall.budget.max_recent_turns 读取, 默认 5
+        从配置 dki.recall.budget.max_recent_turns 读取, 默认 5。
+        
+        v7.5: BM25-only 模式下使用 bm25_only_tuning.max_recent_turns，
+        确保近轮对话在向量信号缺失时得到充分保留。
         """
         try:
-            if self._recall_config and hasattr(self._recall_config, 'budget'):
-                return getattr(self._recall_config.budget, 'max_recent_turns', 5)
+            if self._recall_config:
+                if retrieval_mode == "bm25_only" and hasattr(self._recall_config, 'bm25_only_tuning'):
+                    return getattr(self._recall_config.bm25_only_tuning, 'max_recent_turns', 8)
+                if hasattr(self._recall_config, 'budget'):
+                    return getattr(self._recall_config.budget, 'max_recent_turns', 5)
         except Exception:
             pass
         return 5
@@ -558,40 +575,43 @@ class DKIPlugin:
         self,
         recent_messages: List[AdapterChatMessage],
         recalled_messages: List[AdapterChatMessage],
+        retrieval_mode: str = "unknown",
     ) -> List[AdapterChatMessage]:
         """
         v7.2: 合并近轮对话与 BM25 召回结果
         v7.3: 合并后按时间排序, 确保成对注入
         v7.4: 过滤末尾无 assistant 回复的 user 消息
-              (用户当前查询已在 prompt 最后, 不需要在历史中重复)
+        v7.5: BM25-only 模式下近轮完整保留，老 BM25 召回优先裁剪
         
         策略: 近轮优先, 去重, 按时间排序, 成对补全, 过滤孤立末尾 user
         - recent_messages: 按时间正序 (最旧在前), 确保多轮连贯
         - recalled_messages: 按 BM25 相关性排序, 可能来自任意会话
         
-        合并后: 按时间正序排列 (近轮 + BM25 混合, 去重)
+        BM25-only 策略 (v7.5):
+        - 近轮消息完整保留 (不受 recall_limit 裁剪)
+        - BM25 召回消息仅补充近轮未覆盖的部分
+        - SuffixBuilder 面临 token 不足时，优先裁剪老的 BM25 召回
+          (通过将 BM25 消息追加在近轮之后，SuffixBuilder 的 FIFO 裁剪自然实现)
         """
         seen_ids = set()
         merged = []
-        
-        # 1. 近轮消息优先 (保持时间序)
+
+        # 1. 近轮消息优先 (保持时间序，BM25-only 模式下确保完整保留)
         for msg in recent_messages:
-            msg_id = getattr(msg, 'message_id', None) or id(msg)
-            msg_id = str(msg_id)
+            msg_id = str(getattr(msg, 'message_id', None) or id(msg))
             if msg_id not in seen_ids:
                 seen_ids.add(msg_id)
                 merged.append(msg)
-        
+
         # 2. BM25 召回补充 (去重)
         bm25_added = 0
         for msg in recalled_messages:
-            msg_id = getattr(msg, 'message_id', None) or id(msg)
-            msg_id = str(msg_id)
+            msg_id = str(getattr(msg, 'message_id', None) or id(msg))
             if msg_id not in seen_ids:
                 seen_ids.add(msg_id)
                 merged.append(msg)
                 bm25_added += 1
-        
+
         # v7.3: 合并后按时间戳排序 (确保时间正序)
         merged.sort(
             key=lambda m: (
@@ -599,19 +619,17 @@ class DKIPlugin:
                 else str(getattr(m, 'timestamp', ''))
             )
         )
-        
+
         # v7.4: 过滤末尾无 assistant 回复的 user 消息
-        # 用户当前查询已经写入 DB 但尚无 assistant 回复, 会被 get_recent_messages 拉出
-        # 这条消息已在 prompt 最后作为独立查询, 历史中不应重复
         merged = self._remove_trailing_unpaired_user(merged)
-        
+
         if bm25_added > 0:
             logger.debug(
                 f"Merged history: {len(recent_messages)} recent + "
                 f"{bm25_added} BM25 recalled = {len(merged)} total "
-                f"(sorted by timestamp)"
+                f"(sorted by timestamp, retrieval_mode={retrieval_mode})"
             )
-        
+
         return merged
     
     @staticmethod
@@ -766,7 +784,13 @@ class DKIPlugin:
             logger.debug(f"Preference single-flight join for user {user_id}")
             try:
                 return await asyncio.shield(self._preference_single_flight[flight_key])
-            except Exception:
+            except Exception as join_err:
+                # P2-5: 仅做统计和日志, 不改变原有“静默降级为空列表”的行为
+                self._stats["preference_singleflight_join_errors"] += 1
+                logger.warning(
+                    "Preference single-flight join error for user "
+                    f"{user_id}: {join_err!r}; falling back to empty preference list"
+                )
                 # 降级: 主请求异常时, 等待方返回空列表而不是向上传播
                 return []
         
@@ -792,6 +816,12 @@ class DKIPlugin:
             # 通知所有等待者异常
             if not future.done():
                 future.set_exception(e)
+            # P2-5: 记录偏好加载错误, 便于监控系统性故障
+            self._stats["preference_load_errors"] += 1
+            logger.warning(
+                "Preference load error for user "
+                f"{user_id}: {e!r}; preference cache miss will surface as exception"
+            )
             raise
         finally:
             # 清理 in-flight 标记
@@ -1025,27 +1055,37 @@ class DKIPlugin:
             preferences = await self._get_cached_preferences(user_id)
             metadata.preferences_count = len(preferences)
             
-            # v7.0: 检测适配器的向量检索能力
-            # ConfigDrivenAdapter 会根据 vector_index_config 的有无
-            # 自动选择 BM25+Embedding 或 BM25-only
+            # v7.0 / v7.5: 检测适配器的向量检索能力
             retrieval_mode = self._detect_retrieval_mode()
             metadata.retrieval_mode = retrieval_mode
-            
+
+            # v7.5: BM25-only 模式下扩大候选集 (BM25 误差大，需要更宽的候选再裁剪)
+            effective_recall_limit = context.recall_limit
+            if retrieval_mode == "bm25_only" and self._recall_config:
+                try:
+                    bm25_cfg = self._recall_config.bm25_only_tuning
+                    expanded = int(context.recall_limit * bm25_cfg.recall_limit_multiplier)
+                    effective_recall_limit = min(expanded, bm25_cfg.recall_limit_max)
+                    logger.debug(
+                        f"BM25-only: recall_limit expanded "
+                        f"{context.recall_limit} → {effective_recall_limit}"
+                    )
+                except Exception:
+                    pass
+
             # v6.1: 不限制 session_id, 支持跨会话记忆检索
-            # 适配器会在所有该用户的会话中检索相关历史
             relevant_history = await self.data_adapter.search_relevant_history(
                 user_id=user_id,
                 query=query,
                 session_id=None,  # 跨会话检索
-                limit=context.recall_limit,
+                limit=effective_recall_limit,
             )
-            
-            # v7.2: 获取近轮对话 (跨会话, 按时间近度)
-            # BM25 只做语义相关性召回, 可能遗漏最近的对话内容
-            # 近轮对话确保模型能看到最近的上下文, 维持多轮连贯性
+
+            # v7.2 / v7.5: 获取近轮对话
+            # BM25-only 模式下近轮比远期 BM25 命中更重要，使用更大的 max_recent_turns
             recent_messages = []
             try:
-                max_recent = self._get_max_recent_turns()
+                max_recent = self._get_max_recent_turns(retrieval_mode=retrieval_mode)
                 recent_messages = await self.data_adapter.get_recent_messages(
                     user_id=user_id,
                     limit=max_recent * 2,  # 每轮 user+assistant
@@ -1053,16 +1093,17 @@ class DKIPlugin:
                 if recent_messages:
                     logger.debug(
                         f"Recent messages loaded: {len(recent_messages)} "
-                        f"(max_recent_turns={max_recent})"
+                        f"(max_recent_turns={max_recent}, retrieval_mode={retrieval_mode})"
                     )
             except Exception as e:
                 logger.warning(f"Failed to get recent messages (non-critical): {e}")
-            
+
             # v7.2: 合并近轮对话 + BM25 召回 (近轮优先, 去重)
             if recent_messages:
                 relevant_history = self._merge_recent_and_recalled(
                     recent_messages=recent_messages,
                     recalled_messages=relevant_history,
+                    retrieval_mode=retrieval_mode,
                 )
             
             metadata.relevant_history_count = len(relevant_history)
@@ -1221,6 +1262,8 @@ class DKIPlugin:
                     max_new_tokens=max_new_tokens,
                     temperature=temperature,
                     start_time=start_time,
+                    user_id=user_id,
+                    session_id=session_id,
                     **kwargs,
                 )
         
@@ -1238,6 +1281,8 @@ class DKIPlugin:
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
                 start_time=start_time,
+                user_id=user_id,
+                session_id=session_id,
                 **kwargs,
             )
         
@@ -1262,6 +1307,8 @@ class DKIPlugin:
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
                 start_time=start_time,
+                user_id=user_id,
+                session_id=session_id,
                 **kwargs,
             )
         
@@ -1313,10 +1360,12 @@ class DKIPlugin:
         **kwargs,
     ) -> DKIPluginResponse:
         """
-        降级: 不使用适配器数据, 仅偏好 K/V + 原始查询
+        降级: 适配器暂时不可用时，尽量保留偏好 K/V + 原始查询（与 _fallback_stable_then_none 行为一致）。
         
-        适用于适配器暂时性故障 (连接超时等)
+        适用于适配器暂时性故障 (连接超时等)。先尝试直连 get_user_preferences 取偏好并注入，
+        失败则走无注入推理。
         """
+        session_id = kwargs.get("session_id", "")
         try:
             stable_plan = InjectionPlan(
                 strategy="stable",
@@ -1325,6 +1374,25 @@ class DKIPlugin:
                 user_id=user_id,
                 injection_enabled=False,
             )
+            # P1: 与 _fallback_stable_then_none 对齐，尽量保留偏好注入
+            try:
+                preferences = await self.data_adapter.get_user_preferences(user_id)
+                if preferences:
+                    pref_text = "\n".join(
+                        f"- {p.preference_type}: {p.preference_text}"
+                        for p in sorted(
+                            preferences, key=lambda x: x.priority, reverse=True
+                        )
+                        if not p.is_expired()
+                    )
+                    stable_plan.preference_text = pref_text
+                    stable_plan.preferences_count = len(preferences)
+                    stable_plan.injection_enabled = True
+                    stable_plan.alpha_profile = AlphaProfile(
+                        preference_alpha=0.4, history_alpha=1.0
+                    )
+            except Exception:
+                pass  # 偏好加载失败则无注入
             
             result = await self._executor.execute(
                 plan=stable_plan,
@@ -1335,7 +1403,16 @@ class DKIPlugin:
             
             clean_text, _ = strip_think_content(result.text)
             metadata.latency_ms = (time.time() - start_time) * 1000
-            
+            metadata.injection_enabled = stable_plan.injection_enabled
+            # P0: 降级路径也记录注入日志与统计
+            self._record_injection_log(
+                metadata=metadata,
+                query=query,
+                user_id=user_id,
+                session_id=session_id,
+                final_input=query,
+                plan=stable_plan,
+            )
             return DKIPluginResponse(
                 text=clean_text,
                 input_tokens=result.input_tokens,
@@ -1351,6 +1428,8 @@ class DKIPlugin:
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
                 start_time=start_time,
+                user_id=user_id,
+                session_id=session_id,
                 **kwargs,
             )
     
@@ -1361,6 +1440,8 @@ class DKIPlugin:
         max_new_tokens: int,
         temperature: float,
         start_time: float,
+        user_id: str = "",
+        session_id: str = "",
         **kwargs,
     ) -> DKIPluginResponse:
         """
@@ -1387,7 +1468,15 @@ class DKIPlugin:
             clean_text, _ = strip_think_content(output.text)
             metadata.injection_strategy = "none_fallback"
             metadata.latency_ms = (time.time() - start_time) * 1000
-            
+            # P0: 降级路径也记录注入日志与统计
+            self._record_injection_log(
+                metadata=metadata,
+                query=query,
+                user_id=user_id,
+                session_id=session_id,
+                final_input=query,
+                plan=None,
+            )
             return DKIPluginResponse(
                 text=clean_text,
                 input_tokens=output.input_tokens,
@@ -1453,7 +1542,16 @@ class DKIPlugin:
             
             clean_text, _ = strip_think_content(result.text)
             metadata.latency_ms = (time.time() - start_time) * 1000
-            
+            # P0: 降级路径也记录注入日志与统计
+            session_id = kwargs.get("session_id", "")
+            self._record_injection_log(
+                metadata=metadata,
+                query=query,
+                user_id=user_id,
+                session_id=session_id,
+                final_input=query,
+                plan=stable_plan,
+            )
             return DKIPluginResponse(
                 text=clean_text,
                 input_tokens=result.input_tokens,
@@ -1471,6 +1569,8 @@ class DKIPlugin:
             max_new_tokens=max_new_tokens,
             temperature=temperature,
             start_time=start_time,
+            user_id=user_id,
+            session_id=kwargs.get("session_id", ""),
             **kwargs,
         )
     
@@ -1524,28 +1624,39 @@ class DKIPlugin:
             
             retrieval_mode = self._detect_retrieval_mode()
             metadata.retrieval_mode = retrieval_mode
-            
+
+            # v7.5: BM25-only 模式下扩大候选集
+            effective_recall_limit = context.recall_limit
+            if retrieval_mode == "bm25_only" and self._recall_config:
+                try:
+                    bm25_cfg = self._recall_config.bm25_only_tuning
+                    expanded = int(context.recall_limit * bm25_cfg.recall_limit_multiplier)
+                    effective_recall_limit = min(expanded, bm25_cfg.recall_limit_max)
+                except Exception:
+                    pass
+
             relevant_history = await self.data_adapter.search_relevant_history(
                 user_id=user_id,
                 query=query,
                 session_id=None,
-                limit=context.recall_limit,
+                limit=effective_recall_limit,
             )
-            
+
             recent_messages = []
             try:
-                max_recent = self._get_max_recent_turns()
+                max_recent = self._get_max_recent_turns(retrieval_mode=retrieval_mode)
                 recent_messages = await self.data_adapter.get_recent_messages(
                     user_id=user_id,
                     limit=max_recent * 2,
                 )
             except Exception:
                 pass
-            
+
             if recent_messages:
                 relevant_history = self._merge_recent_and_recalled(
                     recent_messages=recent_messages,
                     recalled_messages=relevant_history,
+                    retrieval_mode=retrieval_mode,
                 )
             
             metadata.relevant_history_count = len(relevant_history)
@@ -1605,9 +1716,19 @@ class DKIPlugin:
                         **kwargs,
                     )
                 clean_text, _ = strip_think_content(result.text)
+                metadata.inference_latency_ms = getattr(result, "inference_latency_ms", 0.0)
+                metadata.preference_cache_hit = getattr(result, "preference_cache_hit", False)
+                metadata.preference_cache_tier = getattr(result, "preference_cache_tier", "none")
                 metadata.latency_ms = (time.time() - start_time) * 1000
-                
-                # 模拟流式输出
+                # P0: chat_stream 成功路径也记录注入日志与统计
+                self._record_injection_log(
+                    metadata=metadata,
+                    query=query,
+                    user_id=user_id,
+                    session_id=session_id,
+                    final_input=plan.final_input or query,
+                    plan=plan,
+                )
                 yield {"type": "token", "content": clean_text}
                 yield {
                     "type": "done",
@@ -1684,7 +1805,15 @@ class DKIPlugin:
                 # 流式模式下估算 token (修复 token 统计为 0 的问题)
                 input_tokens = estimate_tokens_fast(prompt, overestimate_factor=1.15)
                 output_tokens = estimate_tokens_fast(clean_text, overestimate_factor=1.15)
-                
+                # P0: chat_stream 成功路径也记录注入日志与统计
+                self._record_injection_log(
+                    metadata=metadata,
+                    query=query,
+                    user_id=user_id,
+                    session_id=session_id,
+                    final_input=plan.final_input or query,
+                    plan=plan,
+                )
                 yield {
                     "type": "done",
                     "text": clean_text,
@@ -1702,9 +1831,19 @@ class DKIPlugin:
                 )
                 
                 clean_text, _ = strip_think_content(result.text)
+                metadata.inference_latency_ms = getattr(result, "inference_latency_ms", 0.0)
+                metadata.preference_cache_hit = getattr(result, "preference_cache_hit", False)
+                metadata.preference_cache_tier = getattr(result, "preference_cache_tier", "none")
                 metadata.latency_ms = (time.time() - start_time) * 1000
-                
-                # 模拟流式: 逐句发送
+                # P0: chat_stream 非流式回退成功路径也记录注入日志与统计
+                self._record_injection_log(
+                    metadata=metadata,
+                    query=query,
+                    user_id=user_id,
+                    session_id=session_id,
+                    final_input=plan.final_input or query,
+                    plan=plan,
+                )
                 yield {"type": "token", "content": clean_text}
                 yield {
                     "type": "done",
@@ -1716,6 +1855,21 @@ class DKIPlugin:
         
         except Exception as e:
             logger.error(f"DKI stream error: {e}")
+            # P0: 流式错误路径也记录一次日志（仅统计与 latency，无 plan）
+            try:
+                meta_fail = InjectionMetadata()
+                meta_fail.latency_ms = (time.time() - start_time) * 1000
+                meta_fail.injection_strategy = "stream_error_fallback"
+                self._record_injection_log(
+                    metadata=meta_fail,
+                    query=query,
+                    user_id=user_id,
+                    session_id=session_id,
+                    final_input="",
+                    plan=None,
+                )
+            except Exception:
+                pass
             yield {
                 "type": "error",
                 "error": str(e),
@@ -1894,6 +2048,11 @@ class DKIPlugin:
             "reference_resolver_config": planner_stats.get(
                 "reference_resolver", {}
             ),
+            # P2-5: 偏好加载相关错误统计（便于发现系统性故障）
+            "preference_singleflight_join_errors": self._stats.get(
+                "preference_singleflight_join_errors", 0
+            ),
+            "preference_load_errors": self._stats.get("preference_load_errors", 0),
         }
     
     def get_injection_logs(
@@ -1921,10 +2080,12 @@ class DKIPlugin:
         
         当用户偏好更新时调用此方法:
         - 使偏好文本缓存失效 (P1-3)
-        - 使偏好 KV 缓存失效
+        - 使 Executor L0 偏好 KV 缓存失效 (P1)
+        - 使 PreferenceCacheManager L1/L2 偏好 KV 缓存失效
         """
-        # P1-3: 同时清除偏好文本缓存
         self.invalidate_preference_text_cache(user_id)
+        # P1: 同时清理 Executor 内 L0 KV 缓存，保证三层缓存同时失效
+        self._executor.clear_preference_cache(user_id)
         return await self._preference_cache.invalidate(user_id)
     
     def get_cache_stats(self) -> Dict[str, Any]:

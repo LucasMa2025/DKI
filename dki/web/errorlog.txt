@@ -1,6 +1,0 @@
-INFO:     39.130.51.43:49426 - "GET / HTTP/1.1" 200 OK
-2026-03-12 13:05:35.267 | INFO     | dki.database.repository:create:543 - Created demo user: demo_user (id=user_abd5af83509c4740)
-2026-03-12 13:05:35.270 | DEBUG    | dki.core.dki_plugin:chat:1058 - Adapter data loaded: 0 preferences, 0 relevant history messages (recent=0, retrieval_mode=unknown)
-2026-03-12 13:05:35.270 | DEBUG    | dki.core.plugin.injection_planner:build_plan:442 - Plan built: strategy=recall_v4, recall=, inject=True, pref_α=0.50, prefs=0, history=0
-2026-03-12 13:05:35.913 | ERROR    | dki.web.app:chat:686 - Chat error: GatingDecision.__init__() missing 4 required positional arguments: 'entropy', 'relevance_score', 'margin', and 'reasoning'
-INFO:     39.130.51.43:49437 - "POST /api/chat HTTP/1.1" 500 Internal Server Error

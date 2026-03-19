@@ -176,6 +176,41 @@ class SignalGatingConfig:
 
 
 @dataclass
+class BM25OnlyTuningConfig:
+    """
+    BM25-only 模式专用调参配置
+    
+    当 retrieval_mode == "bm25_only" 时，覆盖默认参数，
+    以补偿向量信号缺失带来的召回质量下降。
+    
+    配置路径: dki.recall.bm25_only_tuning
+    """
+    # 候选集扩大: BM25 误差大，需要更宽的候选集再由上层裁剪
+    recall_limit_multiplier: float = 2.0    # recall_limit × 此倍数 (e.g. 20→40)
+    recall_limit_max: int = 60              # 扩大后的上限
+
+    # 近轮保留: BM25-only 下近轮比远期 BM25 命中更重要
+    max_recent_turns: int = 8              # 覆盖 budget.max_recent_turns
+
+    # 权重覆盖: 提升 recency 权重，降低 keyword/bm25 权重
+    keyword_weight: float = 0.20
+    bm25_weight: float = 0.30
+    recency_weight: float = 0.50           # 大幅提升时间近度权重
+
+    # 跨会话召回: BM25-only 下跨会话噪声更大，收紧阈值
+    cross_session_limit: int = 5           # 覆盖 budget.cross_session_limit
+    cross_session_min_bm25_score: float = 1.0  # 跨会话消息的 BM25 最低分数阈值
+
+    # 时间衰减 penalty (跨会话)
+    # score_penalized = score × exp(-decay_rate × days_ago)
+    cross_session_time_decay_rate: float = 0.05  # 每天衰减约 5%
+
+    # 在线轻量 rerank (可选): 对 BM25 top-K 做 n-gram 二次排序
+    online_rerank_enabled: bool = False
+    online_rerank_top_k: int = 20          # 只对前 K 条做 rerank
+
+
+@dataclass
 class RecallConfig:
     """
     记忆召回策略 v4 完整配置
@@ -196,6 +231,8 @@ class RecallConfig:
     epistemic_modes: EpistemicModeConfig = field(default_factory=EpistemicModeConfig)
     # F1-2: 信号门控配置
     signal_gating: SignalGatingConfig = field(default_factory=SignalGatingConfig)
+    # BM25-only 专用调参
+    bm25_only_tuning: BM25OnlyTuningConfig = field(default_factory=BM25OnlyTuningConfig)
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "RecallConfig":
@@ -233,6 +270,12 @@ class RecallConfig:
         sg_dict = d.get("signal_gating", {})
         signal_gating = SignalGatingConfig(**sg_dict) if sg_dict else SignalGatingConfig()
 
+        # BM25-only 专用调参
+        bm25_dict = d.get("bm25_only_tuning", {})
+        bm25_fields = {f.name for f in BM25OnlyTuningConfig.__dataclass_fields__.values()}
+        bm25_filtered = {k: v for k, v in bm25_dict.items() if k in bm25_fields} if bm25_dict else {}
+        bm25_only_tuning = BM25OnlyTuningConfig(**bm25_filtered) if bm25_filtered else BM25OnlyTuningConfig()
+
         return cls(
             enabled=d.get("enabled", True),
             strategy=d.get("strategy", "summary_with_fact_call"),
@@ -244,6 +287,7 @@ class RecallConfig:
             prompt_formatter=d.get("prompt_formatter", "auto"),
             epistemic_modes=epistemic_modes,
             signal_gating=signal_gating,
+            bm25_only_tuning=bm25_only_tuning,
         )
 
 

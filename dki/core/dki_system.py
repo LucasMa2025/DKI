@@ -1446,10 +1446,24 @@ class DKISystem:
                 memory_tokens=int(memory_tokens),
             )
             
+            # 偏好 KV（来自 hybrid）：有则优先走注入路径，不依赖门控记忆检索
+            preference_kv = None
+            preference_alpha = 0.0
+            if hybrid_result and hybrid_result.preference_kv is not None:
+                preference_kv = hybrid_result.preference_kv
+                preference_alpha = hybrid_result.preference_alpha or 0.0
+            
             # Step 2: Generate with or without injection
-            if not gating_decision.should_inject or gating_decision.alpha < 0.1:
+            # 注入条件：门控通过 或 有偏好 KV 且 alpha > 0.1（仅偏好时也注入）
+            use_injection = (
+                (gating_decision.should_inject and gating_decision.alpha >= 0.1)
+                or (preference_kv is not None and preference_alpha > 0.1)
+            )
+            if not use_injection:
                 # Fallback to vanilla generation (graceful degradation)
-                # But still use hybrid history suffix if available
+                logger.info(
+                    "[DKI] 使用标准推理 (无 KV 注入): 门控未通过且无有效偏好 KV"
+                )
                 timer.start_stage("prefill")
                 output = self.model.generate(
                     prompt=query,  # May include history suffix from hybrid
@@ -1460,14 +1474,27 @@ class DKISystem:
                 timer.end_stage()
                 memories_used = []
             else:
-                # DKI injection flow
-                # Include preference K/V from hybrid if available
-                preference_kv = None
-                preference_alpha = 0.0
-                if hybrid_result and hybrid_result.preference_kv is not None:
-                    preference_kv = hybrid_result.preference_kv
-                    preference_alpha = hybrid_result.preference_alpha
-                
+                # DKI injection flow (门控通过 或 仅有偏好 KV)
+                if preference_kv is not None and preference_alpha > 0.1 and not gating_decision.should_inject:
+                    # 仅偏好注入：门控未通过但存在偏好，构造用于注入的 gating_decision
+                    gating_decision = GatingDecision(
+                        should_inject=True,
+                        alpha=preference_alpha,
+                        entropy=gating_decision.entropy,
+                        relevance_score=gating_decision.relevance_score,
+                        margin=gating_decision.margin,
+                        memories=[],
+                        reasoning="Preference-only injection (no memory match)",
+                    )
+                    logger.info(
+                        f"[DKI] 使用 KV 注入推理 (仅偏好): preference_alpha={preference_alpha:.2f}, "
+                        f"pref_layers={len(preference_kv)}"
+                    )
+                else:
+                    logger.info(
+                        f"[DKI] 使用 KV 注入推理 (门控通过): alpha={gating_decision.alpha:.2f}, "
+                        f"memories={len(gating_decision.memories)}, pref={'yes' if preference_kv else 'no'}"
+                    )
                 output, cache_hit, cache_tier = self._generate_with_injection(
                     query=query,
                     gating_decision=gating_decision,
@@ -1834,6 +1861,25 @@ class DKISystem:
         
         return kept_messages
     
+    def _should_put_preference_in_prompt(self) -> bool:
+        """
+        是否将偏好写入 prompt 的 system message。
+        仅在 prompt_prefix 模式（如 vLLMAdapter）下写入；HF KV 适配器（如 LlamaAdapter）
+        仅通过 past_key_values 注入偏好，不写入 prompt。
+        """
+        try:
+            model = self._model_adapter if self._model_adapter else getattr(self, 'model', None)
+            if model is None or not hasattr(model, 'get_model_info'):
+                return False  # 未知适配器时不写入，避免与 KV 注入重复
+            info = model.get_model_info() or {}
+            mode = (info.get('injection_mode') or '').strip()
+            # 仅当明确为 prompt_prefix / vLLM 相关模式时才将偏好写入提示词
+            if mode in ('prompt_prefix', 'vllm_kv', 'vllm_native_prefix_caching'):
+                return True
+            return False
+        except Exception:
+            return False
+    
     def _build_recall_v4_chat_prompt(
         self,
         items: list,
@@ -1879,8 +1925,9 @@ class DKISystem:
             tokenizer = self.model.tokenizer
         
         # ============ 1. System message: 偏好 + 召回元数据 + 澄清指令 ============
+        # HF KV 适配器 (LlamaAdapter 等): 偏好仅通过 KV 注入，不写入 prompt，避免重复
         system_parts = []
-        if preference and preference.content:
+        if preference and preference.content and self._should_put_preference_in_prompt():
             system_parts.append(f"用户偏好:\n{preference.content}")
         
         # 如果有 fact call 指令, 加入 system message
@@ -2023,8 +2070,9 @@ class DKISystem:
             tokenizer = self.model.tokenizer
         
         # ============ 1. System message ============
+        # HF KV 适配器: 偏好仅通过 KV 注入，不写入 prompt
         system_parts = []
-        if preference:
+        if preference and self._should_put_preference_in_prompt():
             pref_content = getattr(preference, 'content', str(preference))
             if pref_content:
                 system_parts.append(f"用户偏好:\n{pref_content}")
@@ -2281,14 +2329,14 @@ class DKISystem:
             if timer:
                 timer.end_stage()
         
-        # Generate with injected K/V
+        # Generate with injected K/V（merged_kv 已在上面按 alpha 缩放，adapter 不再缩放，传 1.0）
         if timer:
             timer.start_stage("prefill")
         
         output = self.model.forward_with_kv_injection(
             prompt=query,
             injected_kv=merged_kv,
-            alpha=gating_decision.alpha,
+            alpha=1.0,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
             **kwargs

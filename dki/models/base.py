@@ -93,8 +93,21 @@ class KVCacheEntry:
             value_bytes: Serialized value tensor bytes
             shape: Tensor shape
             layer_idx: Layer index
-            dtype: Target torch dtype (also used to determine numpy dtype for parsing)
+            dtype: Target torch dtype (also used to determine numpy dtype for parsing).
+                   建议显式传入模型的实际 dtype，避免 bfloat16 模型使用默认
+                   float16 导致精度静默损失。
         """
+        # 默认 float16 警告：bfloat16 模型若未显式传入 dtype，
+        # 反序列化后的 KV 精度会低于模型实际精度
+        if dtype == torch.float16:
+            import warnings
+            warnings.warn(
+                "KVCacheEntry.from_bytes: dtype defaults to float16. "
+                "If your model uses bfloat16, pass dtype=torch.bfloat16 explicitly "
+                "to avoid silent precision loss.",
+                UserWarning,
+                stacklevel=2,
+            )
         # Map torch dtype to numpy dtype for correct byte interpretation
         # Previously hardcoded np.float16, causing data corruption for float32/bfloat16 models
         _torch_to_numpy = {
@@ -229,20 +242,29 @@ class PackedKV:
     
     def scale_values(self, alpha: float) -> "PackedKV":
         """
-        Vectorized alpha scaling (inplace)
+        Vectorized alpha scaling (返回新对象，不修改原始 tensor)
         
-        一次 mul_ 替代 per-layer loop。
+        一次 mul 替代 per-layer loop。
         注意: Key tensor 永远不被 alpha 缩放 (保护 attention addressing)
+        
+        设计说明: 使用非 inplace 操作 (mul 而非 mul_)，避免缓存复用时
+        alpha 累乘问题——同一 PackedKV 被多次请求以不同 alpha 复用时，
+        inplace 修改会导致实际缩放因子为历次 alpha 的乘积。
         
         Args:
             alpha: 缩放因子
             
         Returns:
-            self (inplace 修改)
+            新的 PackedKV 实例 (values 已缩放，keys 不变)
         """
-        if alpha != 1.0:
-            self.values.mul_(alpha)
-        return self
+        if alpha == 1.0:
+            return self
+        return PackedKV(
+            keys=self.keys,
+            values=self.values.mul(alpha),
+            num_layers=self.num_layers,
+            dtype=self.dtype,
+        )
     
     @property
     def total_bytes(self) -> int:
@@ -294,10 +316,12 @@ def extract_kv_from_past(past_key_values) -> List[Tuple[torch.Tensor, torch.Tens
     
     if _is_dynamic_cache:
         # 策略 1: key_cache / value_cache 列表属性 (某些 5.x 版本)
+        # 注意: 5.x 的 DynamicCache.key_cache 可能存在但为空列表 (模型刚初始化时),
+        # 必须同时检查第一个元素非 None, 否则会错误降级到策略2/3/4
         if hasattr(past_key_values, 'key_cache') and hasattr(past_key_values, 'value_cache'):
             kc = past_key_values.key_cache
             vc = past_key_values.value_cache
-            if isinstance(kc, (list, tuple)) and len(kc) > 0:
+            if isinstance(kc, (list, tuple)) and len(kc) > 0 and kc[0] is not None:
                 return [(kc[i], vc[i]) for i in range(len(kc))]
         
         # 策略 2: layers[i].keys / .values (Transformers 5.x DynamicLayer)

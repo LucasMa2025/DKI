@@ -254,30 +254,5 @@ class TestAdapterGetRecentMessages:
         result = await adapter.get_recent_messages("user1", limit=10)
         assert result == []
     
-    @pytest.mark.asyncio
-    async def test_example_adapter_recent_messages(self):
-        """ExampleAdapter 的 get_recent_messages 实现"""
-        from dki.adapters.example_adapter import ExampleAdapter
-        
-        adapter = ExampleAdapter()
-        await adapter.connect()
-        
-        # 添加跨 session 的消息
-        now = datetime.now()
-        for i, sid in enumerate(["s1", "s1", "s2", "s2"]):
-            role = "user" if i % 2 == 0 else "assistant"
-            adapter.add_message(
-                session_id=sid,
-                user_id="u1",
-                role=role,
-                content=f"msg-{i}",
-            )
-        
-        # 获取近轮消息
-        recent = await adapter.get_recent_messages("u1", limit=10)
-        
-        # 应包含两个 session 的消息
-        assert len(recent) == 4
-        # 按时间正序
-        for i in range(1, len(recent)):
-            assert recent[i].timestamp >= recent[i-1].timestamp
+    # ExampleAdapter 已不再维护，其 get_recent_messages 的专项测试已随 test_example_adapter 移除。
+    # 近轮合并逻辑由 test_merge_* 与 MinimalAdapter 覆盖。

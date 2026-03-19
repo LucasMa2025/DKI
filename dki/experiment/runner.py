@@ -335,24 +335,9 @@ class ExperimentRunner:
             adapter_config = build_experiment_adapter_config(self._db_config)
             
             # 使用标准 create_plugin 工厂 (与 demo 一致)
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    import concurrent.futures
-                    with concurrent.futures.ThreadPoolExecutor() as pool:
-                        future = pool.submit(
-                            asyncio.run,
-                            self._create_plugin_async(adapter_config),
-                        )
-                        self._dki_plugin = future.result()
-                else:
-                    self._dki_plugin = loop.run_until_complete(
-                        self._create_plugin_async(adapter_config)
-                    )
-            except RuntimeError:
-                self._dki_plugin = asyncio.run(
-                    self._create_plugin_async(adapter_config)
-                )
+            self._dki_plugin = self._run_async_safe(
+                self._create_plugin_async(adapter_config)
+            )
             
             logger.info("Experiment DKIPlugin created via create_plugin (standard integration)")
         
@@ -369,20 +354,53 @@ class ExperimentRunner:
             language="cn",
         )
         return plugin
-    
+
+    @staticmethod
+    def _run_async_safe(coro):
+        """
+        在任意线程/事件循环环境下安全运行协程，避免 ThreadPoolExecutor 死锁。
+
+        策略:
+        1. 若当前线程没有运行中的 event loop → 直接 asyncio.run()
+        2. 若当前线程有运行中的 event loop (如 Jupyter/FastAPI) →
+           在独立线程中创建全新 event loop 运行，彻底隔离，不共享任何 loop 状态。
+        """
+        import threading
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop is None:
+            # 无运行中的 loop，直接运行
+            return asyncio.run(coro)
+
+        # 有运行中的 loop：在独立线程里创建新 loop 运行，避免死锁
+        result_holder = [None]
+        exc_holder = [None]
+
+        def _thread_target():
+            new_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(new_loop)
+            try:
+                result_holder[0] = new_loop.run_until_complete(coro)
+            except Exception as e:
+                exc_holder[0] = e
+            finally:
+                new_loop.close()
+
+        t = threading.Thread(target=_thread_target, daemon=True)
+        t.start()
+        t.join()
+
+        if exc_holder[0] is not None:
+            raise exc_holder[0]
+        return result_holder[0]
+
     def _run_plugin_chat(self, **kwargs) -> DKIPluginResponse:
         """同步包装 DKIPlugin.chat() 异步调用。"""
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor() as pool:
-                    future = pool.submit(asyncio.run, self._dki_plugin.chat(**kwargs))
-                    return future.result()
-            else:
-                return loop.run_until_complete(self._dki_plugin.chat(**kwargs))
-        except RuntimeError:
-            return asyncio.run(self._dki_plugin.chat(**kwargs))
+        return self._run_async_safe(self._dki_plugin.chat(**kwargs))
     
     @property
     def model(self):
