@@ -3,6 +3,21 @@ LLaMA Model Adapter for DKI System — 真正的 K/V 注入实现
 HuggingFace Transformers-based adapter for LLaMA models (单模型, 无引擎)
 
 ============================================================================
+⚠️  支持范围声明 — 重要
+============================================================================
+本实验系统 **仅支持 LLaMA 3.1 系列模型**:
+  - meta-llama/Llama-3.1-8B-Instruct
+  - meta-llama/Llama-3.1-70B-Instruct
+  - meta-llama/Llama-3.1-405B-Instruct
+
+不支持以下模型，传入不支持的模型名会在 load() 时抛出 ValueError:
+  - LLaMA 3.2 / 3.3 及以上版本
+  - 其他模型族: Qwen / Mistral / Gemma / DeepSeek 等任何非 LLaMA 3.1 模型
+
+如需扩展到其他模型族，需重新设计 compute_kv 的语义空间对齐策略
+(参见设计文档 §3 — 多模型族 KV 注入的结构性问题)。
+
+============================================================================
 核心设计 (论文 §4.2 — 偏好 K/V 注入)
 ============================================================================
 - 偏好文本通过 model.forward(use_cache=True) 计算 K/V 表示
@@ -31,25 +46,23 @@ HuggingFace LLaMA 的 RoPE 实现:
 - forward_with_kv_injection(prompt, injected_kv, alpha) → ModelOutput: Executor 调用
 - 无 injection_mode 属性 → Executor._is_prompt_prefix_mode() 返回 False → 走 HF KV 路径
 
-Chat Template 支持 (双分支):
+Chat Template (LLaMA 3.1 单一路径):
 ============================================================================
-分支 A — LLaMA 3.x (保持原有方案):
-  - compute_kv: 偏好文本直接 tokenize (裸文本, 无 template wrapper)
-  - 推理:  apply_chat_template 或手动 Llama3 格式
-  - Stop:  <|eot_id|> + EOS
+- compute_kv: 偏好文本裸文本直接 tokenize (无 template wrapper)
+  → 偏好 KV 作为纯语义背景, 不与推理序列的 system/user/assistant 结构冲突
+- 推理: tokenizer.apply_chat_template 优先, 回退到手动 LLaMA 3 格式
+- Stop: <|eot_id|> + <|end_of_text|> + EOS
 
-分支 B — 其他 HF 模型 (Qwen / Mistral / Gemma / DeepSeek 等):
-  - compute_kv: 偏好文本以 system role 包装后计算 KV
-    → 使 KV 语义空间与推理时的 ChatML 空间一致
-  - 推理: tokenizer.apply_chat_template (优先) 或模型族手动模板 (回退)
-  - Stop:  模型族专属 stop token + EOS
+KV 注入实现 (HF 5.x 稳定路径):
+============================================================================
+不使用 model.generate(past_key_values=...) 路径。
+HF 5.x 内部引入 cache_position，会覆盖外部传入的 position_ids，
+导致查询 token 的 RoPE 位置与偏好 KV 冲突，注入效果不可预测。
 
-设计理由:
-  LLaMA 3 的 system message 在训练时已与 user/assistant 对齐,
-  裸文本偏好 KV 注入到 Llama3 推理序列仍能工作 (原方案已验证稳定)。
-  非 Llama3 模型 (如 Qwen3) 使用 ChatML 格式训练, 裸文本 KV 与
-  ChatML 推理序列的位置编码语义空间不匹配, 导致 attention 混乱和幻觉,
-  因此必须用 system role 包装偏好 KV。
+统一走手动 prefill + decode loop (_forward_with_bias_impl):
+  1. model.forward(input_ids, past_kv=pref_kv, attention_mask=4D_bias) → prefill
+  2. 逐 token 自回归 decode, 每步手动构造 attention mask
+完全绕开 HF 内部推断逻辑，HF 4.x / 5.x 均稳定。
 
 Author: AGI Demo Project
 """
@@ -108,23 +121,34 @@ def _get_cache_seq_length(cache) -> int:
     return 0
 
 
+# ============================================================================
+# 支持的模型关键词白名单 (仅 LLaMA 3.1)
+# ============================================================================
+_LLAMA31_NAME_KEYWORDS = (
+    'llama-3.1',
+    'llama3.1',
+    'meta-llama/meta-llama-3.1',
+    'meta-llama/llama-3.1',
+)
+
+
 class LlamaAdapter(BaseModelAdapter):
     """
-    LLaMA / 通用 HF model adapter — 真正的 K/V 注入 (非提示词前缀).
+    LLaMA 3.1 专用 adapter — 真正的 K/V 注入 (非提示词前缀).
 
-    支持模型族:
-    - LLaMA 3 / 3.1 / 3.2 Instruct  (分支 A: 原有方案)
-    - Qwen2 / Qwen3                  (分支 B: system-role KV + ChatML)
-    - Mistral / Mixtral Instruct     (分支 B)
-    - Gemma / Gemma2 Instruct        (分支 B)
-    - DeepSeek V2 / V3               (分支 B)
-    - 其他带 apply_chat_template 的模型 (分支 B)
+    ⚠️  本实验系统仅支持 LLaMA 3.1 系列:
+        meta-llama/Llama-3.1-{8B,70B,405B}-Instruct
+
+    不支持其他模型族 (Qwen / Mistral / Gemma / DeepSeek 等)，
+    也不支持 LLaMA 3.2 / 3.3 及以上版本。
+    传入不支持的模型名会在 load() 时抛出 ValueError。
 
     核心机制:
-    1. compute_kv(): 将偏好文本编码为 K/V 表示 (每层一个 KVCacheEntry)
-       - LLaMA 3: 裸文本直接 tokenize → forward
-       - 其他:    system role 包装后 tokenize → forward
+    1. compute_kv(): 将偏好文本 (裸文本) 编码为 K/V 表示 (每层一个 KVCacheEntry)
     2. forward_with_kv_injection(): 将偏好 K/V 注入 attention 层, 配合 alpha 门控
+       → 内部走手动 prefill + decode loop (_forward_with_bias_impl)
+       → 完全绕开 HF generate() 的 position_ids/cache_position 内部推断
+       → HF 4.x / 5.x 均稳定
     3. generate(): 标准推理 (无注入, 用于 Executor 的无注入降级路径)
 
     与 Executor 的交互:
@@ -143,7 +167,7 @@ class LlamaAdapter(BaseModelAdapter):
 
     def __init__(
         self,
-        model_name: str = "meta-llama/Llama-3.2-3B-Instruct",
+        model_name: str = "meta-llama/Llama-3.1-8B-Instruct",
         device: str = "cuda",
         dtype: str = "float16",
         load_in_8bit: bool = False,
@@ -174,6 +198,8 @@ class LlamaAdapter(BaseModelAdapter):
         """
         Load model and tokenizer.
 
+        ⚠️  仅接受 LLaMA 3.1 系列模型名，其他模型名抛出 ValueError。
+
         支持量化模式:
         - "none": 原始精度 (dtype)
         - "4bit": 4-bit NF4 量化 (bitsandbytes)
@@ -185,6 +211,17 @@ class LlamaAdapter(BaseModelAdapter):
         """
         if self._is_loaded:
             return
+
+        # ---- 模型白名单校验 ----
+        if not self._is_llama31():
+            raise ValueError(
+                f"[LlamaAdapter] 不支持的模型: '{self.model_name}'。\n"
+                f"本实验系统仅支持 LLaMA 3.1 系列:\n"
+                f"  meta-llama/Llama-3.1-8B-Instruct\n"
+                f"  meta-llama/Llama-3.1-70B-Instruct\n"
+                f"  meta-llama/Llama-3.1-405B-Instruct\n"
+                f"不支持 LLaMA 3.2/3.3+ 及其他模型族 (Qwen/Mistral/Gemma/DeepSeek 等)。"
+            )
 
         try:
             from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
@@ -259,83 +296,49 @@ class LlamaAdapter(BaseModelAdapter):
                 f"Model loaded: {self.model_name} "
                 f"(layers={self.num_layers}, heads={self.num_heads}, "
                 f"hidden={self.hidden_dim}, attn=eager, "
-                f"quantization={self.quantization}, "
-                f"branch={'llama3' if self._is_llama3() else 'hf_generic'})"
+                f"quantization={self.quantization})"
             )
 
+        except ValueError:
+            raise
         except Exception as e:
             logger.error(f"Failed to load model: {e}")
             raise
 
     # ================================================================
-    # 模型族检测
+    # 模型验证
     # ================================================================
 
-    def _is_llama3(self) -> bool:
+    def _is_llama31(self) -> bool:
         """
-        判断是否为 LLaMA 3.x 系列 (分支 A).
+        判断是否为 LLaMA 3.1 系列 (唯一支持的模型族).
 
-        分支 A 使用原有方案:
-        - compute_kv: 裸文本直接 tokenize (无 template wrapper)
-        - chat template: Llama3 官方格式
-        - stop tokens: <|eot_id|>
+        白名单关键词匹配 model_name (大小写不敏感)。
+        注意: LLaMA 3.2 / 3.3 不在支持范围内。
         """
         name_lower = self.model_name.lower()
-        return any(kw in name_lower for kw in (
-            'llama-3', 'llama3',
-            'meta-llama/meta-llama-3',
-            'meta-llama/llama-3',
-        ))
-
-    def _is_qwen(self) -> bool:
-        """判断是否为 Qwen 系列 (分支 B)"""
-        return 'qwen' in self.model_name.lower()
-
-    def _is_mistral(self) -> bool:
-        """判断是否为 Mistral / Mixtral 系列 (分支 B)"""
-        name_lower = self.model_name.lower()
-        return any(kw in name_lower for kw in ('mistral', 'mixtral'))
-
-    def _is_gemma(self) -> bool:
-        """判断是否为 Gemma 系列 (分支 B)"""
-        return 'gemma' in self.model_name.lower()
-
-    def _is_deepseek(self) -> bool:
-        """判断是否为 DeepSeek 系列 (分支 B)"""
-        return 'deepseek' in self.model_name.lower()
-
-    def _is_chat_model(self) -> bool:
-        """判断是否为 Chat/Instruct 模型 (用于分支 B 回退路径)"""
-        name_lower = self.model_name.lower()
-        return any(kw in name_lower for kw in ('chat', 'instruct'))
+        return any(kw in name_lower for kw in _LLAMA31_NAME_KEYWORDS)
 
     # ================================================================
-    # Chat Template 处理
+    # Chat Template 处理 (LLaMA 3.1 单一路径)
     # ================================================================
 
     def _format_prompt(self, prompt: str, system_prompt: Optional[str] = None) -> str:
         """
-        Format prompt using official chat template.
+        Format prompt using LLaMA 3.1 official chat template.
 
-        优先使用 tokenizer.apply_chat_template (所有分支共用, 最安全).
+        优先使用 tokenizer.apply_chat_template, 回退到手动 LLaMA 3 格式:
 
-        分支 A — LLaMA 3.x 回退模板:
             <|begin_of_text|>
             <|start_header_id|>system<|end_header_id|>\n\n{system}<|eot_id|>
             <|start_header_id|>user<|end_header_id|>\n\n{user}<|eot_id|>
             <|start_header_id|>assistant<|end_header_id|>\n\n
-
-        分支 B — 通用 ChatML 回退模板 (Qwen / Mistral / Gemma / DeepSeek):
-            <|im_start|>system\n{system}<|im_end|>\n
-            <|im_start|>user\n{user}<|im_end|>\n
-            <|im_start|>assistant\n
         """
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
         messages.append({"role": "user", "content": prompt})
 
-        # 优先使用 tokenizer 内置的 chat template (最准确)
         if hasattr(self.tokenizer, 'apply_chat_template'):
             try:
                 return self.tokenizer.apply_chat_template(
@@ -346,59 +349,30 @@ class LlamaAdapter(BaseModelAdapter):
             except Exception as e:
                 logger.warning(f"apply_chat_template failed, using manual template: {e}")
 
-        # ---- 分支 A: LLaMA 3.x 手动回退 ----
-        if self._is_llama3():
-            parts = ["<|begin_of_text|>"]
-            if system_prompt:
-                parts.append(
-                    f"<|start_header_id|>system<|end_header_id|>\n\n{system_prompt}<|eot_id|>"
-                )
-            parts.append(
-                f"<|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|>"
-            )
-            parts.append("<|start_header_id|>assistant<|end_header_id|>\n\n")
-            return "".join(parts)
-
-        # ---- 分支 B: 通用 ChatML 手动回退 ----
-        parts = []
+        # 手动 LLaMA 3 格式回退
+        parts = ["<|begin_of_text|>"]
         if system_prompt:
-            parts.append(f"<|im_start|>system\n{system_prompt}<|im_end|>\n")
-        parts.append(f"<|im_start|>user\n{prompt}<|im_end|>\n")
-        parts.append("<|im_start|>assistant\n")
+            parts.append(
+                f"<|start_header_id|>system<|end_header_id|>\n\n{system_prompt}<|eot_id|>"
+            )
+        parts.append(
+            f"<|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|>"
+        )
+        parts.append("<|start_header_id|>assistant<|end_header_id|>\n\n")
         return "".join(parts)
 
     def _has_chat_template_tokens(self, text: str) -> bool:
-        """检测文本是否已包含 chat template 特殊标记 (避免双重包装)"""
-        # LLaMA 3
-        if '<|begin_of_text|>' in text or '<|start_header_id|>' in text:
-            return True
-        # LLaMA 2
-        if '[INST]' in text:
-            return True
-        # ChatML (Qwen / Mistral / DeepSeek / Gemma)
-        if '<|im_start|>' in text:
-            return True
-        # DeepSeek V2/V3 全角标记
-        if '<\uff5c' in text and '\uff5c>' in text:
-            return True
-        # Gemma 特殊标记
-        if '<start_of_turn>' in text:
-            return True
-        return False
+        """检测文本是否已包含 LLaMA 3 chat template 特殊标记 (避免双重包装)"""
+        return (
+            '<|begin_of_text|>' in text
+            or '<|start_header_id|>' in text
+        )
 
     def _get_stop_token_ids(self) -> List[int]:
         """
-        获取模型专属 stop token IDs.
+        获取 LLaMA 3.1 专属 stop token IDs.
 
-        分支 A — LLaMA 3.x:
-            <|eot_id|>  +  EOS
-
-        分支 B — 其他 HF 模型:
-            Qwen:      <|im_end|>  +  <|endoftext|>  +  EOS
-            Mistral:   </s>  +  EOS
-            Gemma:     <end_of_turn>  +  EOS
-            DeepSeek:  <|im_end|>  +  EOS
-            其他:       EOS (通过 apply_chat_template 已注册的 eos_token)
+        LLaMA 3.1: <|eot_id|>  +  <|end_of_text|>  +  EOS
         """
         if self.tokenizer is None:
             return []
@@ -406,7 +380,6 @@ class LlamaAdapter(BaseModelAdapter):
         stop_ids: List[int] = []
 
         def _add_token(token_str: str) -> None:
-            """安全地将 token 字符串转换为 ID 并加入 stop_ids"""
             tid = self.tokenizer.convert_tokens_to_ids(token_str)
             if (
                 tid is not None
@@ -415,29 +388,10 @@ class LlamaAdapter(BaseModelAdapter):
             ):
                 stop_ids.append(tid)
 
-        # ---- 分支 A: LLaMA 3.x ----
-        if self._is_llama3():
-            _add_token("<|eot_id|>")
-            # Llama 3.2 增加了额外的 stop token
-            _add_token("<|end_of_text|>")
+        _add_token("<|eot_id|>")
+        _add_token("<|end_of_text|>")
 
-        # ---- 分支 B: 其他模型 ----
-        elif self._is_qwen():
-            _add_token("<|im_end|>")
-            _add_token("<|endoftext|>")
-
-        elif self._is_mistral():
-            # Mistral 使用 </s> 作为 turn 边界
-            _add_token("</s>")
-
-        elif self._is_gemma():
-            _add_token("<end_of_turn>")
-
-        elif self._is_deepseek():
-            _add_token("<|im_end|>")
-            _add_token("<｜end▁of▁sentence｜>")  # DeepSeek V3 特殊 EOS
-
-        # 通用 EOS (所有分支都加入, 保底)
+        # 通用 EOS 保底
         eos_id = self.tokenizer.eos_token_id
         if eos_id is not None and eos_id not in stop_ids:
             stop_ids.append(eos_id)
@@ -449,49 +403,15 @@ class LlamaAdapter(BaseModelAdapter):
         """
         安全地格式化 prompt (检测已有 template 标记, 避免双重包装).
 
-        用于 generate() 和 forward_with_kv_injection()
+        用于 generate() 和 forward_with_kv_injection()。
         """
         if self._has_chat_template_tokens(prompt):
             return prompt
-        elif self._is_chat_model() or self._is_llama3() or self._is_qwen() \
-                or self._is_mistral() or self._is_gemma() or self._is_deepseek():
-            return self._format_prompt(prompt)
-        else:
-            return prompt
+        return self._format_prompt(prompt)
 
     # ================================================================
     # K/V 计算 (偏好编码 — 论文 §4.2)
     # ================================================================
-
-    def _wrap_preference_as_system(self, text: str) -> str:
-        """
-        将偏好文本包装为 system message 格式 (分支 B 专用).
-
-        目的: 使偏好 KV 的 RoPE 位置编码语义空间与推理时的 ChatML 序列一致,
-        避免裸文本 KV 与 ChatML 推理序列拼接时产生的 attention 混乱。
-
-        实现:
-        - 优先使用 tokenizer.apply_chat_template (最准确)
-        - 回退到手动 ChatML system 格式
-
-        注意: 不加 add_generation_prompt=True, 只编码 system turn 本身。
-        """
-        if hasattr(self.tokenizer, 'apply_chat_template'):
-            try:
-                # 仅编码 system turn, 不加 generation prompt
-                return self.tokenizer.apply_chat_template(
-                    [{"role": "system", "content": text}],
-                    add_generation_prompt=False,
-                    tokenize=False,
-                )
-            except Exception as e:
-                logger.warning(
-                    f"apply_chat_template for system role failed: {e}, "
-                    f"using manual ChatML wrapper"
-                )
-
-        # 手动 ChatML 回退
-        return f"<|im_start|>system\n{text}<|im_end|>\n"
 
     def compute_kv(
         self,
@@ -501,17 +421,12 @@ class LlamaAdapter(BaseModelAdapter):
         """
         Compute K/V cache for preference text (论文 §4.2).
 
-        双分支策略:
-        ┌─────────────┬────────────────────────────────────────────────┐
-        │ 分支 A      │ LLaMA 3.x: 裸文本直接 tokenize                │
-        │             │ 原有方案, 已验证稳定                           │
-        ├─────────────┼────────────────────────────────────────────────┤
-        │ 分支 B      │ 其他 HF 模型: system role 包装后 tokenize      │
-        │             │ 使 KV 语义空间与 ChatML 推理序列一致           │
-        └─────────────┴────────────────────────────────────────────────┘
+        LLaMA 3.1 策略: 偏好文本裸文本直接 tokenize → forward.
+        不使用任何 template 包装，偏好 KV 作为纯语义背景注入，
+        不与推理序列的 system/user/assistant turn 结构冲突。
 
         安全措施:
-        - 偏好 token 数超过 MAX_PREF_TOKENS 时截断 (OOD 风险控制)
+        - 偏好 token 数超过 MAX_PREF_TOKENS 时截断 (OOD 风险控制, 论文 §7.2)
         - KV tensor detach + 移至 CPU (防止 GPU 内存泄漏)
         - 显式删除 outputs 并清空 CUDA cache
 
@@ -527,20 +442,7 @@ class LlamaAdapter(BaseModelAdapter):
         if not self._is_loaded:
             self.load()
 
-        # ---- 分支路由 ----
-        if self._is_llama3():
-            # 分支 A: 裸文本, 保持原有方案
-            input_text = text
-            logger.debug("compute_kv: branch A (llama3), using raw text")
-        else:
-            # 分支 B: system role 包装, 对齐 ChatML 空间
-            input_text = self._wrap_preference_as_system(text)
-            logger.debug(
-                f"compute_kv: branch B ({self.model_name}), "
-                f"wrapped as system role, preview: {input_text[:80]!r}"
-            )
-
-        inputs = self.tokenize(input_text)
+        inputs = self.tokenize(text)
         input_ids = inputs['input_ids']
 
         # 安全截断
@@ -583,16 +485,10 @@ class LlamaAdapter(BaseModelAdapter):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        logger.debug(
-            f"Computed preference KV: {n_tokens} tokens, "
-            f"{len(kv_entries)} layers, "
-            f"shape={kv_entries[0].key.shape if kv_entries else 'N/A'}"
-        )
         logger.info(
             f"[LlamaAdapter] 偏好 KV 计算完成: tokens={n_tokens}, "
             f"layers={len(kv_entries)}, "
-            f"shape={kv_entries[0].key.shape if kv_entries else 'N/A'}, "
-            f"branch={'A(llama3)' if self._is_llama3() else 'B(hf_generic)'}"
+            f"shape={kv_entries[0].key.shape if kv_entries else 'N/A'}"
         )
         return kv_entries, hidden_states
 
@@ -782,10 +678,10 @@ class LlamaAdapter(BaseModelAdapter):
             Attn_DKI = Softmax(Q[K_p;K_u]^T/√d + B_alpha) [α·V_p; V_u]
 
         B_alpha 对偏好位置施加 log(alpha) bias:
-        - alpha=1.0: bias=0, 偏好与查询等权
-        - alpha=0.5: bias=log(0.5)≈-0.69, 偏好被适度抑制
-        - alpha=0.3: bias=log(0.3)≈-1.2,  偏好被较强抑制
-        - alpha=0.0: bias=-inf,            偏好被完全屏蔽
+        - alpha=1.0: bias=0,    偏好与查询等权
+        - alpha=0.5: bias≈-0.69, 偏好被适度抑制
+        - alpha=0.3: bias≈-1.2,  偏好被较强抑制
+        - alpha=0.0: bias=-inf,  偏好被完全屏蔽
 
         同时保持 causal mask (下三角):
         - 查询 token 只能 attend 到自身及之前的 token
@@ -797,16 +693,14 @@ class LlamaAdapter(BaseModelAdapter):
         total_len = n_pref + n_query
         bias = torch.zeros(1, 1, n_query, total_len, device=device, dtype=dtype)
 
-        if alpha > 0 and alpha < 1.0:
-            pref_bias = math.log(max(alpha, 1e-8))
-            bias[:, :, :, :n_pref] = pref_bias
-        elif alpha <= 0:
+        if alpha <= 0:
             bias[:, :, :, :n_pref] = float('-inf')
-        # alpha=1.0: bias=0, 不修改
+        elif alpha < 1.0:
+            bias[:, :, :, :n_pref] = math.log(max(alpha, 1e-8))
+        # alpha >= 1.0: bias=0, 不修改
 
-        # causal mask (向量化): 屏蔽 query 中 i 之后的位置
-        # 原 for 循环在 n_query 较大时极慢 (O(n²) Python 循环)
-        # torch.triu 一次性构建上三角 -inf 矩阵，复杂度不变但无 Python 循环开销
+        # causal mask: 屏蔽 query 中 i 之后的位置
+        # torch.triu 向量化构建, 无 Python 循环开销
         if n_query > 1:
             query_causal = torch.triu(
                 torch.full((n_query, n_query), float('-inf'), device=device, dtype=dtype),
@@ -856,21 +750,31 @@ class LlamaAdapter(BaseModelAdapter):
         真正的 K/V 注入推理 (论文 §4.2).
 
         实现流程:
-        1. 格式化 prompt (chat template, 双分支)
+        1. 格式化 prompt (LLaMA 3.1 chat template)
         2. 将偏好 KV 移至 GPU, Value 缩放 alpha
-        3. 扩展 attention mask (覆盖偏好位置)
-        4. model.generate() 自回归生成 (含 stop tokens)
+        3. 手动 prefill + 逐 token decode (完全掌控 attention)
+        4. attention bias 精确实现 B_alpha (论文公式)
+
+        核心设计 (HF 5.x 兼容):
+        ---------------------------------------------------------------
+        不使用 model.generate(past_key_values=...) 路径。
+        HF 5.x 重构了 generate() 内部逻辑，引入 cache_position 并
+        可能覆盖外部传入的 position_ids，导致查询 token 的 RoPE 位置
+        与偏好 KV 冲突，注入效果不可预测。
+
+        统一走 _forward_with_bias_impl (手动 prefill+decode)，
+        完全绕开 HF 内部推断，HF 4.x / 5.x 均稳定。
+        ---------------------------------------------------------------
 
         安全保证:
         - alpha 被 ALPHA_OVERRIDE_CAP (0.7) 截断
         - alpha=0 → 退化为 vanilla LLM
-        - 异常时自动降级到无注入推理
+        - 异常时自动降级到标准 generate
         """
         if not self._is_loaded:
             self.load()
 
         start_time = time.perf_counter()
-
         clamped_alpha = min(max(alpha, 0.0), self.ALPHA_OVERRIDE_CAP)
 
         if not injected_kv or clamped_alpha <= 0.01:
@@ -884,11 +788,10 @@ class LlamaAdapter(BaseModelAdapter):
 
         logger.info(
             f"[LlamaAdapter] 开始 KV 注入推理: layers={len(injected_kv)}, "
-            f"alpha={clamped_alpha:.2f}, max_new_tokens={max_new_tokens}, "
-            f"branch={'A(llama3)' if self._is_llama3() else 'B(hf_generic)'}"
+            f"alpha={clamped_alpha:.2f}, max_new_tokens={max_new_tokens}"
         )
         try:
-            return self._forward_with_kv_injection_impl(
+            return self._forward_with_bias_impl(
                 prompt=prompt,
                 injected_kv=injected_kv,
                 alpha=clamped_alpha,
@@ -907,173 +810,6 @@ class LlamaAdapter(BaseModelAdapter):
                 top_p=kwargs.get('top_p', 0.9),
             )
 
-    def _forward_with_kv_injection_impl(
-        self,
-        prompt: str,
-        injected_kv: List[KVCacheEntry],
-        alpha: float,
-        max_new_tokens: int,
-        start_time: float,
-        **kwargs,
-    ) -> ModelOutput:
-        """
-        K/V 注入推理的核心实现.
-
-        策略: past_key_values 注入 + model.generate() 自回归生成
-
-        HuggingFace 的 past_key_values 机制:
-        - model.generate(input_ids, past_key_values=pref_kv, attention_mask=extended_mask)
-        - 模型自动将 input_ids 的 position_ids 从 past_kv_length 开始
-        - 偏好 KV 占据 position [0, n_pref-1]
-        - 查询 token 从 position n_pref 开始
-        - attention_mask 扩展以覆盖偏好 + 查询的完整序列
-        - eos_token_id 传入以确保正确停止
-        """
-        # 1. Format prompt (双分支: apply_chat_template 优先)
-        formatted_prompt = self._format_prompt_safe(prompt)
-        inputs = self.tokenize(formatted_prompt)
-        input_ids = inputs['input_ids']
-        attention_mask = inputs['attention_mask']
-
-        # 2. 准备偏好 KV
-        device = input_ids.device
-        past_kv, mem_len = self._prepare_kv_for_injection(
-            injected_kv, alpha, device
-        )
-        logger.info(
-            f"[LlamaAdapter] 偏好 KV 已注入 past_key_values: "
-            f"mem_len={mem_len}, layers={len(injected_kv)}, "
-            f"query_tokens={input_ids.shape[1]}"
-        )
-
-        # 3. 扩展 attention mask (偏好 token 标记为可见)
-        if mem_len > 0:
-            mem_mask = torch.ones(
-                (input_ids.shape[0], mem_len),
-                device=device,
-                dtype=attention_mask.dtype,
-            )
-            extended_mask = torch.cat([mem_mask, attention_mask], dim=1)
-        else:
-            extended_mask = attention_mask
-
-        # 4. 获取 stop token IDs (双分支均配置)
-        stop_token_ids = self._get_stop_token_ids()
-
-        # 5. 显式构造 position_ids (Transformers 5.x 兼容)
-        # 4.x: generate() 会自动从 past_kv_length 推断 position_ids
-        # 5.x: 部分路径下推断逻辑重构，不再保证自动推断正确
-        #      若不显式传入，查询 token 的 position_ids 可能从 0 开始，
-        #      与偏好 KV 的 RoPE [0..mem_len-1] 完全重叠 → 注入完全失效
-        n_query = input_ids.shape[1]
-        position_ids = torch.arange(
-            mem_len,
-            mem_len + n_query,
-            device=device,
-            dtype=torch.long,
-        ).unsqueeze(0)  # [1, n_query]
-
-        kv_type = type(past_kv).__name__
-        logger.debug(
-            f"KV injection generate: input_ids={input_ids.shape}, "
-            f"mem_len={mem_len}, mask={extended_mask.shape}, "
-            f"position_ids=[{mem_len}..{mem_len + n_query - 1}], "
-            f"past_kv_type={kv_type}, stop_ids={stop_token_ids}"
-        )
-
-        # 6. model.generate() 自回归生成
-        with torch.no_grad():
-            outputs = self.model.generate(
-                input_ids=input_ids,
-                attention_mask=extended_mask,
-                past_key_values=past_kv,
-                position_ids=position_ids,
-                max_new_tokens=max_new_tokens,
-                do_sample=True,
-                temperature=kwargs.get('temperature', 0.7),
-                top_p=kwargs.get('top_p', 0.9),
-                pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=stop_token_ids,
-            )
-
-        end_time = time.perf_counter()
-
-        # 7. 提取生成的 token (跳过 input_ids 部分)
-        input_len = input_ids.shape[1]
-        new_tokens = outputs[0][input_len:]
-        output_text = self.decode(new_tokens.cpu())
-        output_token_list = new_tokens.cpu().tolist()
-
-        logger.debug(
-            f"KV injection generate done: input={input_len}, "
-            f"output={len(output_token_list)}, total_seq={outputs[0].shape[0]}"
-        )
-        latency_ms = (end_time - start_time) * 1000
-        logger.info(
-            f"[LlamaAdapter] KV 注入成功: mem_len={mem_len}, "
-            f"input_tokens={input_len}, output_tokens={len(output_token_list)}, "
-            f"alpha={alpha:.2f}, latency_ms={latency_ms:.0f}"
-        )
-
-        # 8. 清理 GPU 内存
-        del past_kv, outputs, input_ids, attention_mask, extended_mask
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        return ModelOutput(
-            text=output_text,
-            tokens=output_token_list,
-            latency_ms=latency_ms,
-            input_tokens=input_len,
-            output_tokens=len(output_token_list),
-            metadata={
-                'alpha': alpha,
-                'alpha_clamped': min(alpha, self.ALPHA_OVERRIDE_CAP),
-                'mem_len': mem_len,
-                'injection_mode': 'hf_kv_negative_position',
-                'branch': 'A_llama3' if self._is_llama3() else 'B_hf_generic',
-            },
-        )
-
-    # ================================================================
-    # 高级 K/V 注入 (带 Attention Bias — 论文 §4.2 完整实现)
-    # ================================================================
-
-    def forward_with_kv_injection_and_bias(
-        self,
-        prompt: str,
-        injected_kv: List[KVCacheEntry],
-        alpha: float = 1.0,
-        max_new_tokens: int = 2048,
-        **kwargs
-    ) -> ModelOutput:
-        """
-        带 Attention Bias 的 K/V 注入推理 (论文 §4.2 完整公式).
-
-        与 forward_with_kv_injection 的区别:
-        - 使用手动 prefill + 逐 token 生成 (非 model.generate)
-        - 在 prefill 阶段通过 4D attention_mask 注入 B_alpha bias
-        - 更精确地实现论文公式, 但速度较慢
-
-        注意: 此方法不由 Executor 直接调用, 仅供高级用户使用。
-        """
-        if not self._is_loaded:
-            self.load()
-
-        start_time = time.perf_counter()
-        clamped_alpha = min(max(alpha, 0.0), self.ALPHA_OVERRIDE_CAP)
-
-        if not injected_kv or clamped_alpha <= 0.01:
-            return self.generate(prompt=prompt, max_new_tokens=max_new_tokens, **kwargs)
-
-        try:
-            return self._forward_with_bias_impl(
-                prompt, injected_kv, clamped_alpha, max_new_tokens, start_time, **kwargs
-            )
-        except Exception as e:
-            logger.warning(f"KV injection with bias failed ({e}), falling back")
-            return self.generate(prompt=prompt, max_new_tokens=max_new_tokens, **kwargs)
-
     def _forward_with_bias_impl(
         self,
         prompt: str,
@@ -1084,12 +820,34 @@ class LlamaAdapter(BaseModelAdapter):
         **kwargs,
     ) -> ModelOutput:
         """
-        带 Attention Bias 的 K/V 注入核心实现.
+        带 Attention Bias 的 K/V 注入核心实现 (HF 4.x/5.x 稳定路径).
 
         步骤:
-        1. Prefill: model.forward(input_ids, past_kv=pref_kv, attention_mask=4D_bias)
+        1. Prefill: model.forward(input_ids, past_kv=pref_kv, attention_mask=4D_bias,
+                                  position_ids=[mem_len .. mem_len+n_query-1])
            → 获取完整 KV cache (pref + query)
         2. Decode: 逐 token 自回归生成 (使用完整 KV cache + stop tokens)
+           → 每步传入 position_ids=[mem_len + n_query + step]
+
+        position_ids 设计:
+        ---------------------------------------------------------------
+        pref KV 在 compute_kv() 时以裸文本 forward，RoPE 编码为
+        position [0, 1, ..., n_pref-1]。
+
+        若 prefill 和 decode 不显式传入 position_ids，HF 默认从 0
+        开始给 query token 编号，导致 query 的 Q 与 pref 的 K 在
+        相同 position 上计算 QK^T，旋转角度重叠，attention 分布
+        产生系统性偏差。
+
+        修正：query 的 position_ids 从 mem_len 开始连续递增，
+        确保 pref 和 query 在同一个连续 RoPE 位置空间内，
+        attention 的 QK^T 点积语义正确。
+        ---------------------------------------------------------------
+
+        Attention bias 语义 (与 _build_attention_bias 完全对齐):
+        - alpha=0      → 偏好位置 -inf (完全屏蔽)
+        - 0 < alpha <1 → 偏好位置 log(alpha) (适度抑制)
+        - alpha >= 1   → 偏好位置 0 (等权, 不修改)
         """
         formatted_prompt = self._format_prompt_safe(prompt)
         inputs = self.tokenize(formatted_prompt)
@@ -1110,12 +868,20 @@ class LlamaAdapter(BaseModelAdapter):
             dtype=self.dtype,
         )
 
+        # Prefill position_ids: query token 从 mem_len 开始，紧接 pref KV
+        # shape: [1, n_query]
+        prefill_position_ids = torch.arange(
+            mem_len, mem_len + n_query,
+            device=device, dtype=torch.long,
+        ).unsqueeze(0)
+
         # ---- Prefill ----
         with torch.no_grad():
             prefill_outputs = self.model(
                 input_ids=input_ids,
                 past_key_values=past_kv,
                 attention_mask=attention_bias,
+                position_ids=prefill_position_ids,
                 use_cache=True,
                 return_dict=True,
             )
@@ -1145,24 +911,36 @@ class LlamaAdapter(BaseModelAdapter):
             next_token_id = next_token.item()
             generated_ids.append(next_token_id)
 
-            # 检查 stop tokens (双分支均覆盖)
             if next_token_id in stop_ids:
                 break
 
             next_input = torch.tensor([[next_token_id]], device=device)
 
+            # Decode position_ids: 当前 token 在整个序列中的绝对位置
+            # = pref(mem_len) + query(n_query) + 已生成(step)
+            # shape: [1, 1]
+            decode_position_ids = torch.tensor(
+                [[mem_len + n_query + step]],
+                device=device, dtype=torch.long,
+            )
+
             total_past = _get_cache_seq_length(full_kv)
             decode_mask = torch.zeros(
                 1, 1, 1, total_past + 1, device=device, dtype=self.dtype
             )
-            if alpha > 0 and alpha < 1.0:
+            # 与 prefill 阶段的 _build_attention_bias 保持语义一致
+            if alpha <= 0:
+                decode_mask[:, :, :, :mem_len] = float('-inf')
+            elif alpha < 1.0:
                 decode_mask[:, :, :, :mem_len] = math.log(max(alpha, 1e-8))
+            # alpha >= 1.0: decode_mask 全零, 不修改
 
             with torch.no_grad():
                 decode_outputs = self.model(
                     input_ids=next_input,
                     past_key_values=full_kv,
                     attention_mask=decode_mask,
+                    position_ids=decode_position_ids,
                     use_cache=True,
                     return_dict=True,
                 )
@@ -1172,7 +950,6 @@ class LlamaAdapter(BaseModelAdapter):
             del decode_outputs
 
         end_time = time.perf_counter()
-
         output_text = self.decode(generated_ids)
 
         del full_kv, past_kv
@@ -1188,11 +965,43 @@ class LlamaAdapter(BaseModelAdapter):
             metadata={
                 'alpha': alpha,
                 'mem_len': mem_len,
-                'injection_mode': 'hf_kv_attention_bias',
+                'injection_mode': 'manual_prefill_decode_bias',
                 'attention_bias_applied': True,
-                'branch': 'A_llama3' if self._is_llama3() else 'B_hf_generic',
+                'position_ids_explicit': True,
             },
         )
+
+    def forward_with_kv_injection_and_bias(
+        self,
+        prompt: str,
+        injected_kv: List[KVCacheEntry],
+        alpha: float = 1.0,
+        max_new_tokens: int = 2048,
+        **kwargs
+    ) -> ModelOutput:
+        """
+        带 Attention Bias 的 K/V 注入推理 (论文 §4.2 完整公式).
+
+        forward_with_kv_injection 与本方法共用同一底层实现
+        (_forward_with_bias_impl)，两者等价。
+        本方法保留供向后兼容及直接调用。
+        """
+        if not self._is_loaded:
+            self.load()
+
+        start_time = time.perf_counter()
+        clamped_alpha = min(max(alpha, 0.0), self.ALPHA_OVERRIDE_CAP)
+
+        if not injected_kv or clamped_alpha <= 0.01:
+            return self.generate(prompt=prompt, max_new_tokens=max_new_tokens, **kwargs)
+
+        try:
+            return self._forward_with_bias_impl(
+                prompt, injected_kv, clamped_alpha, max_new_tokens, start_time, **kwargs
+            )
+        except Exception as e:
+            logger.warning(f"KV injection with bias failed ({e}), falling back")
+            return self.generate(prompt=prompt, max_new_tokens=max_new_tokens, **kwargs)
 
     # ================================================================
     # Embedding
@@ -1278,24 +1087,14 @@ class LlamaAdapter(BaseModelAdapter):
         """Get model architecture information."""
         info = super().get_model_info()
         info.update({
-            'adapter_type': 'llama_hf_kv_injection',
-            'injection_mode': 'hf_kv',
+            'adapter_type': 'llama31_hf_kv_injection',
+            'supported_model_family': 'llama3.1_only',
+            'injection_mode': 'manual_prefill_decode_bias',
             'kv_injection_type': 'negative_position',
             'alpha_override_cap': self.ALPHA_OVERRIDE_CAP,
             'max_pref_tokens': self.MAX_PREF_TOKENS,
             'attention_bias_available': True,
             'load_in_8bit': self.load_in_8bit,
             'quantization': self.quantization,
-            # 双分支信息
-            'template_branch': 'A_llama3' if self._is_llama3() else 'B_hf_generic',
-            'compute_kv_mode': 'raw_text' if self._is_llama3() else 'system_role_wrapped',
-            'model_family': (
-                'llama3' if self._is_llama3() else
-                'qwen' if self._is_qwen() else
-                'mistral' if self._is_mistral() else
-                'gemma' if self._is_gemma() else
-                'deepseek' if self._is_deepseek() else
-                'hf_generic'
-            ),
         })
         return info
