@@ -17,11 +17,13 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python main.py web              Start web UI server
-  python main.py api              Start API server only
-  python main.py generate-data    Generate experiment data
-  python main.py experiment       Run experiments
-  python main.py demo             Run interactive demo
+  python main.py web                         Start web UI server
+  python main.py api                         Start API server only
+  python main.py demo                        Start Demo App (FastAPI web app)
+  python main.py demo --port 8080            Demo App on port 8080
+  python main.py demo --config config/demo.yaml  Demo App with custom config
+  python main.py generate-data               Generate experiment data
+  python main.py experiment                  Run experiments
         """
     )
     
@@ -153,68 +155,44 @@ def run_experiment():
 
 
 def run_demo(args):
-    """Run interactive demo."""
-    print("=" * 50)
-    print("DKI Interactive Demo")
-    print("=" * 50)
+    """Start the DKI Demo App (FastAPI web application).
+
+    Launches demo/app.py via uvicorn — this is the full-featured demo
+    application with chat, session management, preference editing, and
+    DKI Plugin integration.
+
+    Accessible at: http://{host}:{port}
+    API docs:       http://{host}:{port}/docs
+    Health check:   http://{host}:{port}/api/health
+    """
+    import os
+    import uvicorn
+
+    print("=" * 60)
+    print("DKI Demo App")
+    print("=" * 60)
+    print(f"Host   : {args.host}")
+    print(f"Port   : {args.port}")
+    print(f"Config : {os.environ.get('DKI_CONFIG_PATH', '(default)')}")
     print()
-    
-    # Check if we can import torch
-    try:
-        import torch
-        print(f"PyTorch version: {torch.__version__}")
-        print(f"CUDA available: {torch.cuda.is_available()}")
-    except ImportError:
-        print("PyTorch not installed. Please run: pip install -r requirements.txt")
-        return
-    
+    print(f"Demo App will be available at http://{args.host}:{args.port}")
+    print(f"API docs: http://{args.host}:{args.port}/docs")
+    print("=" * 60)
     print()
-    print("This demo shows DKI vs RAG comparison.")
-    print("Due to model loading requirements, this is a simplified version.")
-    print()
-    
-    # Demo without loading actual models
-    from dki.core.memory_router import MemoryRouter
-    from dki.core.embedding_service import EmbeddingService
-    
-    print("Initializing embedding service...")
-    embedding_service = EmbeddingService(device="cpu")
-    router = MemoryRouter(embedding_service)
-    
-    print("\nAdding sample memories...")
-    memories = [
-        ("mem1", "User prefers vegetarian food and is allergic to seafood"),
-        ("mem2", "User lives in Beijing and works as a software engineer"),
-        ("mem3", "User enjoys hiking and photography on weekends"),
-        ("mem4", "User's birthday is on March 15th"),
-        ("mem5", "User prefers coffee over tea"),
-    ]
-    
-    for mem_id, content in memories:
-        router.add_memory(mem_id, content)
-        print(f"  Added: {content[:50]}...")
-    
-    print("\n" + "=" * 50)
-    print("Memory Search Demo")
-    print("=" * 50)
-    
-    queries = [
-        "What should I eat for dinner?",
-        "What activities can I do this weekend?",
-        "When is my birthday?",
-    ]
-    
-    for query in queries:
-        print(f"\nQuery: {query}")
-        results = router.search(query, top_k=3)
-        print("Retrieved memories:")
-        for i, result in enumerate(results, 1):
-            print(f"  {i}. [{result.score:.3f}] {result.content[:60]}...")
-    
-    print("\n" + "=" * 50)
-    print("Demo complete!")
-    print("For full functionality, start the web UI: python main.py web")
-    print("=" * 50)
+
+    # create_demo_app() reads DKI_CONFIG_PATH from env (already set by
+    # main() if --config was passed, or exported by start_dki_with_model.sh)
+    from demo.app import create_demo_app
+
+    config_path = os.environ.get("DKI_CONFIG_PATH") or None
+    app = create_demo_app(config_path=config_path)
+
+    uvicorn.run(
+        app,
+        host=args.host,
+        port=args.port,
+        log_level="info",
+    )
 
 
 def run_tests():

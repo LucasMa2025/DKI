@@ -27,15 +27,15 @@ export default defineConfig({
         port: 3000,
         proxy: {
             "/api": {
-                target: "http://8.129.235.81:8000",
+                target: "http://47.112.175.155:8000",
                 changeOrigin: true,
             },
             "/v1": {
-                target: "http://8.129.235.81:8000",
+                target: "http://47.112.175.155:8000",
                 changeOrigin: true,
             },
             "/ws": {
-                target: "ws://8.129.235.81:8000",
+                target: "ws://47.112.175.155:8000",
                 ws: true,
             },
         },
